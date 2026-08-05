@@ -2,7 +2,7 @@
 
 Date: 2026-08-05
 
-Status: approved direction (approach 1); design pending final review
+Status: approved
 
 ## 1. Goal
 
@@ -30,6 +30,8 @@ This is a personal interoperability client. It must not copy proprietary applica
 - Primary gateway: `https://gateway.vdome.mts.ru/`
 - Resident API: `https://resident-rest.vdome.mts.ru`
 - Call signaling: `https://webrtc.domofon.mts.ru/ws`
+- MTS support chat: `wss://online-chat.mts.ru/ws/chat`
+- MTS support HTTP: `https://online-chat.mts.ru` and `https://support.mts.ru`
 
 The APK and safe unauthenticated probes confirm that the production feature configuration uses `WEB_SSO`, not the legacy direct SMS API.
 
@@ -59,10 +61,10 @@ Its Dom.ru provider protocol is not reused for MTS.
 2. Profile, flats, onboarding, residents, and additional users.
 3. Dashboard, services, favorites, and per-flat selection.
 4. Intercoms, barriers, elevators/access points, doors, and multi-lock control.
-5. Cameras, snapshots, live streams, archive playback, event timeline, and clip download.
+5. Cameras, snapshots, live streams, archive playback, event timeline/deletion, and clip download.
 6. Incoming call monitoring and browser audio/video call handling.
 7. Call actions: accept, reject, ignore, hang up, and open during a call.
-8. Call settings and call/guest event history.
+8. Call settings, explicitly armed automatic opening (`always`, `next call`, or 30-minute window), and call/guest event history.
 9. Browser notifications, SSE, and outbound webhooks.
 10. Individual and vehicle access requests/passes.
 11. News and publication details.
@@ -73,19 +75,25 @@ Its Dom.ru provider protocol is not reused for MTS.
 16. Meters, readings, history/statistics, and submission of readings.
 17. Marketplace catalog/search, product details, local basket, checkout/order creation, and order history.
 18. Notification preferences and application settings that have a browser equivalent.
+19. MTS support: FAQ, support conversation/history, live messages, safe file upload/download, operator/typing state, reactions/bot actions where returned, and appeal list/details/close.
+20. VDome profile editing plus safe handoff to official MTS ID account, personal-data, safety, and linked-account pages.
+21. About/legal/share/theme: version and compatibility status, official terms/privacy documents, current Play Store link, copy/share action, and a local light/dark/system theme.
 
 ### Explicitly excluded
 
 - Wear OS application behavior;
 - Android home-screen widgets;
 - Android NFC virtual card/HCE behavior;
+- Android Bluetooth/BLE or other local-hardware access flows;
 - Android-only background components and intents;
 - FCM device registration as a mobile device;
-- proprietary telemetry, MTS analytics, and crash reporting;
+- proprietary telemetry, MTS analytics, crash reporting, and the TNPS survey SDK;
+- hidden ESMART/developer/debug menus and internal diagnostics;
+- native MTS Profile/All Services SDK screens, Android update UI, and native rating APIs;
 - literal copies of APK UI/assets;
 - storage or processing of bank-card details.
 
-Browser notifications, SSE, webhooks, responsive shortcuts, and official payment redirects replace the relevant mobile-only presentation features.
+Browser notifications, SSE, webhooks, responsive shortcuts, local health/compatibility diagnostics, official MTS ID/account links, the current Play Store link, and official payment redirects replace the relevant mobile-only presentation features. The service never proxies an MTS ID account page or handles card data.
 
 ## 4. Chosen approach
 
@@ -123,6 +131,7 @@ VDome provider layer
   |-- gateway.vdome.mts.ru
   |-- resident-rest.vdome.mts.ru
   |-- webrtc.domofon.mts.ru
+  |-- online-chat.mts.ru / support.mts.ru
   `-- authorized camera/stream hosts returned by VDome
 ```
 
@@ -158,6 +167,7 @@ domru-mts/
 │   │   ├── residents.rs
 │   │   ├── issues.rs
 │   │   ├── chat.rs
+│   │   ├── support.rs
 │   │   ├── billing.rs
 │   │   ├── meters.rs
 │   │   ├── access.rs
@@ -176,6 +186,7 @@ domru-mts/
 │   │       ├── events.rs
 │   │       ├── calls.rs
 │   │       ├── resident.rs
+│   │       ├── support.rs
 │   │       ├── access.rs
 │   │       └── marketplace.rs
 │   ├── realtime/
@@ -203,6 +214,8 @@ The shared client adds the headers observed in VDome 3.0.1:
 Tokens and authorization headers must always be redacted from logs. Upstream `Request-Id` values are retained in structured error metadata.
 
 Provider DTOs are converted immediately into local domain models. Tolerant deserialization is used for additive upstream changes, while required safety-critical identifiers remain strict.
+
+Before authentication, a restricted anonymous bootstrap client reads only gateway `GET /config` and `GET /feature`. It normalizes known `{configName, platform, value}` and `{featureName, value}` entries, preserves unknown names for diagnostics, and requires `AUTH_TYPE=WEB_SSO`. Android minimum/latest-version values are compatibility observations rather than forced-update rules for this independent Rust/Web release; no result may trigger fallback to the legacy direct-SMS API.
 
 ### 7.2 Authentication coordinator
 
@@ -240,7 +253,9 @@ Domain services provide stable types for:
 - meter/reading;
 - access request;
 - marketplace product/basket/order;
-- favorite and notification preference.
+- favorite and notification preference;
+- support conversation/message/attachment/operator state/appeal;
+- legal document, provider compatibility, and safe official-account link.
 
 Account- or company-specific missing modules are represented as unavailable capabilities, not as global application failures.
 
@@ -271,6 +286,15 @@ The call subsystem has a stable local interface independent of the final upstrea
 - Direct browser WebRTC is preferred. If the live account reveals a mobile SIP/RTP leg that cannot be negotiated by a browser, the same component provides a server-side SIP/RTP-to-WebRTC bridge without changing the public API or UI.
 - Opening a lock during a call uses the active call session ID.
 
+Automatic opening is modeled as an explicitly armed policy, never as a hidden side effect:
+
+- `off` (default), `always`, `next_call`, or `until` with a 30-minute preset;
+- scoped to an owned flat and selected access point/call source;
+- arming or changing the policy requires a short-lived one-use mutation intent and a prominent warning;
+- `next_call` is consumed before dispatch, `until` expires by server UTC, and at most one open attempt is made for a validated call session;
+- ambiguous results are not retried, every attempt is audited as a redacted event, and logout disarms the policy;
+- persistent `always` mode is disabled unless `VDOME_ALLOW_PERSISTENT_AUTO_OPEN=true` is set deliberately.
+
 The server continues detecting incoming calls and invoking webhooks when no browser tab is open.
 
 ### 7.6 Realtime bus and webhooks
@@ -281,9 +305,22 @@ Normalized events include:
 - door-open result;
 - new camera/intercom event;
 - issue/chat/order update when polling or an upstream signal makes it available;
+- support message/operator/appeal update and automatic-open policy/result;
 - connection/authentication state changes.
 
 Events are exposed through SSE. Incoming calls also appear through the call WebSocket. Webhooks are signed with an optional shared secret, have short timeouts, bounded retries, and never block the upstream listener.
+
+### 7.7 MTS support and documents
+
+Support is implemented as a clean-room typed client, not by embedding the proprietary Android SDK:
+
+- support configuration, bidirectional history, and uploads use `online-chat.mts.ru` with product/channel `vdome` and compatibility version `3.23.0`;
+- live messaging uses `wss://online-chat.mts.ru/ws/chat`; the first typed frame carries the server-held `idToken`, generated event ID, bounded application/device data, selected official company referrer, optional appeal ID, settings, and enabled features;
+- appeals use `support.mts.ru/my-appeals/api`, and the fixed FAQ is `https://m.support.mts.ru/mpvdome`;
+- provider frames map to safe text, file/image, operator/typing, delivery/read, reaction, bot-action, and appeal domain events; unknown frames are retained only as redacted diagnostics;
+- send, upload, reaction, and close operations use typed one-use intents and are not retried after an ambiguous dispatch.
+
+The fixed terms document is `https://resident-rest.vdome.mts.ru/docs/terms-of-use-resident.pdf`; privacy is `https://domofon.mts.ru/privacy-policy.html`. Official PDFs and authenticated invoice/issue/support attachments may be exposed only through fixed routes or opaque, owned, expiring document leases with strict HTTPS/host/DNS/redirect, type, size, and timeout checks. There is no caller-supplied URL proxy.
 
 ## 8. Local API design
 
@@ -305,17 +342,22 @@ Principal groups:
 /api/v1/companies/*
 /api/v1/issues/*
 /api/v1/chat/*
+/api/v1/support/*
 /api/v1/billing/*
 /api/v1/meters/*
 /api/v1/access-requests/*
 /api/v1/marketplace/*
 /api/v1/notifications/*
 /api/v1/config
+/api/v1/about
+/api/v1/legal/*
+/api/v1/documents/*
 /api/v1/realtime                 # SSE
 /api/v1/calls/signaling          # WebSocket
+/api/v1/calls/auto-open
 ```
 
-Compatibility aliases include `/api/login`, `/api/confirm`, `/api/session`, `/api/logout`, `/api/places`, `/api/snapshot/...`, `/api/stream/...`, `/api/archive/...`, and `/api/open-door`.
+Compatibility aliases include `/api/login`, `/api/confirm`, `/api/session`, `/api/logout`, `/api/places`, `/api/snapshot/:camera_id`, `/api/stream/:camera_id`, `/api/archive/:camera_id`, and `/api/open-door`.
 
 Authorization is represented uniformly:
 
@@ -361,16 +403,22 @@ Top-level navigation:
 6. Home services: news, issues, chat, invoices, meters.
 7. Marketplace.
 8. Profile/residents/settings.
+9. Support/FAQ and appeals.
+10. About/legal/provider compatibility.
 
 Important interaction rules:
 
 - A flat selector scopes every applicable screen.
 - Unsupported services are hidden or shown as unavailable with the upstream reason.
-- Door/open-barrier controls always require a deliberate confirmation interaction.
+- Manual door/open-barrier controls always require a deliberate confirmation interaction. Automatic opening runs only after the user deliberately arms a narrowly scoped policy through the same one-use confirmation mechanism.
 - Orders, issue creation/cancellation, readings submission, and payment transitions show a final summary before mutation.
 - Payment opens only an official upstream payment URL in a new secure browser context.
 - Camera playback supports live/archive state, timeline navigation, event markers, and clip download.
 - Incoming calls display an in-app banner and Browser Notification, then open the call surface with answer/reject/open controls.
+- Support sends, uploads, reactions, and appeal closing show a final summary; official micro-app/survey links open only through a strict HTTPS allowlist without local token injection.
+- MTS ID account pages open on the official `id.mts.ru` host in a separate secure context; the service does not proxy them or expose its server-side ID token/cookies.
+- Account links are limited to `/account`, `/account/personal`, `/account/safety`, `/account/links`, and an explicitly marked official `/account/payments` handoff when offered; card/account-payment pages are never proxied or reproduced locally.
+- Official PDFs and attachments use a bounded allowlisted document proxy or direct safe download and the browser's native PDF viewer.
 - Accessibility includes keyboard navigation, focus management, labeled controls, reduced-motion support, and sufficient contrast.
 
 The design is original and does not reproduce VDome branding assets.
@@ -384,6 +432,7 @@ Persisted data:
 - encrypted session/token bundle;
 - stable device identity;
 - selected flat and non-sensitive UI preferences;
+- automatic-open policy, selected device favorites, theme, and dismissed UI notices;
 - webhook and polling configuration;
 - optional bounded cache metadata.
 
@@ -398,6 +447,7 @@ Security defaults:
 - body and upload size limits;
 - validated outbound webhook URL and redirect URL handling;
 - no arbitrary upstream proxy route;
+- no general-purpose HTML/document proxy and no token injection into external account/support pages;
 - no secrets in frontend storage;
 - redaction in tracing and panic/error output.
 
@@ -421,7 +471,7 @@ Rules:
 
 - retry idempotent reads with capped exponential backoff and jitter;
 - honor `Retry-After`;
-- do not blindly retry door, payment, reading, issue, access-request, or order mutations;
+- do not blindly retry door, auto-open, call, support, payment, reading, issue, access-request, or order mutations;
 - reconnect realtime transports with state notifications;
 - preserve the last known read-only view during temporary upstream outages;
 - invalidate only the affected capability when an optional service is absent;
@@ -433,7 +483,7 @@ Rules:
 
 - Unit tests for URL building, headers, token redaction, refresh serialization, DTO mapping, playlist rewriting, and call state transitions.
 - Fixture tests based on fully redacted observed response shapes.
-- Mock upstream contract tests for every provider module, including error and schema-variation cases.
+- Mock upstream contract tests for every provider module, including support WebSocket/HTTP, bootstrap configuration, and error/schema-variation cases.
 - Axum API tests for status codes, validation, CSRF, and secret non-disclosure.
 - Frontend component tests for all loading/empty/error/challenge states.
 - Browser E2E tests against a deterministic mock provider for the complete user flows.
@@ -444,9 +494,9 @@ Rules:
 After the mock suite passes:
 
 1. Perform MTS ID login and real SMS verification with the user.
-2. Run read-only smoke tests for profile, flats, devices, cameras, events, archive, services, news, issues, billing, meters, passes, and marketplace.
+2. Run read-only smoke tests for provider configuration, profile, flats, devices, cameras, events, archive, services, news, issues, billing, meters, passes, marketplace, support history, and appeals.
 3. Verify incoming-call observation without accepting or controlling it.
-4. Ask for explicit confirmation immediately before each real door-open, call accept/reject/hangup, issue/order/access-request creation, meter submission, or payment-related mutation.
+4. Ask for explicit confirmation immediately before each real door-open, automatic-open arm/test, call accept/reject/hangup, issue/order/access-request creation, meter submission, support send/upload/reaction/appeal close, or payment-related mutation.
 
 Live responses are never committed unless manually reduced to redacted synthetic fixtures.
 
@@ -462,6 +512,7 @@ VDOME_DATA_DIR=./data
 VDOME_SECRET_KEY=<optional external key>
 WEBHOOK_URL=<optional>
 WEBHOOK_SECRET=<optional>
+VDOME_ALLOW_PERSISTENT_AUTO_OPEN=false
 RUST_LOG=info
 TZ=Europe/Moscow
 ```
@@ -486,6 +537,10 @@ Use a host allowlist derived from trusted VDome responses, strict redirects, bou
 
 Keep signaling, call actions, and media transport separate. Validate read-only signaling first; support either direct browser WebRTC or an internal SIP/RTP bridge without changing the local contract.
 
+### Support protocol and externally rendered content
+
+Keep MTS support HTTP/WebSocket transport behind a typed provider with fixtures and strict size/host policies. Render normalized message primitives locally; hand dynamic official micro-apps, polls, and surveys off to allowlisted HTTPS pages without forwarding local cookies or tokens.
+
 ### Upstream schema drift
 
 Use tolerant additive parsing, captured redacted fixtures, explicit versioned domain models, and contract smoke tests.
@@ -498,10 +553,10 @@ The project is complete when:
 2. Every included feature area has a typed Rust provider implementation, local API routes, and a usable Web UI state.
 3. Cameras support snapshot, live playback, archive timeline/events, and clip download for the live account where the service is provisioned.
 4. The service detects real incoming calls, delivers SSE/browser/webhook notifications, and supports browser audio/video plus all applicable call actions.
-5. Door and barrier controls work only through explicit user actions and report unambiguous results.
+5. Manual door and barrier controls work only through explicit user actions; automatic opening works only through a deliberately armed, scoped, expiring/audited policy, and all outcomes remain explicit.
 6. Optional resident services degrade independently according to account capabilities.
 7. Tokens and personal secrets remain server-side, encrypted at rest, and absent from logs/API errors.
 8. Mock/unit/API/UI suites pass, Docker starts successfully, and read-only live smoke tests pass.
 9. Mutating live tests are performed only after immediate user confirmation.
-10. README documents setup, security, API usage, Docker, supported features, limitations, and the unofficial/non-affiliated status.
-
+10. Support/FAQ/appeals, legal/about/theme/share, official MTS ID handoff, and provider compatibility diagnostics have typed safe browser flows without leaking credentials.
+11. README documents setup, security, API usage, Docker, supported features, limitations, and the unofficial/non-affiliated status.
