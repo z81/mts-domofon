@@ -1,10 +1,10 @@
-# VDome Calls, Guarded Auto-Open, Realtime, Browser Media, and Webhooks Implementation Plan
+# VDome Calls, Realtime, Browser Media, and Webhooks Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Keep VDome call registration active without an open browser, normalize incoming calls, support browser audio/video, manual call actions, and explicitly armed automatic door opening, expose realtime SSE/WebSocket state, and deliver signed webhooks.
+**Goal:** Keep VDome call registration active without an open browser, normalize incoming calls, support browser audio/video and deliberate manual call actions, expose realtime SSE/WebSocket state, and deliver signed webhooks.
 
-**Architecture:** A supervised call engine obtains SIP credentials from VDome, registers through the known VDome WebSocket transport, and drives a pure state machine. SIP signaling and upstream REST actions remain behind provider traits. Browser WebRTC terminates in Rust; the bridge relays negotiated RTP between the VDome leg and a local peer connection. A fail-closed auto-open policy may consume one validated incoming session only after deliberate arming. A bounded broadcast bus fans normalized events to SSE, the call WebSocket, browser notifications, and a non-blocking signed webhook worker.
+**Architecture:** A supervised call engine obtains SIP credentials from VDome, registers through the known VDome WebSocket transport, and drives a pure state machine. SIP signaling and upstream REST actions remain behind provider traits. Browser WebRTC terminates in Rust; the bridge relays negotiated RTP between the VDome leg and a local peer connection. A bounded broadcast bus fans normalized events to SSE, the call WebSocket, browser notifications, and a non-blocking signed webhook worker.
 
 **Tech Stack:** The first two phases; Tokio Tungstenite 0.30.0, RSIP 0.4.0, WebRTC 0.20.0, Rustls, HMAC/SHA-256, Tokio broadcast/watch channels, Axum WebSocket/SSE, React 19.2.8, TypeScript 6.0.3, Vitest 4.1.10, and Playwright 1.62.1.
 
@@ -19,7 +19,7 @@
 - Never record call audio/video or persist raw SDP/SIP messages. Redacted structured diagnostics may include message kind, call ID hash, codec names, timing, status codes, and byte counts.
 - Do not automatically retry accept, reject, ignore, hangup, or open-during-call after an ambiguous dispatch.
 - Ask the user immediately before each real call-control or open-during-call mutation during live verification. Merely observing an incoming call and registration state is read-only.
-- Automatic opening defaults to off. Arming/changing it is a mutation requiring a one-use intent and immediate live approval; persistent `always` mode additionally requires `VDOME_ALLOW_PERSISTENT_AUTO_OPEN=true`. Never test it against a real call without a separately confirmed controlled self-ring, and disarm it after the test.
+- Automatic opening is excluded: no policy type, scheduler, persisted rule, incoming-call hook, route, or UI control may be implemented.
 - Webhooks must not block the call engine, must never contain credentials/SDP/raw SIP, and must refuse private/link-local destinations unless explicitly allowed by a separate unsafe development flag.
 - Do not include `Co-Authored-By` trailers or any Codex/Anthropic co-author line in commits.
 - When a task creates a Rust module, update its nearest existing `mod.rs` (and `src/lib.rs` only for a new top-level module) in the same task and include that registry file in the task commit.
@@ -32,7 +32,6 @@
 - `src/provider/mts/calls.rs`: SIP credential discovery and VDome REST call actions only.
 - `src/calls/sip/*`: SIP message, digest, dialog, registration, transaction, and WebSocket transport only.
 - `src/calls/engine.rs`: supervision, session ownership, timeouts, and domain transitions only.
-- `src/calls/auto_open.rs`: scoped arming policy, expiry/consumption, deduplication, and audit decisions only.
 - `src/calls/bridge.rs`: RTP/WebRTC media bridging only.
 - `src/calls/signaling.rs`: browser offer/answer/ICE protocol only.
 - `src/realtime/bus.rs`: normalized in-memory event publication/subscription only.
@@ -60,7 +59,6 @@
 pub struct CallRevision(pub u64);
 pub enum CallPhase { Ringing, Connecting, Active, Ending, Ended(CallEndReason) }
 pub enum CallCommand { ObserveInvite(IncomingInvite), Accept { revision: CallRevision }, Reject { revision: CallRevision }, Ignore { revision: CallRevision }, Hangup { revision: CallRevision }, RemoteEnded(CallEndReason), Timeout }
-pub enum AutoOpenMode { Off, Always, NextCall, Until(DateTime<Utc>) }
 pub fn reduce(state: &CallSession, command: CallCommand, now: DateTime<Utc>) -> Result<Transition, CallTransitionError>;
 
 #[derive(Clone)]
@@ -68,7 +66,7 @@ pub struct RealtimeBus { /* bounded broadcast sender and monotonic event ID */ }
 impl RealtimeBus { pub fn publish(&self, event: DomainEvent) -> EventId; pub fn subscribe(&self) -> EventSubscription; }
 ```
 
-- [ ] **Step 1: Write table/property tests** for all legal transitions plus duplicate INVITE, stale revision, accept-vs-timeout, reject-vs-remote-BYE, multiple ringers, one-active-call enforcement, monotonic timestamps, terminal idempotency, tolerant auto-open mode serialization, and sensitive-field-free event serialization.
+- [ ] **Step 1: Write table/property tests** for all legal transitions plus duplicate INVITE, stale revision, accept-vs-timeout, reject-vs-remote-BYE, multiple ringers, one-active-call enforcement, monotonic timestamps, terminal idempotency, sensitive-field-free event serialization, and proof that observing an INVITE never dispatches a door action.
 - [ ] **Step 2: Write bus tests** for bounded lag reporting, monotonic event IDs, independent slow subscribers, shutdown notification, and no panic when there are no receivers.
 - [ ] **Step 3: Run and observe failure:** `cargo test --test call_state_machine --test realtime_bus -- --nocapture`.
 - [ ] **Step 4: Implement the reducer and bus** with no network or clock calls in the reducer; inject `now`, keep terminal sessions for a bounded in-memory history, and publish a redacted snapshot after each accepted transition.
@@ -210,15 +208,20 @@ Add `webrtc = "0.20.0"` with its default Tokio runtime before compiling the brid
 - Modify: `src/calls/engine.rs`
 - Modify: `src/calls/sip/dialog.rs`
 - Modify: `src/calls/bridge.rs`
-- Create: `src/calls/auto_open.rs`
 - Modify: `src/service/mutations.rs`
-- Modify: `src/config.rs`
-- Modify: `src/storage.rs`
 - Create: `tests/call_commands.rs`
-- Create: `tests/auto_open_policy.rs`
 - Create: `tests/contract/call_actions.rs`
 
 **Command behavior:**
+
+```rust
+pub enum ManualCallAction { Accept, Reject, Ignore, Hangup, Open { access_point_id: String, lock_number: Option<String> } }
+pub struct CallIntentRequest { pub call_id: CallId, pub expected_revision: CallRevision, pub action: ManualCallAction }
+impl MutationService {
+    pub async fn issue_call_intent(&self, session: &LocalSessionId, request: CallIntentRequest) -> Result<MutationIntent, AppError>;
+    pub async fn execute_call_intent(&self, session: &LocalSessionId, intent: Uuid) -> Result<CallActionResult, AppError>;
+}
+```
 
 ```text
 accept  -> consume intent, send SIP 200 with negotiated SDP, await ACK, activate bridge
@@ -226,16 +229,14 @@ reject  -> consume intent, send SIP 603, publish rejected terminal state
 ignore  -> consume intent, POST observed remote action `ignore`, leave SIP ringing until CANCEL/timeout
 hangup  -> consume intent, send BYE in-dialog, await response, terminate bridge
 open    -> consume access intent bound to active call revision, add X-Call-Session-ID
-arm-auto-open -> consume policy intent, validate owned flat/access point/source, persist Off/Always/NextCall/Until
-incoming-auto-open -> atomically consume NextCall or validate active mode, reserve call-session hash, dispatch one open only
 ```
 
 - [ ] **Step 1: Write race-heavy tests** for all commands, intent/session/revision binding, double-clicks, ACK timeout, CANCEL during accept, remote BYE during hangup, no media before ACK, ignore REST failure, ambiguous results, and automatic cleanup.
-- [ ] **Step 2: Write auto-open policy tests** for default-off, owned flat/access-point/source binding, one-use arming intent, 30-minute UTC expiry, `NextCall` consumption before network dispatch, `Always` feature-gate refusal, duplicate/replayed INVITE suppression, one attempt per call session, ambiguous-result no-retry, logout disarm, restart persistence, clock skew, and redacted audit events.
-- [ ] **Step 3: Run and observe failure:** `cargo test --test call_commands --test call_actions --test auto_open_policy -- --nocapture`.
-- [ ] **Step 4: Implement command and auto-open orchestration** so the reducer decides legality, the engine atomically reserves an action before I/O, and outcomes distinguish confirmed, rejected, and unknown without unsafe retry. Persist only the scoped policy and hashed recent-session deduplication metadata; consume `NextCall` before dispatch and publish policy/result events without addresses or call credentials.
-- [ ] **Step 5: Run focused/full checks:** `cargo test --test call_commands --test call_actions --test auto_open_policy && cargo test && cargo clippy --all-targets --all-features -- -D warnings`.
-- [ ] **Step 6: Commit:** `git add src/calls src/service/mutations.rs src/config.rs src/storage.rs tests && git commit -m "feat: add call controls and guarded auto-open"`.
+- [ ] **Step 2: Add negative-scope tests** proving INVITE/reconnect/restart never creates an access intent, no timer or configuration can trigger opening, and a manual open is rejected unless it is bound to the active call revision and explicitly executed by the local session.
+- [ ] **Step 3: Run and observe failure:** `cargo test --test call_commands --test call_actions -- --nocapture`.
+- [ ] **Step 4: Implement command orchestration** so the reducer decides legality, the engine atomically reserves a manual action before I/O, and outcomes distinguish confirmed, rejected, and unknown without unsafe retry. Do not add any automatic-open state or hook.
+- [ ] **Step 5: Run focused/full checks:** `cargo test --test call_commands --test call_actions && cargo test && cargo clippy --all-targets --all-features -- -D warnings`.
+- [ ] **Step 6: Commit:** `git add src/calls src/service/mutations.rs tests && git commit -m "feat: add manual browser call controls"`.
 
 ### Task 7: SSE Resume, Heartbeats, and Signed Webhooks
 
@@ -282,9 +283,6 @@ Add `hmac = { version = "0.13.0", features = ["zeroize"] }` and `sha2 = { versio
 ```text
 GET  /api/v1/calls
 GET  /api/v1/calls/:id
-GET  /api/v1/calls/auto-open
-POST /api/v1/calls/auto-open/intents
-POST /api/v1/calls/auto-open/intents/:intent/execute
 POST /api/v1/calls/:id/intents
 POST /api/v1/calls/:id/intents/:intent/execute
 GET  /api/v1/realtime
@@ -297,9 +295,9 @@ server WS: {"type":"call_state","call":{"id":"call-test-1","revision":4,"phase":
 server WS: {"type":"error","code":"stale_call_revision","message":"Состояние звонка изменилось"}
 ```
 
-- [ ] **Step 1: Write Axum/WebSocket tests** for authentication, stable call JSON, action and auto-open policy schemas, scope/revision/intent validation, persistent-`always` feature gate, SSE resume, origin validation, frame/message limits, offer/candidate limits, one attached browser peer per local session, ping/pong, disconnect cleanup, and secret-free errors.
+- [ ] **Step 1: Write Axum/WebSocket tests** for authentication, stable active/recent call JSON, optional call/guest records mapped from the phase-2 read-only event service, typed manual-action schemas, scope/revision/intent validation, SSE resume, origin validation, frame/message limits, offer/candidate limits, one attached browser peer per local session, ping/pong, disconnect cleanup, secret-free errors, and JSON `404` for every excluded automatic-open route.
 - [ ] **Step 2: Run and observe failure:** `cargo test --test calls --test realtime --test signaling -- --nocapture`.
-- [ ] **Step 3: Implement thin APIs** and a signaling session that owns browser peer IDs, subscribes to call events, never forwards SIP/SDP credentials, and closes with explicit WebSocket codes on auth/session expiry.
+- [ ] **Step 3: Implement thin APIs** that combine bounded engine history with call/guest event records only when the phase-2 event capability returns them, plus a signaling session that owns browser peer IDs, subscribes to call events, never forwards SIP/SDP credentials, and closes with explicit WebSocket codes on auth/session expiry.
 - [ ] **Step 4: Run API/full checks:** `cargo test --test calls --test realtime --test signaling && cargo test`.
 - [ ] **Step 5: Commit:** `git add src/calls/signaling.rs src/api src/app.rs tests/api && git commit -m "feat: expose calls and realtime API"`.
 
@@ -314,14 +312,13 @@ server WS: {"type":"error","code":"stale_call_revision","message":"Состоя�
 - Create: `frontend/src/features/calls/CallSurface.tsx`
 - Create: `frontend/src/features/calls/CallControls.tsx`
 - Create: `frontend/src/features/calls/CallHistory.tsx`
-- Create: `frontend/src/features/calls/AutoOpenSettings.tsx`
 - Modify: `frontend/src/app/App.tsx`
 - Test: `frontend/src/features/calls/CallSurface.test.tsx`
 - Test: `frontend/src/lib/realtime/notifications.test.ts`
 
-- [ ] **Step 1: Write UI tests** for incoming audio/video calls, permission denied, notification opt-in, duplicate events after reconnect, accept/reject/ignore/hangup/open summaries, stale revisions, camera preview, microphone/camera/received-audio mute state, speaker/output-device selection when `setSinkId` is supported, graceful fallback when it is not, auto-open off/always/next-call/30-minute selection, scope warning/confirmation, expiry/disarm/result state, persistent-always disabled state, lost signaling, remote hangup, keyboard-only use, focus trapping, and reduced motion.
+- [ ] **Step 1: Write UI tests** for incoming audio/video calls, bounded active/recent history, optional call/guest event history and unavailable-history state, permission denied, notification opt-in, duplicate events after reconnect, accept/reject/ignore/hangup/manual-open summaries, stale revisions, camera preview, microphone/camera/received-audio mute state, speaker/output-device selection when `setSinkId` is supported, graceful fallback when it is not, lost signaling, remote hangup, keyboard-only use, focus trapping, reduced motion, and absence of automatic-open settings or armed-state UI.
 - [ ] **Step 2: Run and observe failure:** `npm --prefix frontend test -- src/features/calls/CallSurface.test.tsx src/lib/realtime/notifications.test.ts`.
-- [ ] **Step 3: Implement the UI** with an always-visible in-app banner, Browser Notification only after explicit permission, `getUserMedia` only when accepting/previewing, local track indicators, one-use action/policy intents, a persistent visible armed-policy indicator and one-click disarm, and cleanup of tracks/peer connection on every terminal path.
+- [ ] **Step 3: Implement the UI** with an always-visible in-app banner, Browser Notification only after explicit permission, `getUserMedia` only when accepting/previewing, local track indicators, one-use manual-action intents, and cleanup of tracks/peer connection on every terminal path.
 - [ ] **Step 4: Run frontend checks:** `npm --prefix frontend run typecheck && npm --prefix frontend test && npm --prefix frontend run build`.
 - [ ] **Step 5: Commit:** `git add frontend && git commit -m "feat: add browser incoming-call UI"`.
 
@@ -335,9 +332,9 @@ server WS: {"type":"error","code":"stale_call_revision","message":"Состоя�
 - Modify: `README.md`
 
 - [ ] **Step 1: Implement a deterministic SIP/WebSocket/RTP peer** that can ring audio-only/video, challenge registration, cancel, accept, exchange synthetic RTP, reject, ignore, hang up, reconnect, rotate credentials, and return ambiguous action results without touching a real account.
-- [ ] **Step 2: Write Playwright coverage** for background incoming banner, Browser Notification adapter, audio/video accept, reject, ignore, hangup, open confirmation, auto-open arming/expiry/next-call consumption/deduplication/disarm with a mock door, reconnect, no-tab webhook delivery, mobile layout, keyboard controls, and browser-visible secret scans.
+- [ ] **Step 2: Write Playwright coverage** for background incoming banner, Browser Notification adapter, audio/video accept, reject, ignore, hangup, manual-open confirmation, excluded automatic-open navigation/routes, reconnect, no-tab webhook delivery, mobile layout, keyboard controls, and browser-visible secret scans.
 - [ ] **Step 3: Run the phase gate:** `cargo test && npm --prefix frontend run typecheck && npm --prefix frontend test && npm --prefix frontend run build && npm --prefix frontend exec -- playwright test frontend/e2e/calls.spec.ts`.
-- [ ] **Step 4: With the user present, run only live registration and incoming-call observation.** Ask the user to ring their own intercom; verify a redacted INVITE summary, normalized ringing event, browser banner, and webhook while allowing the call to expire naturally. Do not answer/reject/ignore/hang up/open or arm auto-open until asking for and receiving immediate confirmation for that specific action. If the user separately approves an auto-open test, use one controlled self-ring with `NextCall`, observe at most one attempt, then verify the policy is off before continuing.
+- [ ] **Step 4: With the user present, run only live registration and incoming-call observation.** Ask the user to ring their own intercom; verify a redacted INVITE summary, normalized ringing event, browser banner, and webhook while allowing the call to expire naturally. Do not answer/reject/ignore/hang up or open until asking for and receiving immediate confirmation for that specific manual action.
 - [ ] **Step 5: Commit:** `git add tests/mock_provider tests/mock_sip frontend/e2e docs/runbooks/live-calls.md README.md && git commit -m "test: cover realtime call flows"`.
 
 ## Phase Acceptance Gate
@@ -353,4 +350,4 @@ npm --prefix frontend exec -- playwright test frontend/e2e/calls.spec.ts
 git diff --check
 ```
 
-The phase is complete only when the service stays registered with no browser tab, mock SIP/WebRTC media, all call commands, and guarded auto-open pass end to end, SSE/webhook delivery cannot stall registration, secrets never cross the local API, and live control or auto-open arming remains gated by immediate user confirmation.
+The phase is complete only when the service stays registered with no browser tab, mock SIP/WebRTC media and every manual call command pass end to end, SSE/webhook delivery cannot stall registration, secrets never cross the local API, excluded automatic opening has no route/state/UI, and live control remains gated by immediate user confirmation.

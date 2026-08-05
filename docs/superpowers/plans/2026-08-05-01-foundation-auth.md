@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Produce a runnable Axum application with a React shell, encrypted local state, a typed VDome HTTP client, current MTS ID/WebSSO challenge authentication, token refresh, and tested auth/session APIs; phase 5 converts the verified SPA into the final embedded single-binary artifact.
+**Goal:** Produce a runnable Axum application with a React shell, encrypted local state, a typed VDome HTTP client, current MTS ID/WebSSO challenge authentication, token refresh, and tested auth/session APIs; phase 4 converts the verified SPA into the final embedded single-binary artifact.
 
 **Architecture:** The browser talks only to the local Axum API. `AuthCoordinator` owns short-lived WebSSO flows and the active VDome token bundle; `MtsSsoTransport` owns MTS cookies and exchanges WebSSO callback JSON. `MtsClient` reads tokens through a narrow `TokenSource` interface, so later provider modules cannot expose secrets to the UI.
 
@@ -11,16 +11,16 @@
 ## Global Constraints
 
 - Work only in `/Users/alex/dev/domru-mts`; use `/Users/alex/dev/domru-z81` `origin/main` as a structural reference, not as the MTS protocol implementation.
-- Core phase-1 provider hosts are `https://gateway.vdome.mts.ru/`, `https://resident-rest.vdome.mts.ru`, and `https://webrtc.domofon.mts.ru/ws`; later phases add only the separately allowlisted official support hosts documented in the roadmap.
+- Core provider hosts are exactly `https://gateway.vdome.mts.ru/`, `https://resident-rest.vdome.mts.ru`, and `https://webrtc.domofon.mts.ru/ws`; media hosts are admitted later only when returned for an owned camera and accepted by the media policy.
 - Production authentication is MTS ID/WebSSO for client `VDome`; do not make the obsolete direct SMS endpoints the default.
 - Upstream access, refresh, WebSSO, ID, device, phone, OTP, password, captcha, and media credentials must never appear in logs or frontend storage.
-- Bind to `127.0.0.1:3000` by default; a non-loopback bind requires local access protection in phase 5.
+- Bind to `127.0.0.1:3000` by default; a non-loopback bind requires local access protection in phase 4.
 - Persist secret files atomically with owner-only permissions; accept `VDOME_SECRET_KEY`, otherwise generate `data/master.key`.
 - Use TDD for every behavior, keep provider DTOs separate from stable domain/API models, and commit after every task.
 - Do not include `Co-Authored-By` trailers or any Codex/Anthropic co-author line in commits.
 - When a task creates a Rust module, update its nearest existing `mod.rs` (and `src/lib.rs` only for a new top-level module) in the same task and include that registry file in the task commit.
-- Do not copy proprietary APK code or assets; synthetic fixtures must contain no real phone, address, token, account, camera, or resident data.
-- Real SMS login is allowed. Ask immediately before any later live door, call-control, issue, order, pass, meter, or payment mutation.
+- Do not copy proprietary APK code or assets; synthetic fixtures must contain no real phone, address, token, account, flat, camera, or call data.
+- Real SMS login is allowed. Ask immediately before any later live door, call-control, call-block, or call-setting mutation.
 
 ---
 
@@ -39,7 +39,7 @@
 - `src/auth/coordinator.rs`: flow lifecycle, token installation, refresh serialization, and logout only.
 - `src/api/auth.rs`: HTTP transport for auth/session operations only.
 - `src/api/health.rs`: liveness/readiness endpoints only.
-- `src/web.rs`: SPA serving/fallback only; phase 1 serves a built directory and phase 5 embeds the same artifacts.
+- `src/web.rs`: SPA serving/fallback only; phase 1 serves a built directory and phase 4 embeds the same artifacts.
 - `frontend/src/features/auth/*`: auth UI only.
 - `frontend/src/app/*`: application shell/router/API bootstrap only.
 
@@ -343,7 +343,6 @@ pub struct TokenBundle {
     pub access_token: secrecy::SecretString,
     pub refresh_token: secrecy::SecretString,
     pub web_sso_access_token: secrecy::SecretString,
-    pub id_token: secrecy::SecretString,
     pub device_token: Option<secrecy::SecretString>,
 }
 
@@ -400,7 +399,7 @@ git commit -m "feat: persist VDome sessions securely"
 - Create: `tests/fixtures/provider_features.json`
 
 **Interfaces:**
-- Produces: `trait TokenSource { async fn access_token(&self) -> Option<SecretString>; async fn device_token(&self) -> Option<SecretString>; async fn id_token(&self) -> Option<SecretString>; async fn refresh_after_unauthorized(&self) -> Result<(), AppError>; }`; `id_token` exists for the later isolated MTS support client and is never attached by the main VDome request builder.
+- Produces: `trait TokenSource { async fn access_token(&self) -> Option<SecretString>; async fn device_token(&self) -> Option<SecretString>; async fn refresh_after_unauthorized(&self) -> Result<(), AppError>; }`.
 - Produces: `MtsClient::authorized(Method, ProviderBase, &str) -> RequestBuilder`.
 - Produces: `MtsClient::anonymous_gateway(Method, &str) -> RequestBuilder` restricted to the bootstrap allowlist.
 - Produces: `MtsClient::send_json<T>()`, `send_empty()`, and `send_stream()`.
@@ -561,7 +560,7 @@ git commit -m "feat: build current MTS ID authorization requests"
 **Interfaces:**
 - Produces: `AuthChallenge`, `ChallengeInput`, `AuthFlowId`, and `AuthProgress`.
 - Produces: `MtsSsoTransport::{begin, submit}` returning `AuthProgress`.
-- Produces on success: `TokenBundle` parsed from `webSsoAccessToken`, `keycloakTokenPair`, and `idToken`.
+- Produces on success: `TokenBundle` parsed from `webSsoAccessToken` and `keycloakTokenPair`; a returned `idToken` is accepted for schema compatibility, immediately zeroized, and never persisted because no included core route uses it.
 - Consumes: `SsoRequest` from Task 5 and `TokenBundle` from Task 3.
 
 - [ ] **Step 1: Define synthetic fixture bodies and failing parser tests**
@@ -586,7 +585,7 @@ The callback response fixture is:
 {"webSsoAccessToken":"sso-test","keycloakTokenPair":{"accessToken":"access-test","refreshToken":"refresh-test"},"idToken":"id-test"}
 ```
 
-Assert phone maps to `AuthChallenge::Phone`, OTP maps to `SmsOtp { resend_after_seconds: 30 }`, and success produces a redacted `TokenBundle`.
+Assert phone maps to `AuthChallenge::Phone`, OTP maps to `SmsOtp { resend_after_seconds: 30 }`, success produces a redacted `TokenBundle`, and `id-test` is absent from encrypted storage and every captured log/debug representation.
 
 - [ ] **Step 2: Run and verify parser failure**
 
@@ -630,7 +629,7 @@ or `formData.otp`, `formData.captcha`, `formData.password`, `formData.accountId`
 
 - [ ] **Step 5: Implement success callback following**
 
-Allow callback hosts only `gateway.vdome.mts.ru`, require path `/user-service/api/auth/callback`, validate `state`, follow once using the same cookie jar, require HTTPS, and deserialize the three token classes.
+Allow callback hosts only `gateway.vdome.mts.ru`, require path `/user-service/api/auth/callback`, validate `state`, follow once using the same cookie jar, require HTTPS, deserialize the required WebSSO/Keycloak token classes, and zeroize an unused ID token.
 
 - [ ] **Step 6: Add Wiremock flow tests**
 
@@ -918,7 +917,7 @@ Provide skip link, focus-visible states, 44px minimum interactive targets, respo
 
 - [ ] **Step 6: Serve built assets safely from Rust**
 
-Use Tower HTTP `ServeDir` over `AppConfig.web_dist_dir`, defaulting to the configured, canonicalized `frontend/dist/` directory during development. Serve hashed assets with immutable caching, `index.html` with `no-cache`, and SPA fallback only for non-`/api` GET routes. Reject traversal and symlinks outside the build root; API 404s remain JSON. Phase 5 replaces only this asset source with Rust Embed after the UI contract is complete.
+Use Tower HTTP `ServeDir` over `AppConfig.web_dist_dir`, defaulting to the configured, canonicalized `frontend/dist/` directory during development. Serve hashed assets with immutable caching, `index.html` with `no-cache`, and SPA fallback only for non-`/api` GET routes. Reject traversal and symlinks outside the build root; API 404s remain JSON. Phase 4 replaces only this asset source with Rust Embed after the UI contract is complete.
 
 - [ ] **Step 7: Run frontend and embedding tests**
 

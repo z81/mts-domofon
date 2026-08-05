@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add typed flats, dashboard, access-point, intercom, camera, event, live-media, archive, per-flat device favorites, unread badges, call-setting, and confirmed lock-control capabilities to the authenticated service and Web UI.
+**Goal:** Add typed flats, a core dashboard, access points, intercoms, cameras, read-only events, live media, archive, call settings, and confirmed manual lock control to the authenticated service and Web UI.
 
 **Architecture:** Provider modules deserialize VDome responses into private DTOs and immediately map them to stable domain types. Read-only device/media operations are exposed through narrow services; media is fetched through an allowlisted proxy that rewrites HLS references. Lock control crosses a dedicated mutation boundary that requires a short-lived server-issued confirmation intent and never retries an ambiguous upstream result.
 
@@ -17,7 +17,7 @@
 - Bound manifests, snapshots, JSON bodies, archive ranges, segment sizes, upstream concurrency, and all request timeouts.
 - Never put bearer/device tokens or reusable signed media credentials in HTML, JSON, browser storage, logs, redirects, or error bodies.
 - Never retry a lock mutation after any bytes may have reached VDome. Require a fresh one-use intent tied to flat, access point, lock, action, and local session.
-- Ask the user immediately before the first real favorite, call-setting/blocking, event-deletion, lock, barrier, or elevator mutation; mock mutations need no confirmation outside the application flow.
+- Ask the user immediately before each real call-setting/blocking, lock, barrier, gate, door, or elevator mutation; mock mutations need no confirmation outside the application flow.
 - Use only redacted synthetic fixtures and original UI assets; do not copy APK code or artwork.
 - Do not include `Co-Authored-By` trailers or any Codex/Anthropic co-author line in commits.
 - When a task creates a Rust module, update its nearest existing `mod.rs` (and `src/lib.rs` only for a new top-level module) in the same task and include that registry file in the task commit.
@@ -26,13 +26,13 @@
 
 ## Locked File Map
 
-- `src/domain/property.rs`: flat, capability, dashboard, favorite, and call-setting domain types.
+- `src/domain/property.rs`: flat, capability, dashboard, selected-flat, and call-setting domain types.
 - `src/domain/device.rs`: access-point, intercom, lock, and camera domain types.
 - `src/domain/media.rs`: snapshot/live/archive/event query and result types.
-- `src/provider/mts/dashboard.rs`: flats, services, favorites, and call-settings provider calls only.
+- `src/provider/mts/dashboard.rs`: linked flats, core services, and call-settings provider calls only.
 - `src/provider/mts/intercom.rs`: access points, legacy intercom enrichment, cameras, and lock calls only.
 - `src/provider/mts/media.rs`: snapshot/live/archive provider discovery calls only.
-- `src/provider/mts/events.rs`: event query/delete provider calls only.
+- `src/provider/mts/events.rs`: read-only event query provider calls only.
 - `src/service/property.rs`: selected-flat validation and dashboard composition only.
 - `src/service/devices.rs`: device aggregation and capability filtering only.
 - `src/service/media.rs`: camera ownership, media lookup, and event orchestration only.
@@ -62,7 +62,6 @@ pub struct Flat { pub id: FlatId, pub label: String, pub address: String, pub ca
 pub enum AccessPointKind { Intercom, Barrier, Gate, Elevator, Door, Unknown(String) }
 pub struct AccessPoint { pub id: String, pub flat_id: FlatId, pub name: String, pub kind: AccessPointKind, pub locks: Vec<Lock>, pub camera_ids: Vec<String>, pub available: bool }
 pub struct Camera { pub id: String, pub flat_id: FlatId, pub name: String, pub access_point_id: Option<String>, pub capabilities: CameraCapabilities }
-pub enum FavoriteTarget { AccessPoint(String), Camera(String), Elevator(String), Unknown { kind: String, id: String } }
 ```
 
 - [ ] **Step 1: Write serialization and unknown-enum tests** in `tests/domain_property.rs`, covering camel-case JSON, an unknown access-point category, multi-lock devices, and a capability that is unavailable with a reason.
@@ -71,7 +70,7 @@ pub enum FavoriteTarget { AccessPoint(String), Camera(String), Elevator(String),
 - [ ] **Step 4: Run quality checks:** `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --test domain_property`.
 - [ ] **Step 5: Commit:** `git add src/domain src/lib.rs tests/domain_property.rs && git commit -m "feat: add property and device domain models"`.
 
-### Task 2: Flats, Dashboard Capabilities, Favorites, and Call Settings
+### Task 2: Linked Flats, Core Dashboard Capabilities, and Call Settings
 
 **Files:**
 - Create: `src/provider/mts/dashboard.rs`
@@ -79,9 +78,9 @@ pub enum FavoriteTarget { AccessPoint(String), Camera(String), Elevator(String),
 - Modify: `src/provider/mts/dto/mod.rs`
 - Create: `src/service/property.rs`
 - Create: `src/service/mod.rs`
+- Modify: `src/storage.rs`
 - Create: `tests/fixtures/flats.json`
 - Create: `tests/fixtures/flat_services.json`
-- Create: `tests/fixtures/favorites.json`
 - Create: `tests/contract/dashboard_provider.rs`
 
 **Interfaces:**
@@ -91,18 +90,16 @@ pub enum FavoriteTarget { AccessPoint(String), Camera(String), Elevator(String),
 pub trait PropertyProvider: Send + Sync {
     async fn flats(&self) -> Result<Vec<Flat>, AppError>;
     async fn services(&self, flat: &FlatId) -> Result<CapabilitySet, AppError>;
-    async fn favorites(&self, flat: &FlatId) -> Result<Vec<Favorite>, AppError>;
-    async fn set_favorite(&self, flat: &FlatId, alias: &str, enabled: bool) -> Result<(), AppError>;
     async fn call_settings(&self, flat: &FlatId) -> Result<CallSettings, AppError>;
     async fn update_call_settings(&self, flat: &FlatId, input: CallSettingsPatch) -> Result<CallSettings, AppError>;
 }
 ```
 
-- [ ] **Step 1: Write Wiremock contract tests** asserting query/path/body behavior for `GET /vdome-smart-facade/estate/api/v1/residents/flats`, `GET /vdome-smart-facade/services/api/v1/residents/flats/{id}`, favorites under `/vdome-smart-facade/devices/api/v1/favorites`, call settings under `/vdome-smart-facade/devices/api/v1/call-settings`, and per-apartment block/unblock through `POST|DELETE /gw-intercom/apartment/v1/apartments/{apartmentId}/block/{userId}` when that legacy capability is returned. Cover add/remove/reorder-safe favorite selection for cameras, intercom/access points, and elevators, unknown target kinds, per-flat local fallback matching the APK's main-settings selection, unread/event badge aggregation, and optional/additive fields.
+- [ ] **Step 1: Write Wiremock and storage contract tests** asserting query/path/body behavior for `GET /vdome-smart-facade/estate/api/v1/residents/flats`, `GET /vdome-smart-facade/services/api/v1/residents/flats/{id}`, call settings under `/vdome-smart-facade/devices/api/v1/call-settings`, and per-apartment block/unblock through `POST|DELETE /gw-intercom/apartment/v1/apartments/{apartmentId}/block/{userId}` when that legacy capability is returned. Cover selected-flat ownership and restart persistence, automatic clearing when the linked flat disappears, core capability mapping, unavailable cameras/archive/calls, unknown additive services, event/call indicator counts, call-setting revisions, and the complete absence of favorite requests.
 - [ ] **Step 2: Run and observe failure:** `cargo test --test dashboard_provider -- --nocapture`.
-- [ ] **Step 3: Implement DTO mapping and `PropertyService`**, including selected-flat validation, per-flat favorite target ownership, a local revisioned fallback when the provider does not persist a supported favorite kind, unread/event badge counts, and per-capability failures represented as unavailable data rather than a failed dashboard.
+- [ ] **Step 3: Implement DTO mapping and `PropertyService`**, including selected-flat validation, core event/call indicator counts, optimistic call-setting revisions, and per-capability failures represented as unavailable data rather than a failed dashboard. Do not add onboarding, add/remove-flat, resident, or favorite methods.
 - [ ] **Step 4: Run focused and full backend tests:** `cargo test --test dashboard_provider && cargo test`.
-- [ ] **Step 5: Commit:** `git add src/provider/mts src/service tests/fixtures tests/contract/dashboard_provider.rs && git commit -m "feat: add flats and dashboard provider"`.
+- [ ] **Step 5: Commit:** `git add src/provider/mts src/service src/storage.rs tests/fixtures tests/contract/dashboard_provider.rs && git commit -m "feat: add flats and dashboard provider"`.
 
 ### Task 3: Access Points, Intercom Enrichment, and Cameras
 
@@ -217,25 +214,23 @@ impl MediaService {
     pub async fn events(&self, query: EventQuery) -> Result<Page<Event>, AppError>;
     pub async fn archive(&self, query: ArchiveQuery) -> Result<ArchiveSession, AppError>;
     pub async fn download_clip(&self, query: ArchiveQuery) -> Result<ProxiedMedia, AppError>;
-    pub(crate) async fn delete_events(&self, flat: &FlatId, event_ids: Vec<String>) -> Result<(), AppError>; // called only after MutationService consumes a validated intent
 }
 ```
 
 Add `chrono-tz = "0.10.4"` so local archive inputs and DST edge cases are converted with IANA timezone rules.
 
-- [ ] **Step 1: Write contracts** for list and body-bearing `DELETE /vdome-smart-facade/api/v1/event` plus `/domofon/api/intercom/v1/cameras/{id}/archive`; cover pagination, typed event-ID deletion without a blind retry, inclusive UTC normalization, DST input conversion, empty pages, unavailable archives, maximum 24-hour playback and 15-minute clip bounds, and cross-flat IDs.
+- [ ] **Step 1: Write contracts** for read-only `GET /vdome-smart-facade/api/v1/event` plus `/domofon/api/intercom/v1/cameras/{id}/archive`; cover pagination, filters, inclusive UTC normalization, DST input conversion, empty pages, unavailable archives, maximum 24-hour playback and 15-minute clip bounds, cross-flat IDs, and proof that no event-deletion request method exists.
 - [ ] **Step 2: Run and observe failure:** `cargo test --test events_archive -- --nocapture`.
 - [ ] **Step 3: Implement event mapping and archive sessions** using the same media leases/allowlist as live video; use `Content-Disposition: attachment` with a server-generated filename for downloads and never forward an upstream filename.
 - [ ] **Step 4: Run checks:** `cargo test --test events_archive && cargo test && cargo fmt --check`.
 - [ ] **Step 5: Commit:** `git add Cargo.toml Cargo.lock src/provider/mts src/service/media.rs tests && git commit -m "feat: add camera events and archive"`.
 
-### Task 7: One-Use Confirmation Intents, Event Deletion, and Lock Control
+### Task 7: One-Use Confirmation Intents and Manual Lock Control
 
 **Files:**
 - Create: `src/domain/mutation.rs`
 - Create: `src/service/mutations.rs`
 - Modify: `src/provider/mts/intercom.rs`
-- Modify: `src/provider/mts/events.rs`
 - Create: `tests/mutation_intents.rs`
 - Create: `tests/contract/lock_control.rs`
 
@@ -245,17 +240,17 @@ Add `chrono-tz = "0.10.4"` so local archive inputs and DST edge cases are conver
 pub enum AccessAction { Open }
 pub struct AccessIntentRequest { pub flat_id: FlatId, pub access_point_id: String, pub lock_number: Option<String>, pub action: AccessAction }
 pub struct MutationIntent { pub id: Uuid, pub kind: MutationKind, pub summary: String, pub expires_at: DateTime<Utc> }
-pub enum MutationKind { OpenAccessPoint, DeleteEvents }
+pub enum MutationKind { OpenAccessPoint }
 impl MutationService {
     pub async fn issue_access_intent(&self, session: &LocalSessionId, input: AccessIntentRequest) -> Result<MutationIntent, AppError>;
     pub async fn execute_access_intent(&self, session: &LocalSessionId, intent: Uuid) -> Result<AccessResult, AppError>;
 }
 ```
 
-Later phases extend `MutationKind` and add typed issue/access/order/reading methods; they do not introduce an opaque payload or generic raw executor.
+Phase 3 extends `MutationKind` only with typed call actions and open-during-call. It does not introduce an opaque payload, generic executor, scheduler, or automatic-open policy.
 
-- [ ] **Step 1: Write intent tests** proving expiry after 60 seconds, one-use semantics under concurrency, binding to local session/flat/action payload, access-point/lock and event ownership, rejection when a device/event is unavailable, and no retry on timeout or upstream 5xx after dispatch.
-- [ ] **Step 2: Write provider contracts** for `POST /vdome-smart-facade/devices/api/v1/intercoms/{intercomId}/lock`, the `/{lockNumber}` variant, and body-bearing `DELETE /vdome-smart-facade/api/v1/event`, including optional active-call metadata without logging it.
+- [ ] **Step 1: Write intent tests** proving expiry after 60 seconds, one-use semantics under concurrency, binding to local session/flat/action payload, access-point/lock ownership, rejection when a device is unavailable, and no retry on timeout or upstream 5xx after dispatch.
+- [ ] **Step 2: Write provider contracts** for `POST /vdome-smart-facade/devices/api/v1/intercoms/{intercomId}/lock` and the `/{lockNumber}` variant, including optional active-call metadata without logging it and explicit rejection of unsupported action strings.
 - [ ] **Step 3: Run and observe failure:** `cargo test --test mutation_intents --test lock_control -- --nocapture`.
 - [ ] **Step 4: Implement intent storage and lock calls**, atomically consuming the intent before network dispatch and returning `mutation_outcome_unknown` for ambiguous transport results.
 - [ ] **Step 5: Run checks and commit:** `cargo test --test mutation_intents --test lock_control && cargo clippy --all-targets --all-features -- -D warnings && git add src tests && git commit -m "feat: add confirmed lock control"`.
@@ -279,8 +274,6 @@ Later phases extend `MutationKind` and add typed issue/access/order/reading meth
 GET    /api/v1/flats
 PUT    /api/v1/flats/selected
 GET    /api/v1/dashboard?flatId={flatId}
-GET    /api/v1/favorites?flatId={flatId}
-PUT    /api/v1/favorites/:alias
 GET    /api/v1/call-settings?flatId={flatId}
 PUT    /api/v1/call-settings
 GET    /api/v1/devices?flatId={flatId}
@@ -290,8 +283,6 @@ POST   /api/v1/cameras/:id/archive
 GET    /api/v1/media/:lease/:resource
 POST   /api/v1/cameras/:id/archive/download
 GET    /api/v1/events
-POST   /api/v1/events/delete-intents
-POST   /api/v1/events/delete-intents/:id/execute
 POST   /api/v1/access/intents
 POST   /api/v1/access/intents/:id/execute
 GET    /api/places
@@ -301,7 +292,7 @@ GET    /api/archive/:camera_id
 POST   /api/open-door
 ```
 
-- [ ] **Step 1: Write Axum tests** for every canonical route, schema, optimistic revision on favorite/call-setting writes, validation limit, ownership check, content type/range behavior, stable error envelope, compatibility alias, and secret non-disclosure; assert `/api/open-door` also uses an intent and cannot bypass confirmation.
+- [ ] **Step 1: Write Axum tests** for every canonical route, schema, optimistic revision on call-setting writes, validation limit, ownership check, content type/range behavior, stable error envelope, compatibility alias, and secret non-disclosure. Assert `/api/open-door` also uses an intent and cannot bypass confirmation, and assert excluded favorite/event-deletion routes return JSON `404` without touching the provider.
 - [ ] **Step 2: Run and observe failure:** `cargo test --test dashboard_devices --test media --test access_action -- --nocapture`.
 - [ ] **Step 3: Implement thin handlers** that deserialize validated local DTOs, call services, and stream safe responses; add OpenAPI annotations without exposing provider DTOs.
 - [ ] **Step 4: Run API and full tests:** `cargo test --test dashboard_devices --test media --test access_action && cargo test`.
@@ -313,6 +304,7 @@ POST   /api/open-door
 - Create: `frontend/src/lib/api/devices.ts`
 - Create: `frontend/src/features/home/HomePage.tsx`
 - Create: `frontend/src/features/home/FlatSelector.tsx`
+- Create: `frontend/src/features/home/CallSettingsPanel.tsx`
 - Create: `frontend/src/features/devices/DevicesPage.tsx`
 - Create: `frontend/src/features/devices/AccessPointCard.tsx`
 - Create: `frontend/src/features/devices/ConfirmAccessDialog.tsx`
@@ -321,12 +313,13 @@ POST   /api/open-door
 - Create: `frontend/src/features/cameras/EventTimeline.tsx`
 - Create: `frontend/src/features/cameras/ArchiveControls.tsx`
 - Modify: `frontend/src/app/App.tsx`
+- Test: `frontend/src/features/home/HomePage.test.tsx`
 - Test: `frontend/src/features/devices/DevicesPage.test.tsx`
 - Test: `frontend/src/features/cameras/CameraPlayer.test.tsx`
 - Test: `frontend/src/features/cameras/EventTimeline.test.tsx`
 
-- [ ] **Step 1: Write component tests** for loading/empty/partial-capability/error states, flat switching, selecting/removing device favorites across cameras/intercoms/elevators, favorite persistence isolation per flat, unread dashboard badges and clearing after navigation, call/block settings with stale revisions, keyboard focus, reduced motion, multi-lock confirmation summary, intent expiry, live/archive switching, timeline pagination, confirmed event deletion/unknown outcome, and safe download initiation.
-- [ ] **Step 2: Run and observe failure:** `npm --prefix frontend test -- src/features/devices/DevicesPage.test.tsx src/features/cameras/CameraPlayer.test.tsx src/features/cameras/EventTimeline.test.tsx`.
+- [ ] **Step 1: Write component tests** for loading/empty/partial-capability/error states, flat switching, event/call indicators, call/block settings with stale revisions, keyboard focus, reduced motion, multi-lock confirmation summary, intent expiry, live/archive switching, read-only timeline pagination, safe download initiation, and absence of favorite/event-delete controls.
+- [ ] **Step 2: Run and observe failure:** `npm --prefix frontend test -- src/features/home/HomePage.test.tsx src/features/devices/DevicesPage.test.tsx src/features/cameras/CameraPlayer.test.tsx src/features/cameras/EventTimeline.test.tsx`.
 - [ ] **Step 3: Implement the original responsive UI** with semantic controls, visible focus, Russian messages, no upstream URLs in DOM, and mutation confirmation that creates then explicitly executes a one-use intent.
 - [ ] **Step 4: Run frontend checks:** `npm --prefix frontend run typecheck && npm --prefix frontend test && npm --prefix frontend run build`.
 - [ ] **Step 5: Commit:** `git add frontend && git commit -m "feat: add intercom and camera web UI"`.
@@ -340,7 +333,7 @@ POST   /api/open-door
 - Modify: `README.md`
 
 - [ ] **Step 1: Add a deterministic mock-provider scenario** with two flats, a multi-lock intercom, barrier, elevator, cameras, live HLS, archive, events, partial service outage, and an ambiguous mock mutation response.
-- [ ] **Step 2: Write Playwright coverage** for flat selection, dashboard, per-device favorites/main-settings selection, unread badges, device filters, snapshot, live playback request, archive timeline, clip download, confirmation cancellation/expiry/success, keyboard navigation, mobile viewport, and absence of tokens/upstream media URLs in browser-visible state.
+- [ ] **Step 2: Write Playwright coverage** for flat selection, core dashboard indicators, device filters, snapshot, live playback request, archive timeline, clip download, confirmation cancellation/expiry/success, keyboard navigation, mobile viewport, absence of favorite/event-delete navigation, and absence of tokens/upstream media URLs in browser-visible state.
 - [ ] **Step 3: Run the phase gate:** `cargo test && npm --prefix frontend run typecheck && npm --prefix frontend test && npm --prefix frontend run build && npm --prefix frontend exec -- playwright test frontend/e2e/intercom-media.spec.ts`.
 - [ ] **Step 4: Perform only the documented read-only live smoke** after MTS ID login: flats, capabilities, devices, snapshots, live metadata, event listing, and archive discovery. Redact request/response metadata and do not commit captured account data. Stop and ask the user before sending a real lock request.
 - [ ] **Step 5: Commit:** `git add tests/mock_provider frontend/e2e docs/runbooks/live-device-smoke.md README.md && git commit -m "test: cover intercom and camera flows"`.
