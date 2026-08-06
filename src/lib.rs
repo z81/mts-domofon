@@ -1,6 +1,7 @@
 pub mod api;
 pub mod app;
 pub mod auth;
+pub mod calls;
 pub mod config;
 pub mod domain;
 pub mod error;
