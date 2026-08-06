@@ -1,15 +1,16 @@
-use std::collections::HashMap;
-
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use domru_mts::{
     domain::auth::DeviceIdentity,
     provider::mts::{device::MtsDeviceDescriptor, sso::SsoRequest},
 };
 use serde_json::json;
-use url::Url;
 use uuid::Uuid;
 
 const FIXED_DEVICE_ID: &str = "eyJ1dWlkIjoiMzJmNmFkMmItOWYzZS00YTVkLThkMmMtMmFjNGRjZGJiM2U3IiwicGxhdGZvcm0iOiJBbmRyb2lkIiwidmVuZG9yIjoiVkRvbWUgV2ViIiwibW9kZWwiOiJSdXN0IFNlcnZpY2UiLCJuYW1lIjoiZG9tcnUtbXRzIiwiaXAiOiIiLCJ0aW1lem9uZSI6IkV1cm9wZS9Nb3Njb3ciLCJsb2NhbGUiOiJydV9SVSIsInVzZXJhZ2VudCI6ImRvbXJ1LW10cy8wLjEiLCJ2ZXJzaW9uIjoiNS44LjAiLCJzY3JlZW5TaXplIjoiIiwic3lzdGVtVmVyc2lvbiI6InNlcnZlciJ9";
+const FIXED_STATE: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
 #[test]
 fn encodes_the_fixed_mts_device_descriptor_without_host_data() {
@@ -20,6 +21,7 @@ fn encodes_the_fixed_mts_device_descriptor_without_host_data() {
     let encoded = MtsDeviceDescriptor::from_identity(&identity)
         .encode()
         .unwrap();
+    assert_eq!(encoded, FIXED_DEVICE_ID);
     let decoded: serde_json::Value =
         serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
 
@@ -44,30 +46,34 @@ fn encodes_the_fixed_mts_device_descriptor_without_host_data() {
 
 #[test]
 fn builds_the_current_mts_authorization_url_with_all_scopes() {
-    let request = SsoRequest::new(FIXED_DEVICE_ID, "fixed-state");
+    let request = SsoRequest::new(FIXED_DEVICE_ID, FIXED_STATE).unwrap();
     let url = request.authorize_url();
-    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
 
     assert_eq!(url.scheme(), "https");
     assert_eq!(url.host_str(), Some("login.mts.ru"));
     assert_eq!(url.path(), "/amserver/oauth2/authorize");
-    assert_eq!(query.get("client_id"), Some(&"VDome".to_owned()));
     assert_eq!(
-        query.get("redirect_uri"),
-        Some(&"https://gateway.vdome.mts.ru/user-service/api/auth/callback".to_owned())
+        url.query_pairs().into_owned().collect::<Vec<_>>(),
+        vec![
+            ("client_id".to_owned(), "VDome".to_owned()),
+            (
+                "redirect_uri".to_owned(),
+                "https://gateway.vdome.mts.ru/user-service/api/auth/callback".to_owned(),
+            ),
+            ("response_type".to_owned(), "code".to_owned()),
+            (
+                "scope".to_owned(),
+                "account address sso profile ssom openid phone".to_owned(),
+            ),
+            ("state".to_owned(), FIXED_STATE.to_owned()),
+            ("device_id".to_owned(), FIXED_DEVICE_ID.to_owned()),
+        ]
     );
-    assert_eq!(query.get("response_type"), Some(&"code".to_owned()));
-    assert_eq!(
-        query.get("scope"),
-        Some(&"account address sso profile ssom openid phone".to_owned())
-    );
-    assert_eq!(query.get("state"), Some(&"fixed-state".to_owned()));
-    assert_eq!(query.get("device_id"), Some(&FIXED_DEVICE_ID.to_owned()));
 }
 
 #[test]
 fn supplies_the_observed_login_sdk_headers() {
-    let request = SsoRequest::new(FIXED_DEVICE_ID, "fixed-state");
+    let request = SsoRequest::new(FIXED_DEVICE_ID, FIXED_STATE).unwrap();
     let headers = request.headers();
 
     assert_eq!(headers.len(), 5);
@@ -90,32 +96,60 @@ fn creates_distinct_256_bit_url_safe_states() {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     );
+    assert_eq!(URL_SAFE_NO_PAD.decode(first.state()).unwrap().len(), 32);
     assert_ne!(first.state(), second.state());
 }
 
 #[test]
-fn validates_only_the_expected_https_gateway_callback_and_state() {
-    let request = SsoRequest::new(FIXED_DEVICE_ID, "fixed-state");
-    let valid = Url::parse(
-        "https://gateway.vdome.mts.ru/user-service/api/auth/callback?code=opaque&state=fixed-state",
-    )
-    .unwrap();
+fn validates_only_the_expected_raw_https_gateway_callback_and_state() {
+    let request = SsoRequest::new(FIXED_DEVICE_ID, FIXED_STATE).unwrap();
+    let valid = format!(
+        "https://gateway.vdome.mts.ru/user-service/api/auth/callback?code=opaque&state={FIXED_STATE}"
+    );
 
     assert!(request.validate_callback(&valid).is_ok());
 
     for invalid in [
-        "http://gateway.vdome.mts.ru/user-service/api/auth/callback?state=fixed-state",
-        "https://gateway.vdome.mts.ru.evil.test/user-service/api/auth/callback?state=fixed-state",
-        "https://gateway.vdome.mts.ru/not-the-callback?state=fixed-state",
-        "https://gateway.vdome.mts.ru/user-service/api/auth/callback?state=wrong-state",
-        "https://gateway.vdome.mts.ru/user-service/api/auth/callback",
-        "https://gateway.vdome.mts.ru/user-service/api/auth/callback?state=fixed-state&state=wrong-state",
+        format!("http://gateway.vdome.mts.ru/user-service/api/auth/callback?state={FIXED_STATE}"),
+        format!(
+            "https://gateway.vdome.mts.ru:443/user-service/api/auth/callback?state={FIXED_STATE}"
+        ),
+        format!(
+            "https://user@gateway.vdome.mts.ru/user-service/api/auth/callback?state={FIXED_STATE}"
+        ),
+        format!(
+            "https://gateway.vdome.mts.ru/user-service/api/auth/callback?state={FIXED_STATE}#fragment"
+        ),
+        format!("https://GATEWAY.vdome.mts.ru/user-service/api/auth/callback?state={FIXED_STATE}"),
+        format!("https://gateway.vdome.mts.ru./user-service/api/auth/callback?state={FIXED_STATE}"),
+        format!(
+            "https://gateway.vdome.mts.ru.evil.test/user-service/api/auth/callback?state={FIXED_STATE}"
+        ),
+        format!("https://gateway.vdome.mts.ru/not-the-callback?state={FIXED_STATE}"),
+        "https://gateway.vdome.mts.ru/user-service/api/auth/callback?state=wrong-state".to_owned(),
+        "https://gateway.vdome.mts.ru/user-service/api/auth/callback".to_owned(),
+        format!(
+            "https://gateway.vdome.mts.ru/user-service/api/auth/callback?state={FIXED_STATE}&state={FIXED_STATE}"
+        ),
     ] {
         assert!(
-            request
-                .validate_callback(&Url::parse(invalid).unwrap())
-                .is_err(),
+            request.validate_callback(&invalid).is_err(),
             "must reject {invalid}"
         );
+    }
+}
+
+#[test]
+fn rejects_malformed_short_and_long_states_at_each_boundary() {
+    let malformed = "!AECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    let short = &FIXED_STATE[..42];
+    let long = format!("{FIXED_STATE}A");
+
+    for state in [malformed, short, long.as_str()] {
+        assert!(SsoRequest::new(FIXED_DEVICE_ID, state).is_err());
+        let request = SsoRequest::new(FIXED_DEVICE_ID, FIXED_STATE).unwrap();
+        let callback =
+            format!("https://gateway.vdome.mts.ru/user-service/api/auth/callback?state={state}");
+        assert!(request.validate_callback(&callback).is_err());
     }
 }
