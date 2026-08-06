@@ -320,9 +320,11 @@ async fn logout(
     Extension(request_id): Extension<RequestId>,
 ) -> Result<Json<LogoutResult>, ApiError> {
     let coordinator = coordinator(&state, request_id)?;
-    coordinator
-        .logout()
-        .await
+    let result = coordinator.logout().await;
+    if let Some(manager) = state.live_session_manager() {
+        manager.stop_all().await;
+    }
+    result
         .map(Json)
         .map_err(|error| ApiError::new(request_id, error))
 }

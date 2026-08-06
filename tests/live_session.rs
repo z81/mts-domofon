@@ -1,4 +1,11 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use domru_mts::{
@@ -6,18 +13,30 @@ use domru_mts::{
     service::live::{LiveProcess, LiveProcessRunner, LiveSessionManager},
 };
 use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 #[derive(Default)]
 struct FakeRunner {
     sources: Mutex<Vec<String>>,
+    outputs: Mutex<Vec<PathBuf>>,
+    exits: Mutex<Vec<oneshot::Sender<()>>>,
+    stop_calls: Arc<AtomicUsize>,
 }
 
-struct FakeProcess;
+struct FakeProcess {
+    exited: oneshot::Receiver<()>,
+    stop_calls: Arc<AtomicUsize>,
+}
 
 #[async_trait]
 impl LiveProcess for FakeProcess {
-    async fn stop(&mut self) {}
+    async fn stop(&mut self) {
+        self.stop_calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn wait_for_exit(&mut self) {
+        let _ = (&mut self.exited).await;
+    }
 }
 
 #[async_trait]
@@ -31,6 +50,7 @@ impl LiveProcessRunner for FakeRunner {
             .lock()
             .await
             .push(source.expose_secret().to_owned());
+        self.outputs.lock().await.push(output.to_owned());
         tokio::fs::write(
             output.join("index.m3u8"),
             b"#EXTM3U\n#EXTINF:1,\n/private/provider/segment-000001.ts\n",
@@ -40,7 +60,22 @@ impl LiveProcessRunner for FakeRunner {
         tokio::fs::write(output.join("segment-000001.ts"), b"synthetic-ts")
             .await
             .unwrap();
-        Ok(Box::new(FakeProcess))
+        let (exit, exited) = oneshot::channel();
+        self.exits.lock().await.push(exit);
+        Ok(Box::new(FakeProcess {
+            exited,
+            stop_calls: Arc::clone(&self.stop_calls),
+        }))
+    }
+}
+
+impl FakeRunner {
+    async fn end_next_process(&self) {
+        self.exits.lock().await.remove(0).send(()).unwrap();
+    }
+
+    async fn output_for(&self, index: usize) -> PathBuf {
+        self.outputs.lock().await[index].clone()
     }
 }
 
@@ -50,7 +85,10 @@ async fn session_serves_sanitized_bounded_assets_and_stops_idempotently() {
     let manager = LiveSessionManager::new_for_test(runner.clone(), 2).unwrap();
 
     let view = manager
-        .start(SecretString::from("rtsp://provider.invalid/private"))
+        .start(
+            "camera-private".to_owned(),
+            SecretString::from("rtsp://provider.invalid/private"),
+        )
         .await
         .unwrap();
     let playlist = manager.read(view.session_id, "index.m3u8").await.unwrap();
@@ -79,17 +117,26 @@ async fn session_serves_sanitized_bounded_assets_and_stops_idempotently() {
 async fn session_capacity_and_asset_names_fail_closed() {
     let manager = LiveSessionManager::new_for_test(Arc::new(FakeRunner::default()), 2).unwrap();
     let first = manager
-        .start(SecretString::from("rtsp://provider.invalid/one"))
+        .start(
+            "camera-one".to_owned(),
+            SecretString::from("rtsp://provider.invalid/one"),
+        )
         .await
         .unwrap();
     let second = manager
-        .start(SecretString::from("rtsp://provider.invalid/two"))
+        .start(
+            "camera-two".to_owned(),
+            SecretString::from("rtsp://provider.invalid/two"),
+        )
         .await
         .unwrap();
 
     assert!(
         manager
-            .start(SecretString::from("rtsp://provider.invalid/three"))
+            .start(
+                "camera-three".to_owned(),
+                SecretString::from("rtsp://provider.invalid/three"),
+            )
             .await
             .is_err()
     );
@@ -99,4 +146,156 @@ async fn session_capacity_and_asset_names_fail_closed() {
 
     manager.stop(first.session_id).await.unwrap();
     manager.stop(second.session_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_segment_is_rejected_from_its_declared_metadata() {
+    let runner = Arc::new(FakeRunner::default());
+    let manager = LiveSessionManager::new_for_test(runner.clone(), 1).unwrap();
+    let view = manager
+        .start(
+            "camera-one".to_owned(),
+            SecretString::from("rtsp://provider.invalid/one"),
+        )
+        .await
+        .unwrap();
+    let segment = runner.output_for(0).await.join("segment-000001.ts");
+    tokio::fs::write(&segment, vec![0_u8; 16 * 1024 * 1024 + 1])
+        .await
+        .unwrap();
+
+    assert!(
+        manager
+            .read(view.session_id, "segment-000001.ts")
+            .await
+            .is_err()
+    );
+    manager.stop_all().await;
+}
+
+#[tokio::test]
+async fn session_start_reuses_the_active_camera_session() {
+    let runner = Arc::new(FakeRunner::default());
+    let manager = LiveSessionManager::new_for_test(runner.clone(), 2).unwrap();
+
+    let first = manager
+        .start(
+            "camera-one".to_owned(),
+            SecretString::from("rtsp://provider.invalid/first"),
+        )
+        .await
+        .unwrap();
+    let repeated = manager
+        .start(
+            "camera-one".to_owned(),
+            SecretString::from("rtsp://provider.invalid/rotated"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(repeated.session_id, first.session_id);
+    assert_eq!(runner.sources.lock().await.len(), 1);
+    manager.stop_all().await;
+}
+
+#[tokio::test]
+async fn exited_process_releases_its_camera_and_capacity() {
+    let runner = Arc::new(FakeRunner::default());
+    let manager = LiveSessionManager::new_for_test(runner.clone(), 1).unwrap();
+    let first = manager
+        .start(
+            "camera-one".to_owned(),
+            SecretString::from("rtsp://provider.invalid/one"),
+        )
+        .await
+        .unwrap();
+
+    runner.end_next_process().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if manager
+                .start(
+                    "camera-two".to_owned(),
+                    SecretString::from("rtsp://provider.invalid/two"),
+                )
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dead process releases capacity");
+    assert!(manager.read(first.session_id, "index.m3u8").await.is_err());
+    manager.stop_all().await;
+}
+
+#[tokio::test]
+async fn stop_all_stops_every_active_process_and_releases_capacity() {
+    let runner = Arc::new(FakeRunner::default());
+    let manager = LiveSessionManager::new_for_test(runner.clone(), 2).unwrap();
+    let first = manager
+        .start(
+            "camera-one".to_owned(),
+            SecretString::from("rtsp://provider.invalid/one"),
+        )
+        .await
+        .unwrap();
+    let second = manager
+        .start(
+            "camera-two".to_owned(),
+            SecretString::from("rtsp://provider.invalid/two"),
+        )
+        .await
+        .unwrap();
+
+    manager.stop_all().await;
+
+    assert_eq!(runner.stop_calls.load(Ordering::SeqCst), 2);
+    assert!(manager.read(first.session_id, "index.m3u8").await.is_err());
+    assert!(manager.read(second.session_id, "index.m3u8").await.is_err());
+    assert!(
+        manager
+            .start(
+                "camera-three".to_owned(),
+                SecretString::from("rtsp://provider.invalid/three"),
+            )
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn https_live_source_rejects_userinfo_before_starting_a_process() {
+    let runner = Arc::new(FakeRunner::default());
+    let manager = LiveSessionManager::new_for_test(runner.clone(), 1).unwrap();
+
+    assert!(
+        manager
+            .start(
+                "camera-one".to_owned(),
+                SecretString::from("https://user:password@provider.invalid/live.m3u8"),
+            )
+            .await
+            .is_err()
+    );
+    assert!(runner.sources.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn https_live_source_starts_without_userinfo() {
+    let runner = Arc::new(FakeRunner::default());
+    let manager = LiveSessionManager::new_for_test(runner.clone(), 1).unwrap();
+
+    let view = manager
+        .start(
+            "camera-one".to_owned(),
+            SecretString::from("https://provider.invalid/live.m3u8"),
+        )
+        .await
+        .expect("https source is supported");
+    assert_eq!(runner.sources.lock().await.len(), 1);
+    manager.stop(view.session_id).await.unwrap();
 }

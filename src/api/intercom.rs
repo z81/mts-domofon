@@ -63,6 +63,7 @@ async fn start_live(
             AppError::new(ErrorCode::NotFound, "Live video is unavailable.", false),
         ));
     }
+    let camera_key = format!("{:04x}{}{}", flat_id.0.len(), flat_id.0, camera_id);
     let source = state
         .live_source_provider()
         .ok_or_else(runtime_unavailable)
@@ -74,7 +75,7 @@ async fn start_live(
         .live_session_manager()
         .ok_or_else(runtime_unavailable)
         .map_err(|error| ApiError::new(request_id, error))?
-        .start(source)
+        .start(camera_key, source)
         .await
         .map_err(|error| ApiError::new(request_id, error))?;
     Ok(Json(view))
