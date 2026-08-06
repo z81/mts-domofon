@@ -95,7 +95,7 @@ fn is_query_sensitive_route_path(path: &str) -> bool {
 }
 
 fn is_removed_mts_relay_path(path: &str) -> bool {
-    path == "/amserver" || path.starts_with("/amserver/") || path == "/wsso/authenticate"
+    ValidatedPath::parse(path).is_some_and(|path| path.is_removed_mts_relay_path())
 }
 
 fn redacted_path(path: &str) -> String {
@@ -187,14 +187,14 @@ pub fn build_router_with_config(state: AppState, config: &AppConfig) -> Router {
         .fallback(move |request: Request| {
             let web_assets = web_assets.clone();
             async move {
-                if is_removed_mts_relay_path(request.uri().path()) {
-                    return axum::http::StatusCode::NOT_FOUND.into_response();
-                }
                 let Some(path) = ValidatedPath::parse(request.uri().path()) else {
                     return axum::http::StatusCode::NOT_FOUND.into_response();
                 };
                 if path.is_api() {
                     return api_not_found(&request);
+                }
+                if path.is_removed_mts_relay_path() {
+                    return axum::http::StatusCode::NOT_FOUND.into_response();
                 }
                 web_assets.serve(request, &path).await
             }

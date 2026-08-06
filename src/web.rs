@@ -84,6 +84,12 @@ impl ValidatedPath {
         self.normalized == "/api" || self.normalized.starts_with("/api/")
     }
 
+    pub(crate) fn is_removed_mts_relay_path(&self) -> bool {
+        self.normalized == "/amserver"
+            || self.normalized.starts_with("/amserver/")
+            || self.normalized == "/wsso/authenticate"
+    }
+
     fn is_index(&self) -> bool {
         self.normalized == "/" || self.normalized == INDEX_PATH
     }

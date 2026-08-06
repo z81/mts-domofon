@@ -176,6 +176,7 @@ async fn request_tracing_redacts_the_entire_mts_relay_query() {
         "/amserver?ordinary=visible-looking&code=relay-secret",
         "/amserver/oauth2/authorize?ordinary=visible-looking&code=relay-secret",
         "/wsso/authenticate?ordinary=visible-looking&code=relay-secret",
+        "/amserver%2Foauth2%2Fauthorize?ordinary=encoded-visible&code=encoded-relay-secret",
     ] {
         let response = app
             .clone()
@@ -192,6 +193,8 @@ async fn request_tracing_redacts_the_entire_mts_relay_query() {
     assert!(!formatted.contains("ordinary"));
     assert!(!formatted.contains("visible-looking"));
     assert!(!formatted.contains("relay-secret"));
+    assert!(!formatted.contains("encoded-visible"));
+    assert!(!formatted.contains("encoded-relay-secret"));
 }
 
 #[tokio::test]
