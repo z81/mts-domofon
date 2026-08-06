@@ -20,8 +20,17 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tower::ServiceExt;
 use tower_http::services::fs::{Backend, DefaultServeDirFallback, File, Metadata, ServeDir};
 
+#[cfg(not(unix))]
+compile_error!("web asset snapshots currently support Unix targets only");
+
 const INDEX_PATH: &str = "/index.html";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const SNAPSHOT_LIMITS: SnapshotLimits = SnapshotLimits {
+    max_entries: 4_096,
+    max_file_bytes: 16 * 1024 * 1024,
+    max_total_bytes: 64 * 1024 * 1024,
+    max_depth: 64,
+};
 
 type SnapshotServeDir = ServeDir<DefaultServeDirFallback, SnapshotBackend>;
 
@@ -183,13 +192,18 @@ struct SnapshotBackend {
 
 impl SnapshotBackend {
     fn load(configured_root: &Path) -> io::Result<(PathBuf, Self)> {
+        Self::load_with_limits(configured_root, SNAPSHOT_LIMITS)
+    }
+
+    fn load_with_limits(
+        configured_root: &Path,
+        limits: SnapshotLimits,
+    ) -> io::Result<(PathBuf, Self)> {
         let root = configured_root.canonicalize()?;
         let mut entries = HashMap::new();
 
         #[cfg(unix)]
-        snapshot_unix::load(&root, &mut entries)?;
-        #[cfg(not(unix))]
-        load_portable(&root, &mut entries)?;
+        snapshot_unix::load(&root, &mut entries, limits)?;
 
         Ok((
             root,
@@ -198,6 +212,14 @@ impl SnapshotBackend {
             },
         ))
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SnapshotLimits {
+    max_entries: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+    max_depth: usize,
 }
 
 impl Backend for SnapshotBackend {
@@ -320,25 +342,30 @@ mod snapshot_unix {
 
     use rustix::fs::{Dir, FileType, Mode, OFlags, fstat, open, openat};
 
-    use super::{SnapshotAsset, SnapshotEntry};
+    use super::{SnapshotAsset, SnapshotEntry, SnapshotLimits};
 
     const OPEN_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::CLOEXEC)
-        .union(OFlags::NOFOLLOW);
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::NONBLOCK);
 
     pub(super) fn load(
         root: &Path,
         entries: &mut HashMap<PathBuf, SnapshotEntry>,
+        limits: SnapshotLimits,
     ) -> io::Result<()> {
         let root_fd =
             open(root, OPEN_FLAGS | OFlags::DIRECTORY, Mode::empty()).map_err(io::Error::from)?;
-        load_directory(root_fd, root, entries)
+        let mut budget = SnapshotBudget::new(limits);
+        load_directory(root_fd, root, entries, &mut budget, 0)
     }
 
     fn load_directory(
         directory_fd: OwnedFd,
         logical_path: &Path,
         entries: &mut HashMap<PathBuf, SnapshotEntry>,
+        budget: &mut SnapshotBudget,
+        depth: usize,
     ) -> io::Result<()> {
         entries.insert(logical_path.to_owned(), SnapshotEntry::Directory);
         let mut directory = Dir::read_from(&directory_fd).map_err(io::Error::from)?;
@@ -350,6 +377,8 @@ mod snapshot_unix {
                 continue;
             }
 
+            let child_depth = depth.checked_add(1).ok_or_else(depth_limit_exceeded)?;
+            budget.claim_entry(child_depth)?;
             let name = OsStr::from_bytes(name_bytes);
             let child_path = logical_path.join(name);
             let child_fd = openat(&directory_fd, entry.file_name(), OPEN_FLAGS, Mode::empty())
@@ -362,15 +391,16 @@ mod snapshot_unix {
             let stat = fstat(&child_fd).map_err(io::Error::from)?;
 
             match FileType::from_raw_mode(stat.st_mode) {
-                FileType::Directory => load_directory(child_fd, &child_path, entries)?,
+                FileType::Directory => {
+                    load_directory(child_fd, &child_path, entries, budget, child_depth)?
+                }
                 FileType::RegularFile => {
-                    let mut bytes = Vec::new();
                     let mut file = File::from(child_fd);
                     let modified = file
                         .metadata()?
                         .modified()
                         .unwrap_or(SystemTime::UNIX_EPOCH);
-                    file.read_to_end(&mut bytes)?;
+                    let bytes = budget.read_file(&mut file)?;
                     entries.insert(
                         child_path,
                         SnapshotEntry::File(SnapshotAsset {
@@ -390,48 +420,168 @@ mod snapshot_unix {
 
         Ok(())
     }
-}
 
-#[cfg(not(unix))]
-fn load_portable(
-    directory: &Path,
-    entries: &mut HashMap<PathBuf, SnapshotEntry>,
-) -> io::Result<()> {
-    entries.insert(directory.to_owned(), SnapshotEntry::Directory);
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-        if file_type.is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "web build contains a symlink",
-            ));
+    struct SnapshotBudget {
+        limits: SnapshotLimits,
+        entries: usize,
+        total_bytes: u64,
+    }
+
+    impl SnapshotBudget {
+        fn new(limits: SnapshotLimits) -> Self {
+            Self {
+                limits,
+                entries: 0,
+                total_bytes: 0,
+            }
         }
-        if file_type.is_dir() {
-            load_portable(&path, entries)?;
-        } else if file_type.is_file() {
-            let modified = entry
-                .metadata()?
-                .modified()
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            entries.insert(
-                path.clone(),
-                SnapshotEntry::File(SnapshotAsset {
-                    bytes: Arc::from(std::fs::read(path)?),
-                    modified,
-                }),
-            );
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "web build contains a non-file entry",
-            ));
+
+        fn claim_entry(&mut self, depth: usize) -> io::Result<()> {
+            if depth > self.limits.max_depth {
+                return Err(depth_limit_exceeded());
+            }
+            self.entries = self
+                .entries
+                .checked_add(1)
+                .filter(|entries| *entries <= self.limits.max_entries)
+                .ok_or_else(entry_limit_exceeded)?;
+            Ok(())
+        }
+
+        fn read_file(&mut self, file: &mut File) -> io::Result<Vec<u8>> {
+            let remaining_total = self.limits.max_total_bytes.saturating_sub(self.total_bytes);
+            let allowed = self.limits.max_file_bytes.min(remaining_total);
+            let mut bytes = Vec::new();
+            file.take(allowed.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            let actual = bytes.len() as u64;
+
+            if actual > self.limits.max_file_bytes {
+                return Err(file_byte_limit_exceeded());
+            }
+            if actual > remaining_total {
+                return Err(total_byte_limit_exceeded());
+            }
+            self.total_bytes = self
+                .total_bytes
+                .checked_add(actual)
+                .ok_or_else(total_byte_limit_exceeded)?;
+            Ok(bytes)
         }
     }
-    Ok(())
+
+    fn entry_limit_exceeded() -> io::Error {
+        invalid_snapshot("web asset snapshot entry-count limit exceeded")
+    }
+
+    fn file_byte_limit_exceeded() -> io::Error {
+        invalid_snapshot("web asset snapshot per-file byte limit exceeded")
+    }
+
+    fn total_byte_limit_exceeded() -> io::Error {
+        invalid_snapshot("web asset snapshot aggregate byte limit exceeded")
+    }
+
+    fn depth_limit_exceeded() -> io::Error {
+        invalid_snapshot("web asset snapshot directory-depth limit exceeded")
+    }
+
+    fn invalid_snapshot(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
 }
 
 fn not_found() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, "web asset not found")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, io};
+
+    use super::{SnapshotBackend, SnapshotLimits};
+
+    #[test]
+    fn snapshot_rejects_actual_file_bytes_over_the_per_file_limit() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("private-name.js"), b"12345").unwrap();
+
+        let error = SnapshotBackend::load_with_limits(
+            root.path(),
+            SnapshotLimits {
+                max_entries: 1,
+                max_file_bytes: 4,
+                max_total_bytes: 10,
+                max_depth: 8,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("private-name"));
+    }
+
+    #[test]
+    fn snapshot_rejects_actual_bytes_over_the_aggregate_limit() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("first.js"), b"abc").unwrap();
+        fs::write(root.path().join("second.js"), b"def").unwrap();
+
+        let error = SnapshotBackend::load_with_limits(
+            root.path(),
+            SnapshotLimits {
+                max_entries: 2,
+                max_file_bytes: 3,
+                max_total_bytes: 5,
+                max_depth: 8,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("first.js"));
+        assert!(!error.to_string().contains("second.js"));
+    }
+
+    #[test]
+    fn snapshot_rejects_more_than_the_entry_count_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["one.js", "two.js", "three.js"] {
+            fs::write(root.path().join(name), []).unwrap();
+        }
+
+        let error = SnapshotBackend::load_with_limits(
+            root.path(),
+            SnapshotLimits {
+                max_entries: 2,
+                max_file_bytes: 0,
+                max_total_bytes: 0,
+                max_depth: 8,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains(".js"));
+    }
+
+    #[test]
+    fn snapshot_rejects_directory_nesting_over_the_depth_limit() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("one/two/secret-name")).unwrap();
+
+        let error = SnapshotBackend::load_with_limits(
+            root.path(),
+            SnapshotLimits {
+                max_entries: 3,
+                max_file_bytes: 0,
+                max_total_bytes: 0,
+                max_depth: 2,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("secret-name"));
+    }
 }

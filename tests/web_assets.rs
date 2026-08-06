@@ -273,6 +273,29 @@ async fn source_tree_symlink_swap_cannot_change_the_served_snapshot() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn fifo_in_build_tree_is_rejected_without_blocking_startup() {
+    use std::process::Command;
+
+    let dist = synthetic_dist();
+    let fifo = dist.path().join("assets/blocked.pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let response = build_router_with_config(AppState::default(), &web_config(dist.path()))
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 async fn assert_json_not_found(response: Response<Body>, method: &Method, path: &str) {
     assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
     assert!(
