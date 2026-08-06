@@ -1,18 +1,36 @@
-import { useCallback, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { AuthPage } from '../features/auth/AuthPage'
-import { Modal } from './Modal'
+import type { AuthApi } from '../features/auth/authApi'
+import {
+  IntercomApiError,
+  intercomApi,
+  type AccessPoint,
+  type Camera,
+  type DeviceInventory,
+  type Flat,
+  type IntercomApi,
+  type PropertyDashboard,
+} from '../features/intercom/intercomApi'
 
-type Page = 'home' | 'access' | 'cameras' | 'calls' | 'events' | 'settings'
-type CallState = 'incoming' | 'active' | 'recent'
-type Confirmation = {
-  title: string
-  copy: string
-  action: string
-  success: string
-  onConfirm: () => void
+type Page = 'home' | 'access' | 'cameras' | 'calls' | 'events'
+
+type Remote<T> =
+  | { status: 'loading' }
+  | { status: 'success'; data: T }
+  | { status: 'error'; error: unknown }
+
+type DeviceRemote =
+  | { status: 'idle' }
+  | { status: 'loading'; flatId: string }
+  | { status: 'success'; flatId: string; data: DeviceInventory }
+  | { status: 'error'; flatId: string; error: unknown }
+
+interface AppProps {
+  api?: IntercomApi
+  authApi?: AuthApi
 }
 
-const navigation: Array<{ page: Page; label: string; glyph: string }> = [
+const navigation: ReadonlyArray<{ page: Page; label: string; glyph: string }> = [
   { page: 'home', label: 'Главная', glyph: '⌂' },
   { page: 'access', label: 'Доступ', glyph: '⌑' },
   { page: 'cameras', label: 'Камеры', glyph: '◉' },
@@ -20,130 +38,337 @@ const navigation: Array<{ page: Page; label: string; glyph: string }> = [
   { page: 'events', label: 'События', glyph: '✓' },
 ]
 
-const accessPoints = [
-  { name: 'Подъезд', detail: 'Основной вход' },
-  { name: 'Калитка', detail: 'Со стороны двора' },
-  { name: 'Паркинг', detail: 'Шлагбаум' },
-]
+const accessKindLabels: Record<string, string> = {
+  barrier: 'Шлагбаум',
+  door: 'Дверь',
+  elevator: 'Лифт',
+  gate: 'Калитка',
+  intercom: 'Домофон',
+}
 
 function Glyph({ children }: { children: ReactNode }) {
   return <span className="glyph" aria-hidden="true">{children}</span>
 }
 
-function CameraScene({ archive = false }: { archive?: boolean }) {
-  return <div className="camera-scene" aria-label={archive ? 'Архив камеры у подъезда' : 'Прямая камера у подъезда'}>
-    <div className="scene-building"><i /><i /><i /><i /><i /><i /></div>
-    <div className="scene-door" />
-    <span className="live-badge"><i />{archive ? 'АРХИВ' : 'LIVE'}</span>
-    <span className="camera-time">10:14:26</span>
-    <button className="play-button" aria-label="Запустить прямой эфир" type="button">▶</button>
-    <div className="camera-caption"><span><b>Камера у подъезда</b><small>{archive ? 'Сегодня · 09:42' : 'Синтетический видеопоток'}</small></span></div>
+function isUnauthorized(error: unknown): boolean {
+  return error instanceof IntercomApiError && error.status === 401
+}
+
+function preferredFlat(dashboard: PropertyDashboard): string | null {
+  if (dashboard.selectedFlatId && dashboard.flats.some((flat) => flat.id === dashboard.selectedFlatId)) {
+    return dashboard.selectedFlatId
+  }
+  return dashboard.flats[0]?.id ?? null
+}
+
+function StateCard({ eyebrow, title, children, action }: {
+  eyebrow: string
+  title: string
+  children: ReactNode
+  action?: ReactNode
+}) {
+  return <section className="state-card">
+    <span className="state-icon" aria-hidden="true">⌂</span>
+    <p className="eyebrow">{eyebrow}</p>
+    <h1>{title}</h1>
+    <div className="state-copy">{children}</div>
+    {action && <div className="state-action">{action}</div>}
+  </section>
+}
+
+function AccessList({ accessPoints }: { accessPoints: readonly AccessPoint[] }) {
+  if (accessPoints.length === 0) {
+    return <p className="empty-copy">Точек доступа для этого объекта нет</p>
+  }
+
+  return <div className="access-list">
+    {accessPoints.map((point) => <div className="access-item" key={point.id}>
+      <span className="access-icon"><Glyph>{point.kind === 'barrier' ? '↔' : '⌑'}</Glyph></span>
+      <span className="access-copy">
+        <b>{point.name}</b>
+        <small><i className={point.available ? 'online' : ''} />{point.available ? 'Доступно' : 'Недоступно'} · {accessKindLabels[point.kind] ?? 'Точка входа'}</small>
+      </span>
+      <button
+        aria-label={`Открытие ${point.name} пока недоступно`}
+        className="open-button"
+        disabled
+        title="Команда открытия ещё не подключена"
+        type="button"
+      >Открытие скоро</button>
+    </div>)}
   </div>
 }
 
-function App() {
-  const [page, setPage] = useState<Page>('home')
-  const [confirmation, setConfirmation] = useState<Confirmation | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
-  const [flatOpen, setFlatOpen] = useState(false)
-  const [flat, setFlat] = useState('Демо-квартира · Подъезд 1')
-  const [archive, setArchive] = useState(false)
-  const [authOpen, setAuthOpen] = useState(false)
-  const [call, setCall] = useState<CallState>('incoming')
-  const [muted, setMuted] = useState(false)
-  const [cameraOn, setCameraOn] = useState(true)
-  const [soundOn, setSoundOn] = useState(true)
-  const [speaker, setSpeaker] = useState<'browser' | 'system'>('browser')
+type SnapshotRemote =
+  | { status: 'loading'; requestKey: string }
+  | { status: 'success'; requestKey: string; objectUrl: string }
+  | { status: 'error'; requestKey: string }
 
-  const closeConfirmation = useCallback(() => setConfirmation(null), [])
-  const closeAuth = useCallback(() => setAuthOpen(false), [])
+function CameraSnapshot({ api, camera, flatId }: { api: IntercomApi; camera: Camera; flatId: string }) {
+  const [reload, setReload] = useState(0)
+  const requestKey = `${flatId}\u0000${camera.id}\u0000${reload}`
+  const [snapshot, setSnapshot] = useState<SnapshotRemote>({ status: 'loading', requestKey })
 
-  function showNotice(message: string) {
-    setNotice(message)
-    window.setTimeout(() => setNotice(null), 4200)
-  }
+  useEffect(() => {
+    if (camera.capabilities.snapshot.state !== 'available') return
 
-  function askCommand(title: string, action: string, onConfirm: () => void, success = 'Команда применена только в безопасном предпросмотре') {
-    setConfirmation({
-      title,
-      action,
-      onConfirm,
-      success,
-      copy: 'В рабочем режиме команда была бы отправлена только после этого подтверждения. Preview ничего не отправляет.',
+    const controller = new AbortController()
+    let active = true
+    let objectUrl: string | null = null
+
+    api.getSnapshot(flatId, camera.id, controller.signal).then((blob) => {
+      if (!active) return
+      objectUrl = URL.createObjectURL(blob)
+      setSnapshot({ status: 'success', requestKey, objectUrl })
+    }).catch(() => {
+      if (active && !controller.signal.aborted) setSnapshot({ status: 'error', requestKey })
     })
+
+    return () => {
+      active = false
+      controller.abort()
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [api, camera.capabilities.snapshot.state, camera.id, flatId, reload, requestKey])
+
+  const currentSnapshot: SnapshotRemote = snapshot.requestKey === requestKey
+    ? snapshot
+    : { status: 'loading', requestKey }
+
+  if (camera.capabilities.snapshot.state !== 'available') {
+    return <div className="camera-placeholder"><p>Снимки с этой камеры недоступны</p></div>
+  }
+  if (currentSnapshot.status === 'loading') {
+    return <div className="camera-placeholder" role="status"><span className="loading-ring" /><p>Загружаем кадр…</p></div>
+  }
+  if (currentSnapshot.status === 'error') {
+    return <div className="camera-placeholder" role="alert">
+      <p>Не удалось загрузить кадр</p>
+      <button className="secondary-button" onClick={() => setReload((value) => value + 1)} type="button">Повторить</button>
+    </div>
   }
 
-  function askDoor(name: string, duringCall = false) {
-    askCommand(
-      duringCall ? 'Открыть дверь во время звонка?' : `Открыть ${name}?`,
-      duringCall ? 'Подтвердить открытие двери' : 'Подтвердить открытие',
-      () => undefined,
-      'Команда не отправлена: это безопасный предпросмотр UI',
-    )
-  }
+  return <div className="camera-snapshot">
+    <img alt={`Кадр с камеры ${camera.name}`} src={currentSnapshot.objectUrl} />
+    <span className="snapshot-badge">СНИМОК</span>
+    <div className="camera-caption">
+      <span><b>{camera.name}</b><small>Кадр получен от локального API</small></span>
+      <button onClick={() => setReload((value) => value + 1)} type="button">Обновить</button>
+    </div>
+  </div>
+}
 
-  function executeConfirmation() {
-    if (!confirmation) return
-    const command = confirmation
-    setConfirmation(null)
-    command.onConfirm()
-    showNotice(command.success)
-  }
+function CameraPanel({ api, camera, flatId }: { api: IntercomApi; camera: Camera | null; flatId: string }) {
+  return <article className="camera-card">
+    {camera
+      ? <CameraSnapshot api={api} camera={camera} flatId={flatId} />
+      : <div className="camera-placeholder"><p>Камер для этого объекта нет</p></div>}
+  </article>
+}
+
+function DeviceError({ unauthorized, onAuth, onRetry }: { unauthorized: boolean; onAuth: () => void; onRetry: () => void }) {
+  return <StateCard
+    eyebrow="Устройства"
+    title={unauthorized ? 'Сессия MTS ID истекла' : 'Не удалось загрузить устройства'}
+    action={<button className="primary-button" onClick={unauthorized ? onAuth : onRetry} type="button">{unauthorized ? 'Войти с MTS ID' : 'Повторить'}</button>}
+  >
+    <p>{unauthorized ? 'Войдите снова, чтобы получить список домофонов и камер.' : 'Проверьте локальный сервис и повторите запрос.'}</p>
+  </StateCard>
+}
+
+function UnavailablePage({ eyebrow, title, copy }: { eyebrow: string; title: string; copy: string }) {
+  return <>
+    <section className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h1>{eyebrow}</h1></div></section>
+    <section className="content-card unavailable-card">
+      <span className="state-icon" aria-hidden="true">○</span>
+      <h2>{title}</h2>
+      <p>{copy}</p>
+    </section>
+  </>
+}
+
+function App({ api = intercomApi, authApi }: AppProps) {
+  const [page, setPage] = useState<Page>('home')
+  const [flatOpen, setFlatOpen] = useState(false)
+  const [authOpen, setAuthOpen] = useState(false)
+  const [dashboardReload, setDashboardReload] = useState(0)
+  const [deviceReload, setDeviceReload] = useState(0)
+  const [dashboard, setDashboard] = useState<Remote<PropertyDashboard>>({ status: 'loading' })
+  const [selectedFlatId, setSelectedFlatId] = useState<string | null>(null)
+  const [devices, setDevices] = useState<DeviceRemote>({ status: 'idle' })
+  const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    api.getDashboard(controller.signal).then((result) => {
+      if (controller.signal.aborted) return
+      const flatId = preferredFlat(result)
+      setDashboard({ status: 'success', data: result })
+      setSelectedFlatId(flatId)
+      setSelectedCameraId(null)
+      setDevices(flatId ? { status: 'loading', flatId } : { status: 'idle' })
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) setDashboard({ status: 'error', error })
+    })
+    return () => controller.abort()
+  }, [api, dashboardReload])
+
+  useEffect(() => {
+    if (!selectedFlatId) return
+
+    const flatId = selectedFlatId
+    const controller = new AbortController()
+    api.getDevices(flatId, controller.signal).then((result) => {
+      if (controller.signal.aborted) return
+      setDevices({ status: 'success', flatId, data: result })
+      setSelectedCameraId((current) => result.cameras.some((camera) => camera.id === current) ? current : (result.cameras[0]?.id ?? null))
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) setDevices({ status: 'error', flatId, error })
+    })
+    return () => controller.abort()
+  }, [api, deviceReload, selectedFlatId])
+
+  const selectedFlat = useMemo<Flat | null>(() => {
+    if (dashboard.status !== 'success') return null
+    return dashboard.data.flats.find((flat) => flat.id === selectedFlatId) ?? null
+  }, [dashboard, selectedFlatId])
+
+  const inventory = devices.status === 'success' && devices.flatId === selectedFlatId ? devices.data : null
+  const selectedCamera = inventory?.cameras.find((camera) => camera.id === selectedCameraId) ?? inventory?.cameras[0] ?? null
 
   function selectPage(next: Page) {
     setPage(next)
     setFlatOpen(false)
   }
 
-  const accessList = <div className="access-list">
-    {accessPoints.map((point) => <div className="access-item" key={point.name}>
-      <span className="access-icon"><Glyph>⌑</Glyph></span>
-      <span className="access-copy"><b>{point.name}</b><small><i className="online" />{point.detail}</small></span>
-      <button className="open-button" aria-label={`Открыть ${point.name}`} onClick={() => askDoor(point.name)} type="button">⌑ Открыть</button>
-    </div>)}
-  </div>
+  function selectFlat(flatId: string) {
+    if (flatId === selectedFlatId) {
+      setFlatOpen(false)
+      return
+    }
+    setSelectedFlatId(flatId)
+    setSelectedCameraId(null)
+    setDevices({ status: 'loading', flatId })
+    setFlatOpen(false)
+  }
 
-  const dashboard = <>
-    <section className="page-heading"><div><p className="eyebrow">Синтетические данные · Четверг, 6 августа</p><h1>Домофон</h1><p>Камеры, двери и звонки — в одном месте.</p></div><button className="outline-button" type="button"><span className="status-dot" />Все устройства на связи</button></section>
-    <section className="hero-grid" aria-label="Камера и быстрый доступ">
-      <article className="camera-card"><CameraScene /></article>
-      <aside className="quick-panel"><div className="section-title-row"><div><span className="eyebrow">Быстрый доступ</span><h2>Точки входа</h2></div><span className="count-badge">3</span></div>{accessList}<button className="call-strip" onClick={() => selectPage('calls')} type="button"><Glyph>☎</Glyph><span><b>{call === 'incoming' ? 'Входящий вызов' : 'Нет активного вызова'}</b><small>{call === 'incoming' ? 'Подъезд · ждёт ответа' : 'Откройте журнал звонков'}</small></span><Glyph>›</Glyph></button></aside>
-    </section>
-    <section className="lower-grid"><article className="panel"><div className="section-title-row"><div><span className="eyebrow">Журнал</span><h2>Последние события</h2></div><button className="text-button" onClick={() => selectPage('events')} type="button">Все события ›</button></div>{['Дверь открыта · Подъезд', 'Входящий вызов · 18 секунд', 'Движение у входа'].map((event, index) => <button className="event-row" onClick={() => selectPage(index === 1 ? 'calls' : 'events')} type="button" key={event}><span className="event-art"><Glyph>{index === 1 ? '☎' : index === 2 ? '◉' : '⌑'}</Glyph></span><span><b>{event}</b><small>{index === 0 ? 'Сегодня, 09:42' : 'Вчера, 20:17'}</small></span><Glyph>›</Glyph></button>)}</article><article className="panel notification-card"><span className="connection-orbit"><Glyph>●</Glyph></span><span className="eyebrow">Уведомления</span><h2>Не пропускайте звонки</h2><p>Браузер может показать входящий вызов, когда вкладка свёрнута.</p><button className="primary-button" onClick={() => selectPage('settings')} type="button">Настроить</button></article></section>
-  </>
+  function finishAuthentication() {
+    setAuthOpen(false)
+    setDashboard({ status: 'loading' })
+    setDashboardReload((value) => value + 1)
+  }
 
-  const access = <><section className="page-heading"><div><p className="eyebrow">Синтетические устройства</p><h1>Доступ</h1><p>Подтверждение обязательно для каждой точки входа.</p></div></section><section className="content-card"><div className="section-title-row"><div><h2>Точки доступа</h2><p>Команды в preview не уходят в домофон.</p></div><span className="preview-pill">Демо</span></div>{accessList}</section></>
+  function retryDashboard() {
+    setDashboard({ status: 'loading' })
+    setDashboardReload((value) => value + 1)
+  }
 
-  const cameras = <><section className="page-heading"><div><p className="eyebrow">Синтетический поток</p><h1>{archive ? 'Архив камеры' : 'Камеры'}</h1><p>Камера у подъезда · данные отображаются только для preview.</p></div><div className="segmented"><button className={!archive ? 'selected' : ''} onClick={() => setArchive(false)} type="button">Прямой эфир</button><button className={archive ? 'selected' : ''} aria-label="Архив за сегодня" onClick={() => setArchive(true)} type="button">Архив за сегодня</button></div></section><section className="camera-layout"><article className="camera-card"><CameraScene archive={archive} /></article><aside className="content-card timeline"><span className="eyebrow">{archive ? 'Запись за 6 августа' : 'Статус камеры'}</span><h2>{archive ? '09:42 — событие движения' : 'Поток доступен'}</h2><p>{archive ? 'Шкала не связана с реальным архивом.' : 'Время и кадр созданы для демонстрации.'}</p><div className="timeline-line"><button type="button" aria-label="Событие в 09:42" /><i /><i /><i /></div><button className="primary-button" onClick={() => showNotice('Фрагмент подготовлен только для демонстрации')} type="button">Скачать фрагмент</button></aside></section></>
+  function retryDevices() {
+    if (!selectedFlatId) return
+    setDevices({ status: 'loading', flatId: selectedFlatId })
+    setDeviceReload((value) => value + 1)
+  }
 
-  const incomingCall = <div className="call-actions"><button className="secondary-button" onClick={() => askCommand('Игнорировать вызов?', 'Подтвердить игнорирование', () => setCall('recent'))} type="button">Игнорировать</button><button className="secondary-button danger-outline" onClick={() => askCommand('Отклонить вызов?', 'Подтвердить отклонение', () => setCall('recent'))} type="button">Отклонить</button><button className="primary-button" onClick={() => askCommand('Принять вызов?', 'Подтвердить приём вызова', () => setCall('active'))} type="button">Принять вызов</button></div>
-  const activeCall = <><div className="call-controls"><button className={muted ? 'pressed' : ''} aria-label="Микрофон" onClick={() => askCommand('Изменить микрофон?', 'Подтвердить изменение микрофона', () => setMuted(!muted))} type="button"><Glyph>●</Glyph>{muted ? 'Выкл. микрофон' : 'Микрофон'}</button><button className={cameraOn ? 'pressed' : ''} aria-label="Камера" onClick={() => askCommand('Изменить камеру?', 'Подтвердить изменение камеры', () => setCameraOn(!cameraOn))} type="button"><Glyph>◉</Glyph>Камера</button><button className={soundOn ? 'pressed' : ''} aria-label="Звук" onClick={() => askCommand('Изменить звук?', 'Подтвердить изменение звука', () => setSoundOn(!soundOn))} type="button"><Glyph>♪</Glyph>Звук</button><button aria-label="Аудиовыход" onClick={() => askCommand('Изменить аудиовыход?', 'Подтвердить смену аудиовыхода', () => setSpeaker(speaker === 'browser' ? 'system' : 'browser'))} type="button"><Glyph>◌</Glyph>{speaker === 'browser' ? 'Браузер' : 'Система'}</button></div><div className="call-actions"><button className="secondary-button" onClick={() => askDoor('Подъезд', true)} type="button">Открыть дверь во время звонка</button><button className="primary-button danger" onClick={() => askCommand('Завершить звонок?', 'Подтвердить завершение звонка', () => setCall('recent'))} type="button">Завершить звонок</button></div></>
-  const calls = <><section className="page-heading"><div><p className="eyebrow">Звонки · синтетические данные</p><h1>Звонки</h1><p>Входящий, активный и недавние вызовы в одном журнале.</p></div></section><section className={`call-stage ${call === 'active' ? 'active-call' : ''}`}><span className="call-avatar"><Glyph>☎</Glyph></span><span className="live-badge"><i />{call === 'incoming' ? 'ВХОДЯЩИЙ' : call === 'active' ? 'НА СВЯЗИ' : 'НЕДАВНИЙ'}</span><h2>{call === 'incoming' ? 'Подъезд · домофон' : call === 'active' ? 'Разговор с подъездом' : 'Вызов завершён'}</h2><p>{call === 'incoming' ? 'Кто-то звонит в вашу квартиру' : call === 'active' ? '00:18 · защищённый preview-канал' : 'Сегодня, 10:12 · 18 секунд'}</p>{call === 'incoming' && incomingCall}{call === 'active' && activeCall}</section><section className="content-card recent-calls"><span className="eyebrow">Недавние</span><h2>Журнал вызовов</h2><div className="event-row"><span className="event-art"><Glyph>☎</Glyph></span><span><b>Подъезд</b><small>Вчера, 20:17 · пропущен</small></span></div></section></>
+  function renderDeviceContent() {
+    if (!selectedFlat) return null
+    if (devices.status === 'idle' || devices.status === 'loading' || devices.flatId !== selectedFlat.id) {
+      return <div className="loading-card" role="status"><span className="loading-ring" /><p>Загружаем устройства…</p></div>
+    }
+    if (devices.status === 'error') {
+      return <DeviceError unauthorized={isUnauthorized(devices.error)} onAuth={() => setAuthOpen(true)} onRetry={retryDevices} />
+    }
 
-  const events = <><section className="page-heading"><div><p className="eyebrow">Синтетический журнал</p><h1>События</h1><p>Только события домофона, камер и звонков.</p></div></section><section className="content-card">{['Сегодня, 09:42 · Дверь открыта', 'Сегодня, 09:38 · Движение у подъезда', 'Вчера, 20:17 · Пропущенный звонок'].map((event, index) => <button className="event-row" onClick={() => selectPage(index === 1 ? 'cameras' : index === 2 ? 'calls' : 'access')} type="button" key={event}><span className="event-art"><Glyph>{index === 1 ? '◉' : index === 2 ? '☎' : '⌑'}</Glyph></span><span><b>{event}</b><small>Демо-событие · переход доступен</small></span><Glyph>›</Glyph></button>)}</section></>
+    const deviceInventory = devices.data
+    const availableCount = deviceInventory.accessPoints.filter((point) => point.available).length
 
-  const settings = <><section className="page-heading"><div><p className="eyebrow">Настройки звонков</p><h1>Связь и приватность</h1><p>Настройки действуют только в интерфейсе preview.</p></div></section><section className="settings-grid"><article className="content-card"><span className="eyebrow">Browser Notifications</span><h2>Уведомления браузера</h2><p>Разрешение запрашивается локально в браузере. На сервер ничего не передаётся.</p><button className="primary-button" onClick={() => askCommand('Запросить уведомления браузера?', 'Подтвердить запрос уведомлений', () => undefined, 'Запрос уведомлений доступен только в браузере')} type="button">Запросить уведомления браузера</button></article><article className="content-card"><span className="eyebrow">Блокировка</span><h2>Заблокированные номера</h2><p>Номер не получит уведомления о будущих вызовах в этом preview.</p><button className="secondary-button" onClick={() => askCommand('Заблокировать номер?', 'Подтвердить блокировку', () => undefined, 'Номер заблокирован только в предпросмотре')} type="button">Заблокировать номер +7 999 111-22-33</button></article></section></>
+    if (page === 'access') {
+      return <>
+        <section className="page-heading"><div><p className="eyebrow">{selectedFlat.address}</p><h1>Доступ</h1><p>Точки входа, найденные для выбранного объекта.</p></div></section>
+        <section className="content-card">
+          <div className="section-title-row"><div><h2>Точки доступа</h2><p>Открытие двери появится после подключения защищённой команды.</p></div><span className="count-badge">{deviceInventory.accessPoints.length}</span></div>
+          <AccessList accessPoints={deviceInventory.accessPoints} />
+        </section>
+      </>
+    }
 
-  const content = page === 'home' ? dashboard : page === 'access' ? access : page === 'cameras' ? cameras : page === 'calls' ? calls : page === 'events' ? events : settings
+    if (page === 'cameras') {
+      return <>
+        <section className="page-heading"><div><p className="eyebrow">{selectedFlat.address}</p><h1>Камеры</h1><p>Снимки с камер выбранного объекта.</p></div></section>
+        {deviceInventory.cameras.length > 1 && <div className="camera-tabs" aria-label="Выбор камеры" role="group">
+          {deviceInventory.cameras.map((camera) => <button className={camera.id === selectedCamera?.id ? 'selected' : ''} onClick={() => setSelectedCameraId(camera.id)} type="button" key={camera.id}>{camera.name}</button>)}
+        </div>}
+        <section className="camera-layout">
+          <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} />
+          <aside className="content-card camera-info"><p className="eyebrow">Возможности</p><h2>{selectedCamera?.name ?? 'Камеры не найдены'}</h2><p>{selectedCamera ? 'Сейчас доступен отдельный снимок. Прямой эфир и архив не отображаются, пока их transport не подключён.' : 'Для выбранного объекта MTS не вернул камер.'}</p></aside>
+        </section>
+      </>
+    }
+
+    if (page === 'calls') {
+      return <UnavailablePage eyebrow="Звонки" title="Приём звонков пока не подключён" copy="Интерфейс не показывает выдуманные вызовы. Здесь появится реальный входящий звонок после подключения SIP/WebRTC transport." />
+    }
+
+    if (page === 'events') {
+      return <UnavailablePage eyebrow="События" title="События пока не подключены" copy="Журнал останется пустым, пока локальный API не начнёт отдавать реальные события домофона." />
+    }
+
+    return <>
+      <section className="page-heading">
+        <div><p className="eyebrow">{selectedFlat.address}</p><h1>Домофон</h1><p>Реальные устройства выбранного объекта.</p></div>
+        <span className="device-summary"><i className={availableCount > 0 ? 'online' : ''} />{availableCount} из {deviceInventory.accessPoints.length} точек доступны</span>
+      </section>
+      <section className="hero-grid" aria-label="Камера и быстрый доступ">
+        <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} />
+        <aside className="quick-panel">
+          <div className="section-title-row"><div><p className="eyebrow">Выбранный объект</p><h2>Точки входа</h2></div><span className="count-badge">{deviceInventory.accessPoints.length}</span></div>
+          <AccessList accessPoints={deviceInventory.accessPoints} />
+        </aside>
+      </section>
+      <section className="lower-grid">
+        <article className="panel honest-status"><span className="state-icon" aria-hidden="true">☎</span><p className="eyebrow">Звонки</p><h2>Приём звонков в работе</h2><p>Пока transport не подключён, входящие вызовы здесь не создаются.</p><button className="text-button" onClick={() => selectPage('calls')} type="button">Подробнее ›</button></article>
+        <article className="panel honest-status"><span className="state-icon" aria-hidden="true">✓</span><p className="eyebrow">События</p><h2>Журнал ещё не подключён</h2><p>Экран начнёт заполняться только реальными событиями локального API.</p><button className="text-button" onClick={() => selectPage('events')} type="button">Подробнее ›</button></article>
+      </section>
+    </>
+  }
+
+  let mainContent: ReactNode
+  if (dashboard.status === 'loading') {
+    mainContent = <div className="loading-card" role="status"><span className="loading-ring" /><p>Загружаем объекты…</p></div>
+  } else if (dashboard.status === 'error' && isUnauthorized(dashboard.error)) {
+    mainContent = <StateCard eyebrow="MTS ID" title="Войдите в MTS ID" action={<button className="primary-button" onClick={() => setAuthOpen(true)} type="button">Войти с MTS ID</button>}><p>Авторизация нужна, чтобы загрузить ваши квартиры и домофоны.</p></StateCard>
+  } else if (dashboard.status === 'error') {
+    mainContent = <StateCard eyebrow="Локальный API" title="Не удалось загрузить объекты" action={<button className="primary-button" onClick={retryDashboard} type="button">Повторить</button>}><p>Проверьте, что локальный сервис запущен, и повторите запрос.</p></StateCard>
+  } else if (dashboard.data.flats.length === 0) {
+    mainContent = <StateCard eyebrow="Объекты MTS" title="Нет доступных объектов"><p>MTS ID подключён, но сервис не вернул ни одной квартиры.</p></StateCard>
+  } else {
+    mainContent = renderDeviceContent()
+  }
+
+  const flatOptions = dashboard.status === 'success' ? dashboard.data.flats : []
 
   return <div className="app-frame">
     <a className="skip-link" href="#main-content">К основному содержимому</a>
     <aside className="sidebar" aria-label="Основная навигация">
-      <div className="brand"><span className="brand-mark">V</span><span>VDome <b>Preview</b></span></div>
+      <div className="brand"><span className="brand-mark">V</span><span className="brand-name">VDome <b>MTS</b></span></div>
       <nav className="nav-list">{navigation.map((item) => <button className={`nav-item ${page === item.page ? 'active' : ''}`} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span></button>)}</nav>
-      <div className="sidebar-foot"><button className={`nav-item ${page === 'settings' ? 'active' : ''}`} onClick={() => selectPage('settings')} type="button"><Glyph>⚙</Glyph><span>Настройки звонков</span></button><small><span className="status-dot" />Локальный preview</small></div>
+      <div className="sidebar-foot"><small><span className="status-dot" />Локальный API</small></div>
     </aside>
-    <div className="app-body"><header className="topbar"><div className="flat-wrap"><button className="flat-switcher" aria-expanded={flatOpen} aria-haspopup="menu" onClick={() => setFlatOpen(!flatOpen)} type="button"><span className="flat-icon"><Glyph>⌂</Glyph></span><span><small>Текущий объект</small><b>{flat}</b></span><Glyph>⌄</Glyph></button>{flatOpen && <div className="flat-menu" role="menu"><button role="menuitem" onClick={() => { setFlat('Демо-квартира · Подъезд 1'); setFlatOpen(false) }} type="button">Демо-квартира · Подъезд 1</button><button role="menuitem" onClick={() => { setFlat('Демо-квартира · Корпус B'); setFlatOpen(false) }} type="button">Демо-квартира · Корпус B</button></div>}</div><div className="top-actions"><span className="preview-pill"><span />Предпросмотр</span><button className="icon-button" aria-label="Уведомления" onClick={() => selectPage('settings')} type="button"><Glyph>●</Glyph></button><button className="avatar" aria-label="Профиль подключения" onClick={() => setAuthOpen(true)} type="button">М</button></div></header><main id="main-content" className="main-content">{content}</main></div>
+    <div className="app-body">
+      <header className="topbar">
+        <div className="flat-wrap">
+          <button className="flat-switcher" aria-expanded={flatOpen} aria-haspopup="menu" disabled={flatOptions.length === 0} onClick={() => setFlatOpen((open) => !open)} type="button">
+            <span className="flat-icon"><Glyph>⌂</Glyph></span>
+            <span><small>Текущий объект</small><b>{selectedFlat?.label ?? (dashboard.status === 'loading' ? 'Загрузка…' : 'Не выбран')}</b></span>
+            <Glyph>⌄</Glyph>
+          </button>
+          {flatOpen && <div className="flat-menu" role="menu">{flatOptions.map((flat) => <button aria-current={flat.id === selectedFlatId ? 'true' : undefined} onClick={() => selectFlat(flat.id)} role="menuitem" type="button" key={flat.id}><b>{flat.label}</b><small>{flat.address}</small></button>)}</div>}
+        </div>
+        <div className="top-actions"><span className="api-pill"><span />Локальный API</span><button className="avatar" aria-label="Профиль подключения" onClick={() => setAuthOpen(true)} type="button">М</button></div>
+      </header>
+      <main id="main-content" className="main-content">{mainContent}</main>
+    </div>
     <nav className="mobile-nav" aria-label="Мобильная навигация">{navigation.slice(0, 4).map((item) => <button className={page === item.page ? 'active' : ''} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span></button>)}</nav>
-    {authOpen && <AuthPage onClose={closeAuth} onAuthenticated={() => { closeAuth(); showNotice('Подключение к MTS ID выполнено') }} />}
-    {confirmation && <Modal labelledBy="confirm-title" onClose={closeConfirmation} closeOnBackdrop>
-      <button className="dialog-close" aria-label="Закрыть" onClick={closeConfirmation} type="button">×</button>
-      <span className="dialog-icon"><Glyph>⌑</Glyph></span>
-      <h2 id="confirm-title">{confirmation.title}</h2>
-      <p>{confirmation.copy}</p>
-      <div className="dialog-actions"><button className="secondary-button" data-dialog-initial onClick={closeConfirmation} type="button">Отмена</button><button className="primary-button danger" onClick={executeConfirmation} type="button">{confirmation.action}</button></div>
-    </Modal>}
-    {notice && <div className="toast" role="status"><span>i</span>{notice}</div>}
+    {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} />}
   </div>
 }
 

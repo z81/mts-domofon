@@ -1,132 +1,273 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AuthApi } from '../features/auth/authApi'
+import {
+  IntercomApiError,
+  type DeviceInventory,
+  type IntercomApi,
+  type PropertyDashboard,
+} from '../features/intercom/intercomApi'
 import App from './App'
 
-describe('core intercom shell', () => {
-  it('shows the core dashboard without excluded product sections', () => {
-    render(<App />)
+const available = { state: 'available' } as const
+const unavailable = { state: 'unavailable', reason: null } as const
 
-    expect(screen.getByRole('heading', { name: 'Домофон' })).toBeVisible()
-    expect(screen.getAllByText('Камера у подъезда')[0]).toBeVisible()
-    expect(screen.getByText('Последние события')).toBeVisible()
+const dashboard: PropertyDashboard = {
+  flats: [
+    {
+      id: 'flat-81',
+      label: 'Квартира 81',
+      address: 'Москва, ул. Примерная, 7',
+      capabilities: {
+        accessPoints: available,
+        cameras: available,
+        archive: unavailable,
+        events: unavailable,
+        calls: unavailable,
+        callSettings: unavailable,
+      },
+    },
+    {
+      id: 'flat / 22',
+      label: 'Квартира 22',
+      address: 'Химки, Лесная, 4',
+      capabilities: {
+        accessPoints: available,
+        cameras: available,
+        archive: unavailable,
+        events: unavailable,
+        calls: unavailable,
+        callSettings: unavailable,
+      },
+    },
+  ],
+  selectedFlatId: 'flat-81',
+  callSettings: { state: 'unavailable' },
+}
+
+const inventory: DeviceInventory = {
+  accessPoints: [{
+    id: 'entrance-1',
+    flatId: 'flat-81',
+    name: 'Подъезд 1',
+    kind: 'intercom',
+    locks: [{ number: '1', name: 'Дверь', permanentlyOpen: false }],
+    cameraIds: ['camera-1'],
+    available: true,
+  }],
+  cameras: [{
+    id: 'camera-1',
+    flatId: 'flat-81',
+    name: 'Камера у подъезда',
+    accessPointId: 'entrance-1',
+    capabilities: { snapshot: available, live: unavailable, archive: unavailable },
+  }],
+}
+
+const secondInventory: DeviceInventory = {
+  accessPoints: [{
+    id: 'gate-2',
+    flatId: 'flat / 22',
+    name: 'Калитка',
+    kind: 'gate',
+    locks: [],
+    cameraIds: ['camera / 2'],
+    available: false,
+  }],
+  cameras: [{
+    id: 'camera / 2',
+    flatId: 'flat / 22',
+    name: 'Камера у калитки',
+    accessPointId: 'gate-2',
+    capabilities: { snapshot: available, live: unavailable, archive: unavailable },
+  }],
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve
+    reject = promiseReject
+  })
+  return { promise, reject, resolve }
+}
+
+function createApi(overrides: Partial<IntercomApi> = {}): IntercomApi {
+  return {
+    getDashboard: async () => dashboard,
+    getDevices: async () => inventory,
+    getSnapshot: async () => new Blob(['snapshot'], { type: 'image/webp' }),
+    ...overrides,
+  }
+}
+
+function anonymousAuthApi(): AuthApi {
+  return {
+    completeCallback: async () => { throw new Error('not used') },
+    getSession: async () => ({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }),
+    logout: async () => undefined,
+    startAuth: async () => ({
+      status: 'browser_redirect',
+      flow_id: 'flow-1',
+      authorization_url: 'https://login.mts.ru/amserver/UI/Login?realm=users',
+    }),
+    submitChallenge: async () => { throw new Error('not used') },
+  }
+}
+
+let objectUrlIndex = 0
+
+beforeEach(() => {
+  objectUrlIndex = 0
+  Object.defineProperty(URL, 'createObjectURL', {
+    configurable: true,
+    value: vi.fn(() => `blob:snapshot-${++objectUrlIndex}`),
+  })
+  Object.defineProperty(URL, 'revokeObjectURL', {
+    configurable: true,
+    value: vi.fn(),
+  })
+})
+
+describe('live intercom dashboard', () => {
+  it('keeps a loading state until the real dashboard request settles', async () => {
+    const pending = deferred<PropertyDashboard>()
+    render(<App api={createApi({ getDashboard: () => pending.promise })} />)
+
+    expect(screen.getByRole('status')).toHaveTextContent('Загружаем объекты')
+    expect(screen.queryByText('Квартира 81')).not.toBeInTheDocument()
+
+    await act(async () => pending.resolve(dashboard))
+    expect(await screen.findByText('Квартира 81')).toBeVisible()
+  })
+
+  it('renders linked flats and discovered devices without synthetic product claims', async () => {
+    render(<App api={createApi()} />)
+
+    expect(await screen.findByRole('heading', { name: 'Домофон' })).toBeVisible()
+    expect(await screen.findByText('Подъезд 1')).toBeVisible()
+    expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у подъезда' })).toHaveAttribute('src', 'blob:snapshot-1')
+    expect(screen.getByText('Москва, ул. Примерная, 7')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Открытие Подъезд 1 пока недоступно' })).toBeDisabled()
+    expect(document.body).not.toHaveTextContent(/preview|демо|синтетическ/i)
     expect(screen.queryByText('Поддержка')).not.toBeInTheDocument()
     expect(screen.queryByText('Документы')).not.toBeInTheDocument()
     expect(screen.queryByText('Избранное')).not.toBeInTheDocument()
   })
 
-  it('asks for confirmation before a door can be opened', async () => {
+  it('offers MTS ID authentication when the dashboard returns 401', async () => {
     const user = userEvent.setup()
-    render(<App />)
+    const api = createApi({
+      getDashboard: async () => { throw new IntercomApiError(401, 'authentication_required') },
+    })
+    render(<App api={api} authApi={anonymousAuthApi()} />)
 
-    await user.click(screen.getByRole('button', { name: 'Открыть Подъезд' }))
+    expect(await screen.findByRole('heading', { name: 'Войдите в MTS ID' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Войти с MTS ID' }))
 
-    expect(screen.getByRole('dialog', { name: 'Открыть Подъезд?' })).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Подтвердить открытие' })).toBeVisible()
-  })
-
-  it('presents the real MTS ID entry without a synthetic phone challenge', async () => {
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
-
-    expect(screen.getByRole('button', { name: 'Войти с MTS ID' })).toBeVisible()
+    expect(await screen.findByRole('dialog', { name: 'Вход в VDome' })).toBeVisible()
     expect(screen.getByText('Локальное подключение')).toBeVisible()
-    expect(screen.queryByRole('button', { name: 'Войти по номеру телефона' })).not.toBeInTheDocument()
   })
 
-  it('switches to camera archive and presents a synthetic clip download', async () => {
-    const user = userEvent.setup()
-    render(<App />)
+  it('shows an empty account without requesting devices', async () => {
+    const getDevices = vi.fn<IntercomApi['getDevices']>()
+    render(<App api={createApi({
+      getDashboard: async () => ({ flats: [], selectedFlatId: null, callSettings: { state: 'unavailable' } }),
+      getDevices,
+    })} />)
 
-    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Камеры' }))
-    await user.click(screen.getByRole('button', { name: 'Архив за сегодня' }))
-    await user.click(screen.getByRole('button', { name: 'Скачать фрагмент' }))
-
-    expect(screen.getByRole('heading', { name: 'Архив камеры' })).toBeVisible()
-    expect(screen.getByText('Фрагмент подготовлен только для демонстрации')).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Нет доступных объектов' })).toBeVisible()
+    expect(getDevices).not.toHaveBeenCalled()
   })
 
-  it('requires confirmation before opening a door during an active call', async () => {
+  it('shows a retryable dashboard error and retries on demand', async () => {
     const user = userEvent.setup()
-    render(<App />)
+    const getDashboard = vi.fn<IntercomApi['getDashboard']>()
+      .mockRejectedValueOnce(new IntercomApiError(502, 'upstream_unavailable'))
+      .mockResolvedValueOnce(dashboard)
+    render(<App api={createApi({ getDashboard })} />)
 
-    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
-    await user.click(screen.getByRole('button', { name: 'Принять вызов' }))
-    expect(screen.getByRole('dialog', { name: 'Принять вызов?' })).toBeVisible()
-    await user.click(screen.getByRole('button', { name: 'Подтвердить приём вызова' }))
-    await user.click(screen.getByRole('button', { name: 'Открыть дверь во время звонка' }))
+    expect(await screen.findByRole('heading', { name: 'Не удалось загрузить объекты' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Повторить' }))
 
-    expect(screen.getByRole('dialog', { name: 'Открыть дверь во время звонка?' })).toBeVisible()
+    expect(await screen.findByText('Квартира 81')).toBeVisible()
+    expect(getDashboard).toHaveBeenCalledTimes(2)
   })
 
-  it('asks to confirm blocking a caller and exposes browser notification request', async () => {
+  it('reloads devices and the snapshot when another returned flat is selected', async () => {
     const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(screen.getByRole('button', { name: 'Настройки звонков' }))
-    await user.click(screen.getByRole('button', { name: 'Запросить уведомления браузера' }))
-    expect(screen.getByRole('dialog', { name: 'Запросить уведомления браузера?' })).toBeVisible()
-    await user.click(screen.getByRole('button', { name: 'Подтвердить запрос уведомлений' }))
-    await user.click(screen.getByRole('button', { name: 'Заблокировать номер +7 999 111-22-33' }))
-
-    expect(screen.getByText('Запрос уведомлений доступен только в браузере')).toBeVisible()
-    expect(screen.getByRole('dialog', { name: 'Заблокировать номер?' })).toBeVisible()
-  })
-
-  it.each(['Игнорировать', 'Отклонить'])('confirms the %s call command before changing call state', async (command) => {
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
-    await user.click(screen.getByRole('button', { name: command }))
-
-    expect(screen.getByRole('dialog', { name: `${command} вызов?` })).toBeVisible()
-    expect(screen.getByText('Кто-то звонит в вашу квартиру')).toBeVisible()
-  })
-
-  it('confirms active-call media, output and hangup commands', async () => {
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
-    await user.click(screen.getByRole('button', { name: 'Принять вызов' }))
-    await user.click(screen.getByRole('button', { name: 'Подтвердить приём вызова' }))
-
-    for (const [button, dialog] of [
-      ['Микрофон', 'Изменить микрофон?'],
-      ['Камера', 'Изменить камеру?'],
-      ['Звук', 'Изменить звук?'],
-      ['Аудиовыход', 'Изменить аудиовыход?'],
-    ] as const) {
-      await user.click(screen.getByRole('button', { name: button }))
-      expect(screen.getByRole('dialog', { name: dialog })).toBeVisible()
-      await user.click(screen.getByRole('button', { name: 'Отмена' }))
-    }
-
-    await user.click(screen.getByRole('button', { name: 'Завершить звонок' }))
-    expect(screen.getByRole('dialog', { name: 'Завершить звонок?' })).toBeVisible()
-  })
-
-  it('traps dialog focus, closes on Escape and restores focus to its trigger', async () => {
-    const user = userEvent.setup()
-    render(<App />)
-    const trigger = screen.getByRole('button', { name: 'Открыть Подъезд' })
-
-    await user.click(trigger)
-    expect(screen.getByRole('button', { name: 'Отмена' })).toHaveFocus()
-    await user.keyboard('{Escape}')
-
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-    expect(trigger).toHaveFocus()
-  })
-
-  it('uses menuitem semantics for linked-flat options', async () => {
-    const user = userEvent.setup()
-    render(<App />)
+    const getDevices = vi.fn<IntercomApi['getDevices']>(async (flatId) => flatId === 'flat-81' ? inventory : secondInventory)
+    const getSnapshot = vi.fn<IntercomApi['getSnapshot']>(async () => new Blob(['snapshot'], { type: 'image/webp' }))
+    render(<App api={createApi({ getDevices, getSnapshot })} />)
+    expect(await screen.findByText('Подъезд 1')).toBeVisible()
 
     await user.click(screen.getByRole('button', { name: /Текущий объект/ }))
+    await user.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: /Квартира 22/ }))
 
-    expect(screen.getAllByRole('menuitem')).toHaveLength(2)
+    expect(await screen.findByText('Калитка')).toBeVisible()
+    expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у калитки' })).toHaveAttribute('src', 'blob:snapshot-2')
+    expect(getDevices).toHaveBeenLastCalledWith('flat / 22', expect.any(AbortSignal))
+    expect(getSnapshot).toHaveBeenLastCalledWith('flat / 22', 'camera / 2', expect.any(AbortSignal))
+  })
+
+  it('renders honest empty and error states for a selected flat', async () => {
+    const user = userEvent.setup()
+    const getDevices = vi.fn<IntercomApi['getDevices']>()
+      .mockResolvedValueOnce({ accessPoints: [], cameras: [] })
+      .mockRejectedValueOnce(new IntercomApiError(502, 'upstream_unavailable'))
+    render(<App api={createApi({ getDevices })} />)
+
+    expect(await screen.findByText('Точек доступа для этого объекта нет')).toBeVisible()
+    expect(screen.getByText('Камер для этого объекта нет')).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: /Текущий объект/ }))
+    await user.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: /Квартира 22/ }))
+
+    expect(await screen.findByRole('heading', { name: 'Не удалось загрузить устройства' })).toBeVisible()
+  })
+
+  it('revokes snapshot object URLs when the camera changes and on unmount', async () => {
+    const user = userEvent.setup()
+    const api = createApi({
+      getDevices: async (flatId) => flatId === 'flat-81' ? inventory : secondInventory,
+    })
+    const view = render(<App api={api} />)
+    expect(await screen.findByRole('img', { name: /Кадр с камеры Камера у подъезда/ })).toHaveAttribute('src', 'blob:snapshot-1')
+
+    await user.click(screen.getByRole('button', { name: /Текущий объект/ }))
+    await user.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: /Квартира 22/ }))
+    expect(await screen.findByRole('img', { name: /Кадр с камеры Камера у калитки/ })).toHaveAttribute('src', 'blob:snapshot-2')
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:snapshot-1')
+
+    view.unmount()
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:snapshot-2')
+  })
+
+  it('does not request a snapshot when the camera capability is unavailable', async () => {
+    const getSnapshot = vi.fn<IntercomApi['getSnapshot']>()
+    const camerasUnavailable: DeviceInventory = {
+      ...inventory,
+      cameras: inventory.cameras.map((camera) => ({
+        ...camera,
+        capabilities: { ...camera.capabilities, snapshot: unavailable },
+      })),
+    }
+    render(<App api={createApi({ getDevices: async () => camerasUnavailable, getSnapshot })} />)
+
+    expect(await screen.findByText('Снимки с этой камеры недоступны')).toBeVisible()
+    expect(getSnapshot).not.toHaveBeenCalled()
+  })
+
+  it('does not invent incoming calls, events, or successful door commands', async () => {
+    const user = userEvent.setup()
+    render(<App api={createApi()} />)
+    expect(await screen.findByText('Подъезд 1')).toBeVisible()
+
+    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
+    expect(screen.getByRole('heading', { name: 'Приём звонков пока не подключён' })).toBeVisible()
+    expect(screen.queryByText('Входящий вызов')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Принять вызов' })).not.toBeInTheDocument()
   })
 })

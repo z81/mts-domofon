@@ -32,6 +32,7 @@ describe('AuthPage', () => {
     const otp = await screen.findByRole('textbox', { name: 'Код из SMS' })
     expect(otp).toHaveAttribute('autocomplete', 'one-time-code')
     expect(screen.queryByDisplayValue('+7 999 000-00-00')).not.toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(/демо|синтетическ|preview/i)
   })
 
   it('renders captcha, current password, account selection and consent rejection', async () => {
