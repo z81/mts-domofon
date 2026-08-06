@@ -43,9 +43,12 @@ impl AppConfig {
             .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned()))
             .collect();
 
-        let bind = value_or_default(&values, "VDOME_BIND", DEFAULT_BIND)
+        let bind: SocketAddr = value_or_default(&values, "VDOME_BIND", DEFAULT_BIND)
             .parse()
             .map_err(ConfigError::InvalidBind)?;
+        if !bind.ip().is_loopback() {
+            return Err(ConfigError::BindMustBeLoopback);
+        }
         let data_dir = PathBuf::from(value_or_default(
             &values,
             "VDOME_DATA_DIR",
@@ -87,6 +90,10 @@ impl AppConfig {
 pub enum ConfigError {
     #[error("invalid VDOME_BIND: {0}")]
     InvalidBind(#[source] AddrParseError),
+    #[error(
+        "VDOME_BIND must use a loopback IP address until local API authentication is configured"
+    )]
+    BindMustBeLoopback,
     #[error("invalid provider URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
     #[error("provider URL must use https")]

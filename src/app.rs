@@ -95,14 +95,14 @@ fn is_query_sensitive_route_path(path: &str) -> bool {
 
 fn redacted_path(path: &str) -> String {
     const PREFIX: &str = "/api/v1/access/intents/";
-    const SUFFIX: &str = "/execute";
-    if path
-        .strip_prefix(PREFIX)
-        .and_then(|remainder| remainder.strip_suffix(SUFFIX))
-        .filter(|intent_id| !intent_id.is_empty())
-        .is_some()
-    {
-        return format!("{PREFIX}[REDACTED]{SUFFIX}");
+    if let Some(descendant) = path.strip_prefix(PREFIX) {
+        if let Some((intent_id, suffix)) = descendant.split_once('/') {
+            if !intent_id.is_empty() {
+                return format!("{PREFIX}[REDACTED]/{suffix}");
+            }
+        } else if !descendant.is_empty() {
+            return format!("{PREFIX}[REDACTED]");
+        }
     }
     path.to_owned()
 }

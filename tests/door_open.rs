@@ -846,6 +846,37 @@ async fn tracing_redacts_the_canonical_execute_intent_path_and_query() {
     assert!(!String::from_utf8_lossy(&body).contains(marker));
 }
 
+#[tokio::test]
+async fn malformed_canonical_descendants_are_404_and_never_trace_the_intent_id() {
+    // Catches malformed or future descendant paths bypassing the exact `/execute` redactor.
+    async fn not_found(Extension(uri): Extension<RedactedUri>) -> (StatusCode, String) {
+        (StatusCode::NOT_FOUND, uri.to_string())
+    }
+    let marker = "00000000-0000-4000-8000-000000000123";
+    let app = with_http_middleware(
+        domru_mts::api::router()
+            .with_state(AppState::default())
+            .fallback(not_found),
+    );
+
+    for suffix in ["execute/", "typo", "execute/extra"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/v1/access/intents/{marker}/{suffix}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let traced_uri = response.into_body().collect().await.unwrap().to_bytes();
+        let traced_uri = String::from_utf8(traced_uri.to_vec()).unwrap();
+        assert!(!traced_uri.contains(marker));
+        assert!(traced_uri.contains("[REDACTED]"));
+    }
+}
+
 #[test]
 fn intent_debug_output_never_contains_public_or_target_identifiers() {
     // Catches accidental logging of intent IDs through derived Debug output.

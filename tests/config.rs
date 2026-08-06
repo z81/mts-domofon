@@ -1,4 +1,4 @@
-use domru_mts::config::AppConfig;
+use domru_mts::config::{AppConfig, ConfigError};
 
 #[test]
 fn defaults_are_loopback_and_local_data() {
@@ -12,6 +12,38 @@ fn defaults_are_loopback_and_local_data() {
         cfg.call_endpoint.as_str(),
         "https://webrtc.domofon.mts.ru/ws"
     );
+}
+
+#[test]
+fn rejects_every_non_loopback_bind_until_local_api_authentication_exists() {
+    // Catches exposing mutation endpoints on wildcard, LAN, or public interfaces without local
+    // client authentication.
+    for value in [
+        "0.0.0.0:3000",
+        "[::]:3000",
+        "192.168.1.50:3000",
+        "10.0.0.8:3000",
+        "[2001:db8::1]:3000",
+    ] {
+        let error = AppConfig::from_iter([("VDOME_BIND", value)]).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::BindMustBeLoopback),
+            "{value} failed with the wrong stable config error: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "VDOME_BIND must use a loopback IP address until local API authentication is configured"
+        );
+    }
+}
+
+#[test]
+fn accepts_ipv4_and_ipv6_loopback_bind_addresses() {
+    for value in ["127.0.0.2:3100", "[::1]:3100"] {
+        let config = AppConfig::from_iter([("VDOME_BIND", value)]).unwrap();
+        assert!(config.bind.ip().is_loopback());
+        assert_eq!(config.bind.port(), 3100);
+    }
 }
 
 #[test]
