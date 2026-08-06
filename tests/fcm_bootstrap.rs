@@ -111,8 +111,12 @@ fn debug_output_redacts_session_urls_and_sip_secret() {
     let debug = format!("{bootstrap:?}");
 
     for private_value in [
+        "intercom-42",
+        "Front door",
         "call-session-7",
         "sip-secret-marker",
+        "sip.example.invalid",
+        "resident-1001",
         "https://camera.invalid/live.m3u8",
         "https://webrtc.example.invalid/ws",
     ] {

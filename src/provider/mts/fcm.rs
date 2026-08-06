@@ -71,8 +71,8 @@ impl fmt::Debug for IncomingCallBootstrap {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("IncomingCallBootstrap")
-            .field("intercom_id", &self.intercom_id)
-            .field("caller_name", &self.caller_name)
+            .field("intercom_id", &Redacted)
+            .field("caller_name", &Redacted)
             .field("call_session_id", &Redacted)
             .field("camera_streams", &Redacted)
             .field("websocket_url", &Redacted)
@@ -107,8 +107,8 @@ impl fmt::Debug for SipBootstrapCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SipBootstrapCredentials")
-            .field("registrar", &self.registrar)
-            .field("username", &self.username)
+            .field("registrar", &Redacted)
+            .field("username", &Redacted)
             .field("secret", &Redacted)
             .finish()
     }
@@ -325,6 +325,7 @@ struct RegisterFcmPayload {
     manufacturer: &'static str,
     model: &'static str,
     system_version: &'static str,
+    #[serde(rename = "app_version")]
     app_version: RegisterFcmAppVersion,
     #[serde(rename = "BundleId")]
     bundle_id: &'static str,

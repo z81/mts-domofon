@@ -663,7 +663,7 @@ async fn fcm_token_registration_uses_exact_apk_route_and_payload_keys() {
                 "manufacturer": "domru-mts",
                 "model": "Rust Service",
                 "systemVersion": "server",
-                "appVersion": {"versionName": "3.0.1"},
+                "app_version": {"versionName": "3.0.1"},
                 "BundleId": "ru.mts.vdome.resident",
                 "is_debug": "false"
             },
