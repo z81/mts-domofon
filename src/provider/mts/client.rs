@@ -72,7 +72,7 @@ pub struct PreparedRequest {
     owner: Uuid,
     method: Method,
     base: ProviderBase,
-    path: String,
+    target: PreparedTarget,
     authorization: Authorization,
     body: PreparedBody,
 }
@@ -115,6 +115,12 @@ enum Authorization {
 enum PreparedBody {
     Empty,
     Json(Vec<u8>),
+}
+
+#[derive(Clone)]
+enum PreparedTarget {
+    ValidatedRawPath(String),
+    ClientBuiltUrl(Url),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +206,51 @@ impl MtsClient {
         self.prepare(method, base, path, Authorization::Authorized)
     }
 
+    /// Prepares an authorized request whose provider-owned identifier is one opaque URL segment.
+    ///
+    /// `fixed_prefix` remains subject to the strict raw-path validator. `fixed_suffix`, when
+    /// present, must itself be one plain fixed segment. The opaque value is encoded by `Url` and
+    /// never reinterpreted by raw-path validation.
+    pub fn authorized_with_path_segment(
+        &self,
+        method: Method,
+        base: ProviderBase,
+        fixed_prefix: &str,
+        segment: &str,
+        fixed_suffix: Option<&str>,
+    ) -> Result<PreparedRequest, AppError> {
+        if fixed_prefix.contains('?') || segment.is_empty() || matches!(segment, "." | "..") {
+            return Err(AppError::invalid_request("invalid provider path segment"));
+        }
+        if fixed_suffix.is_some_and(|suffix| !is_fixed_path_segment(suffix)) {
+            return Err(AppError::invalid_request("invalid provider path segment"));
+        }
+
+        let mut url = self.endpoint(base, fixed_prefix)?;
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| AppError::invalid_request("invalid provider path"))?;
+            path.pop_if_empty().push(segment);
+            if let Some(suffix) = fixed_suffix {
+                path.push(suffix);
+            }
+        }
+        if !same_origin(&url, self.base(base)) || url.query().is_some() || url.fragment().is_some()
+        {
+            return Err(AppError::invalid_request("invalid provider path"));
+        }
+
+        Ok(PreparedRequest {
+            owner: self.inner.id,
+            method,
+            base,
+            target: PreparedTarget::ClientBuiltUrl(url),
+            authorization: Authorization::Authorized,
+            body: PreparedBody::Empty,
+        })
+    }
+
     pub fn anonymous_gateway(
         &self,
         method: Method,
@@ -229,7 +280,7 @@ impl MtsClient {
 
     pub async fn send_empty(&self, request: PreparedRequest) -> Result<(), AppError> {
         let response = self.execute(request).await?;
-        let _ = read_bounded(response, MAX_EMPTY_BODY_BYTES).await?;
+        let _ = drain_bounded(response, MAX_EMPTY_BODY_BYTES).await;
         Ok(())
     }
 
@@ -274,7 +325,7 @@ impl MtsClient {
             owner: self.inner.id,
             method,
             base,
-            path: path.to_owned(),
+            target: PreparedTarget::ValidatedRawPath(path.to_owned()),
             authorization,
             body: PreparedBody::Empty,
         })
@@ -286,7 +337,10 @@ impl MtsClient {
         kind: DispatchKind,
     ) -> Result<(Response, Option<HeaderValue>), AppError> {
         self.validate_owner(prepared)?;
-        let url = self.endpoint(prepared.base, &prepared.path)?;
+        let url = match &prepared.target {
+            PreparedTarget::ValidatedRawPath(path) => self.endpoint(prepared.base, path)?,
+            PreparedTarget::ClientBuiltUrl(url) => url.clone(),
+        };
         let mut builder = self.inner.http.request(prepared.method.clone(), url);
         if let PreparedBody::Json(body) = &prepared.body {
             builder = builder
@@ -409,6 +463,14 @@ fn validate_provider_path(path: &str) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+fn is_fixed_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !matches!(segment, "." | "..")
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn repeatedly_percent_decode(segment: &[u8]) -> Result<Vec<u8>, AppError> {

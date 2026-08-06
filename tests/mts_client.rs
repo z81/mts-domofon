@@ -221,6 +221,98 @@ async fn prepared_request_fetches_credentials_and_request_id_at_dispatch_time() 
 }
 
 #[tokio::test]
+async fn client_owned_path_segment_keeps_opaque_data_out_of_url_structure() {
+    let server = MockServer::start().await;
+    let cases = [
+        ("flat%percent", "/resource/flat%25percent/available"),
+        ("flat/section", "/resource/flat%2Fsection/available"),
+        (
+            "flat?query#fragment",
+            "/resource/flat%3Fquery%23fragment/available",
+        ),
+        (
+            "квартира",
+            "/resource/%D0%BA%D0%B2%D0%B0%D1%80%D1%82%D0%B8%D1%80%D0%B0/available",
+        ),
+        (
+            "//evil.example/../flat",
+            "/resource/%2F%2Fevil.example%2F..%2Fflat/available",
+        ),
+    ];
+    for (_, expected_path) in cases {
+        Mock::given(method("GET"))
+            .and(path(expected_path))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let client = client(&server, Arc::new(TestTokens::new(None)));
+
+    for (segment, _) in cases {
+        let request = client
+            .authorized_with_path_segment(
+                Method::GET,
+                ProviderBase::Gateway,
+                "/resource",
+                segment,
+                Some("available"),
+            )
+            .unwrap();
+        client.send_empty(request).await.unwrap();
+    }
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), cases.len());
+    let received_hosts = requests
+        .iter()
+        .map(|request| request.url.host_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        received_hosts
+            .iter()
+            .all(|host| host.as_deref() != Some("evil.example")),
+        "opaque data escaped to {received_hosts:?}"
+    );
+}
+
+#[tokio::test]
+async fn typed_path_segment_rejects_dot_ambiguity_and_unsafe_fixed_structure() {
+    let server = MockServer::start().await;
+    let client = client(&server, Arc::new(TestTokens::new(None)));
+
+    for segment in [".", ".."] {
+        let error = client
+            .authorized_with_path_segment(
+                Method::GET,
+                ProviderBase::Gateway,
+                "/resource",
+                segment,
+                Some("available"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+    for fixed_prefix in [
+        "//evil.example/resource",
+        "/../resource",
+        "/%2e%2e/resource",
+    ] {
+        let error = client
+            .authorized_with_path_segment(
+                Method::GET,
+                ProviderBase::Gateway,
+                fixed_prefix,
+                "flat-synthetic",
+                Some("available"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn reused_prepared_request_gets_fresh_credentials_and_uuid_on_every_dispatch() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -377,6 +469,29 @@ async fn mutation_is_never_refreshed_or_retried_after_unauthorized() {
     assert_eq!(requests[0].body, br#"{"action":"open"}"#);
     assert_eq!(requests[0].headers["content-type"], "application/json");
     assert!(requests[0].headers.get("x-auth-token").is_none());
+}
+
+#[tokio::test]
+async fn successful_unit_status_is_authoritative_despite_oversized_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/unit-with-unexpected-body"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 32 * 1024]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(&server, Arc::new(TestTokens::new(None)));
+
+    let request = client
+        .authorized(
+            Method::POST,
+            ProviderBase::Gateway,
+            "/unit-with-unexpected-body",
+        )
+        .unwrap();
+    client.send_empty(request).await.unwrap();
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

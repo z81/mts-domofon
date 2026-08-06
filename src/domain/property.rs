@@ -106,7 +106,7 @@ impl Serialize for CallMode {
             Self::Gsm => "gsm",
             Self::Sip => "sip",
             Self::Both => "both",
-            Self::Unknown(value) => value,
+            Self::Unknown(_) => "unknown",
         })
     }
 }

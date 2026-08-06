@@ -1,4 +1,7 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use async_trait::async_trait;
 use reqwest::Method;
@@ -16,6 +19,8 @@ use super::{
 const FLATS_PATH: &str = "/vdome-smart-facade/estate/api/v1/residents/flats";
 const CALL_SETTINGS_PATH: &str = "/vdome-smart-facade/devices/api/v1/call-settings";
 const MAX_ARRAY_ITEMS: usize = 512;
+const MAX_TOTAL_DTO_ITEMS: usize = 1_024;
+const MAX_FLATS: usize = 512;
 const MAX_ID_BYTES: usize = 512;
 const MAX_LABEL_BYTES: usize = 1_024;
 const MAX_ADDRESS_BYTES: usize = 4_096;
@@ -122,13 +127,14 @@ impl PropertyProvider for MtsDashboardProvider {
     }
 
     async fn availability(&self, flat: &FlatId) -> Result<AvailabilitySnapshot, AppError> {
-        let path = format!(
-            "/vdome-smart-facade/devices/api/v1/flats/{}/available",
-            encode_path_segment(&flat.0)?
-        );
-        let request = self
-            .client
-            .authorized(Method::GET, ProviderBase::Gateway, &path)?;
+        validate_required(&flat.0, MAX_ID_BYTES)?;
+        let request = self.client.authorized_with_path_segment(
+            Method::GET,
+            ProviderBase::Gateway,
+            "/vdome-smart-facade/devices/api/v1/flats",
+            &flat.0,
+            Some("available"),
+        )?;
         let names: Option<Vec<String>> = self.client.send_json(request).await?;
         let raw_names = names.unwrap_or_default();
         validate_provider_values(&raw_names)?;
@@ -136,13 +142,14 @@ impl PropertyProvider for MtsDashboardProvider {
     }
 
     async fn services(&self, flat: &FlatId) -> Result<ServiceSnapshot, AppError> {
-        let path = format!(
-            "/vdome-smart-facade/services/api/v1/residents/flats/{}",
-            encode_path_segment(&flat.0)?
-        );
-        let request = self
-            .client
-            .authorized(Method::GET, ProviderBase::Gateway, &path)?;
+        validate_required(&flat.0, MAX_ID_BYTES)?;
+        let request = self.client.authorized_with_path_segment(
+            Method::GET,
+            ProviderBase::Gateway,
+            "/vdome-smart-facade/services/api/v1/residents/flats",
+            &flat.0,
+            None,
+        )?;
         let services: Option<Vec<FlatServiceDto>> = self.client.send_json(request).await?;
         let services = services.unwrap_or_default();
         if services.len() > MAX_ARRAY_ITEMS {
@@ -185,11 +192,33 @@ fn map_flats(residents: Vec<ResidentFlatDto>) -> Result<Vec<Flat>, AppError> {
     }
     let mut flats = Vec::new();
     let mut ids = HashSet::new();
+    let mut total_dto_items = 0_usize;
+    let mut total_flats = 0_usize;
     for resident in residents {
         let parts = resident.parts.unwrap_or_default();
         let buildings = resident.buildings.unwrap_or_default();
         if parts.len() > MAX_ARRAY_ITEMS || buildings.len() > MAX_ARRAY_ITEMS {
             return Err(schema_error());
+        }
+        total_dto_items = total_dto_items
+            .checked_add(parts.len())
+            .and_then(|total| total.checked_add(buildings.len()))
+            .filter(|total| *total <= MAX_TOTAL_DTO_ITEMS)
+            .ok_or_else(schema_error)?;
+        total_flats = total_flats
+            .checked_add(parts.len())
+            .filter(|total| *total <= MAX_FLATS)
+            .ok_or_else(schema_error)?;
+
+        let mut buildings_by_id = HashMap::with_capacity(buildings.len());
+        for building in &buildings {
+            validate_required(&building.id, MAX_ID_BYTES)?;
+            if buildings_by_id
+                .insert(building.id.as_str(), building)
+                .is_some()
+            {
+                return Err(schema_error());
+            }
         }
         for part in parts {
             validate_required(&part.id, MAX_ID_BYTES)?;
@@ -197,11 +226,10 @@ fn map_flats(residents: Vec<ResidentFlatDto>) -> Result<Vec<Flat>, AppError> {
             if !ids.insert(part.id.clone()) {
                 return Err(schema_error());
             }
-            let building = buildings
-                .iter()
-                .find(|building| building.id == part.building_id)
+            let building = buildings_by_id
+                .get(part.building_id.as_str())
+                .copied()
                 .ok_or_else(schema_error)?;
-            validate_required(&building.id, MAX_ID_BYTES)?;
             let label = part
                 .display_name
                 .as_deref()
@@ -273,20 +301,6 @@ fn writable_call_mode(mode: &CallMode) -> Result<&'static str, AppError> {
             "Unknown call settings cannot be written.",
         )),
     }
-}
-
-fn encode_path_segment(value: &str) -> Result<String, AppError> {
-    validate_required(value, MAX_ID_BYTES)?;
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write;
-            write!(&mut encoded, "%{byte:02X}").map_err(|_| schema_error())?;
-        }
-    }
-    Ok(encoded)
 }
 
 fn schema_error() -> AppError {

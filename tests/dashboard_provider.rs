@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use domru_mts::{
-    domain::{CallMode, CallSettingsPatch, CallSettingsStatus, Capability, FlatId},
+    domain::{
+        CallMode, CallSettings, CallSettingsPatch, CallSettingsStatus, Capability, FlatId,
+        PropertyDashboard,
+    },
     error::{AppError, ErrorCode},
     provider::mts::{MtsClient, MtsDashboardProvider, NoTokens, PropertyProvider},
     service::property::PropertyService,
@@ -59,7 +62,7 @@ async fn mount_dashboard_reads(server: &MockServer) {
     mount_flats(server, serde_json::from_str(FLATS).unwrap()).await;
     Mock::given(method("GET"))
         .and(path(
-            "/vdome-smart-facade/devices/api/v1/flats/flat%20synthetic%2Bone/available",
+            "/vdome-smart-facade/devices/api/v1/flats/flat%20synthetic+one/available",
         ))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!(["provider-secret-future-capability"])),
@@ -68,7 +71,7 @@ async fn mount_dashboard_reads(server: &MockServer) {
         .await;
     Mock::given(method("GET"))
         .and(path(
-            "/vdome-smart-facade/services/api/v1/residents/flats/flat%20synthetic%2Bone",
+            "/vdome-smart-facade/services/api/v1/residents/flats/flat%20synthetic+one",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_raw(SERVICES, "application/json"))
         .mount(server)
@@ -94,6 +97,42 @@ async fn mount_dashboard_reads(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"type": "both"})))
         .mount(server)
         .await;
+}
+
+fn resident_fixture(prefix: &str, count: usize) -> serde_json::Value {
+    let parts = (0..count)
+        .map(|index| {
+            json!({
+                "id": format!("{prefix}-flat-{index}"),
+                "name": format!("Label {index}"),
+                "displayName": null,
+                "buildingId": format!("{prefix}-building-{index}")
+            })
+        })
+        .collect::<Vec<_>>();
+    let buildings = (0..count)
+        .map(|index| {
+            json!({
+                "id": format!("{prefix}-building-{index}"),
+                "address": {
+                    "fullAddress": format!("Synthetic bounded address {index}")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"parts": parts, "buildings": buildings})
+}
+
+fn buildings_only_fixture(prefix: &str, count: usize) -> serde_json::Value {
+    let buildings = (0..count)
+        .map(|index| {
+            json!({
+                "id": format!("{prefix}-building-{index}"),
+                "address": {"fullAddress": "Synthetic unused address"}
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"parts": [], "buildings": buildings})
 }
 
 #[tokio::test]
@@ -158,11 +197,99 @@ async fn accepts_nullable_and_additive_arrays_but_rejects_identity_or_join_drift
 }
 
 #[tokio::test]
+async fn rejects_ambiguous_duplicate_building_ids_instead_of_selecting_the_first() {
+    let server = MockServer::start().await;
+    mount_flats(
+        &server,
+        json!([{
+            "parts": [{
+                "id": "flat-ambiguous",
+                "name": "Ambiguous flat",
+                "buildingId": "building-duplicate"
+            }],
+            "buildings": [
+                {
+                    "id": "building-duplicate",
+                    "address": {"fullAddress": "Synthetic first private address"}
+                },
+                {
+                    "id": "building-duplicate",
+                    "address": {"fullAddress": "Synthetic second private address"}
+                }
+            ]
+        }]),
+    )
+    .await;
+
+    let error = provider(&server).flats().await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains("first private address"));
+    assert!(!rendered.contains("second private address"));
+}
+
+#[tokio::test]
+async fn enforces_checked_aggregate_flat_boundary_across_resident_objects() {
+    let boundary_server = MockServer::start().await;
+    mount_flats(
+        &boundary_server,
+        json!([
+            resident_fixture("boundary-a", 256),
+            resident_fixture("boundary-b", 256)
+        ]),
+    )
+    .await;
+    assert_eq!(provider(&boundary_server).flats().await.unwrap().len(), 512);
+
+    let oversized_server = MockServer::start().await;
+    mount_flats(
+        &oversized_server,
+        json!([
+            resident_fixture("oversized-a", 256),
+            resident_fixture("oversized-b", 257)
+        ]),
+    )
+    .await;
+
+    let error = provider(&oversized_server).flats().await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
+}
+
+#[tokio::test]
+async fn enforces_checked_aggregate_dto_item_boundary_without_flat_output() {
+    let boundary_server = MockServer::start().await;
+    mount_flats(
+        &boundary_server,
+        json!([
+            buildings_only_fixture("boundary-a", 512),
+            buildings_only_fixture("boundary-b", 512)
+        ]),
+    )
+    .await;
+    assert!(provider(&boundary_server).flats().await.unwrap().is_empty());
+
+    let oversized_server = MockServer::start().await;
+    mount_flats(
+        &oversized_server,
+        json!([
+            buildings_only_fixture("oversized-a", 512),
+            buildings_only_fixture("oversized-b", 512),
+            buildings_only_fixture("oversized-c", 1)
+        ]),
+    )
+    .await;
+
+    let error = provider(&oversized_server).flats().await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
+}
+
+#[tokio::test]
 async fn uses_exact_percent_safe_availability_and_service_paths_only() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(
-            "/vdome-smart-facade/devices/api/v1/flats/flat%20synthetic%2Bone/available",
+            "/vdome-smart-facade/devices/api/v1/flats/flat%20synthetic+one/available",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!(["future-value"])))
         .expect(1)
@@ -170,7 +297,7 @@ async fn uses_exact_percent_safe_availability_and_service_paths_only() {
         .await;
     Mock::given(method("GET"))
         .and(path(
-            "/vdome-smart-facade/services/api/v1/residents/flats/flat%20synthetic%2Bone",
+            "/vdome-smart-facade/services/api/v1/residents/flats/flat%20synthetic+one",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .expect(1)
@@ -191,6 +318,54 @@ async fn uses_exact_percent_safe_availability_and_service_paths_only() {
             && !path.contains("marketplace")
             && !path.contains("meters")
     }));
+}
+
+#[tokio::test]
+async fn opaque_flat_ids_remain_one_url_segment_for_all_supported_characters() {
+    let cases = [
+        ("flat%percent", "flat%25percent"),
+        ("flat/section", "flat%2Fsection"),
+        ("flat?query#fragment", "flat%3Fquery%23fragment"),
+        (
+            "квартира",
+            "%D0%BA%D0%B2%D0%B0%D1%80%D1%82%D0%B8%D1%80%D0%B0",
+        ),
+        ("//evil.example/../flat", "%2F%2Fevil.example%2F..%2Fflat"),
+    ];
+
+    for (flat_id, encoded) in cases {
+        let server = MockServer::start().await;
+        let expected_path = format!("/vdome-smart-facade/devices/api/v1/flats/{encoded}/available");
+        Mock::given(method("GET"))
+            .and(path(expected_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        provider(&server)
+            .availability(&FlatId(flat_id.to_owned()))
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_ne!(requests[0].url.host_str(), Some("evil.example"));
+    }
+}
+
+#[tokio::test]
+async fn exact_dot_segments_are_rejected_without_dispatch_or_path_ambiguity() {
+    let server = MockServer::start().await;
+    let provider = provider(&server);
+
+    for flat_id in [".", ".."] {
+        let error = provider
+            .availability(&FlatId(flat_id.to_owned()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -363,6 +538,23 @@ async fn call_settings_are_account_scoped_exact_and_preserve_unknown_reads() {
         let mode = provider(&server).call_settings().await.unwrap();
         assert_eq!(mode, expected);
         assert!(!format!("{mode:?}").contains("provider-secret-future-mode"));
+        let public_json = serde_json::to_value(PropertyDashboard {
+            flats: Vec::new(),
+            selected_flat_id: None,
+            call_settings: CallSettingsStatus::Available(CallSettings {
+                mode: mode.clone(),
+                revision: 7,
+            }),
+        })
+        .unwrap();
+        assert!(
+            !public_json
+                .to_string()
+                .contains("provider-secret-future-mode")
+        );
+        if matches!(mode, CallMode::Unknown(_)) {
+            assert_eq!(public_json["callSettings"]["settings"]["mode"], "unknown");
+        }
     }
 
     for (mode_value, raw) in [
@@ -441,6 +633,33 @@ async fn unknown_and_stale_writes_are_local_and_success_increments_local_revisio
         .await
         .unwrap_err();
     assert_eq!(stale_again.code, ErrorCode::InvalidRequest);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn successful_call_setting_status_advances_revision_despite_oversized_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/vdome-smart-facade/devices/api/v1/call-settings"))
+        .and(body_json(json!({"type": "both"})))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 32 * 1024]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = SecretStore::open(dir.path(), Some([71; 32])).await.unwrap();
+    let service = PropertyService::new(Arc::new(provider(&server)), store);
+
+    let changed = service
+        .update_call_settings(CallSettingsPatch {
+            mode: CallMode::Both,
+            expected_revision: 0,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(changed.revision, 1);
+    assert_eq!(changed.mode, CallMode::Both);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
