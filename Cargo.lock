@@ -536,6 +536,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.9.5",
  "reqwest",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

@@ -19,7 +19,7 @@ use crate::{
     error::{ApiError, AppError, ErrorCode},
     request_id::{self, RequestId},
     state::AppState,
-    web::WebAssets,
+    web::{ValidatedPath, WebAssets},
 };
 
 const SENSITIVE_QUERY_KEYS: &[&str] = &[
@@ -140,10 +140,13 @@ pub fn build_router_with_config(state: AppState, config: &AppConfig) -> Router {
         .fallback(move |request: Request| {
             let web_assets = web_assets.clone();
             async move {
-                if request.uri().path().starts_with("/api") {
+                let Some(path) = ValidatedPath::parse(request.uri().path()) else {
+                    return axum::http::StatusCode::NOT_FOUND.into_response();
+                };
+                if path.is_api() {
                     return api_not_found(&request);
                 }
-                web_assets.serve(request).await
+                web_assets.serve(request, &path).await
             }
         });
     with_http_middleware(router)
