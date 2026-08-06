@@ -1,5 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { vi } from 'vitest'
 import { AuthPage } from './AuthPage'
 import { AuthApiError, type AuthApi, type AuthChallenge, type SessionView } from './authApi'
 
@@ -7,8 +8,10 @@ function sequenceApi(challenges: readonly AuthChallenge[], session: SessionView 
   let index = 0
   return {
     completeCallback: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } }),
+    confirmLegacySms: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } }),
     getSession: async () => session,
     startAuth: async () => ({ status: 'challenge', flow_id: 'memory-only-flow', challenge: challenges[0] }),
+    startLegacySms: async () => ({ status: 'challenge', flow_id: 'memory-only-legacy-flow', challenge: { type: 'sms_otp', resend_after_seconds: 30 } }),
     submitChallenge: async () => {
       const next = challenges[++index]
       return next
@@ -20,6 +23,97 @@ function sequenceApi(challenges: readonly AuthChallenge[], session: SessionView 
 }
 
 describe('AuthPage', () => {
+  it('requires explicit compatibility consent and sends only a normalized valid phone', async () => {
+    const user = userEvent.setup()
+    const api = sequenceApi([{ type: 'phone' }])
+    const startLegacySms = vi.fn(api.startLegacySms)
+    api.startLegacySms = startLegacySms
+    render(<AuthPage api={api} onClose={() => undefined} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти по SMS' }))
+    expect(screen.getByText('Режим совместимости')).toBeVisible()
+    expect(startLegacySms).not.toHaveBeenCalled()
+
+    const phone = screen.getByRole('textbox', { name: 'Номер телефона для SMS' })
+    await user.type(phone, '+7 999')
+    expect(screen.getByRole('button', { name: 'Получить код по SMS' })).toBeDisabled()
+    expect(screen.getByText('Введите российский номер из 11 цифр')).toBeVisible()
+    expect(startLegacySms).not.toHaveBeenCalled()
+
+    await user.clear(phone)
+    await user.type(phone, '8 (999) 000-00-00')
+    expect(screen.getByRole('button', { name: 'Получить код по SMS' })).toBeDisabled()
+    await user.click(screen.getByRole('checkbox', { name: 'Я согласен использовать режим совместимости для входа по SMS' }))
+    await user.click(screen.getByRole('button', { name: 'Получить код по SMS' }))
+
+    expect(startLegacySms).toHaveBeenCalledTimes(1)
+    expect(startLegacySms).toHaveBeenCalledWith({ phone: '+79990000000', accept_legacy_sms: true })
+    expect(await screen.findByRole('heading', { name: 'Введите код из SMS' })).toBeVisible()
+  })
+
+  it('accepts exactly six OTP digits and ignores a double confirmation click', async () => {
+    const user = userEvent.setup()
+    const api = sequenceApi([{ type: 'phone' }])
+    let finishConfirmation: ((value: Awaited<ReturnType<AuthApi['confirmLegacySms']>>) => void) | undefined
+    const confirmLegacySms = vi.fn(() => new Promise<Awaited<ReturnType<AuthApi['confirmLegacySms']>>>((resolve) => { finishConfirmation = resolve }))
+    api.confirmLegacySms = confirmLegacySms
+    const onAuthenticated = vi.fn()
+    render(<AuthPage api={api} onClose={() => undefined} onAuthenticated={onAuthenticated} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти по SMS' }))
+    await user.type(screen.getByRole('textbox', { name: 'Номер телефона для SMS' }), '+7 999 000-00-00')
+    await user.click(screen.getByRole('checkbox', { name: 'Я согласен использовать режим совместимости для входа по SMS' }))
+    await user.click(screen.getByRole('button', { name: 'Получить код по SMS' }))
+
+    const otp = await screen.findByRole('textbox', { name: 'Шестизначный код из SMS' })
+    await user.type(otp, '12a34')
+    expect(otp).toHaveValue('1234')
+    expect(screen.getByRole('button', { name: 'Подтвердить код' })).toBeDisabled()
+    await user.type(otp, '56')
+    await user.dblClick(screen.getByRole('button', { name: 'Подтвердить код' }))
+
+    expect(confirmLegacySms).toHaveBeenCalledTimes(1)
+    expect(confirmLegacySms).toHaveBeenCalledWith('memory-only-legacy-flow', '123456')
+    finishConfirmation?.({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } })
+    expect(await screen.findByRole('heading', { name: 'Сессия восстановлена' })).toBeVisible()
+    expect(onAuthenticated).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps resend manual and locked for the server-provided delay', async () => {
+    const user = userEvent.setup()
+    const api = sequenceApi([{ type: 'phone' }])
+    const startLegacySms = vi.fn(api.startLegacySms)
+    api.startLegacySms = startLegacySms
+    render(<AuthPage api={api} onClose={() => undefined} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти по SMS' }))
+    await user.type(screen.getByRole('textbox', { name: 'Номер телефона для SMS' }), '+79990000000')
+    await user.click(screen.getByRole('checkbox', { name: 'Я согласен использовать режим совместимости для входа по SMS' }))
+    await user.click(screen.getByRole('button', { name: 'Получить код по SMS' }))
+
+    const resend = await screen.findByRole('button', { name: 'Отправить код повторно' })
+    expect(resend).toBeDisabled()
+    expect(screen.getByText('Повторная отправка будет доступна через 30 сек.')).toBeVisible()
+    expect(startLegacySms).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a stable legacy SMS error without automatic retries', async () => {
+    const user = userEvent.setup()
+    const api = sequenceApi([{ type: 'phone' }])
+    const startLegacySms = vi.fn(async () => { throw new Error('provider secret') })
+    api.startLegacySms = startLegacySms
+    render(<AuthPage api={api} onClose={() => undefined} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти по SMS' }))
+    await user.type(screen.getByRole('textbox', { name: 'Номер телефона для SMS' }), '+79990000000')
+    await user.click(screen.getByRole('checkbox', { name: 'Я согласен использовать режим совместимости для входа по SMS' }))
+    await user.click(screen.getByRole('button', { name: 'Получить код по SMS' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось отправить код')
+    expect(document.body).not.toHaveTextContent('provider secret')
+    expect(startLegacySms).toHaveBeenCalledTimes(1)
+  })
+
   it('advances from phone to OTP and clears the submitted phone secret', async () => {
     const user = userEvent.setup()
     const api = sequenceApi([{ type: 'phone' }, { type: 'sms_otp', resend_after_seconds: 30 }])

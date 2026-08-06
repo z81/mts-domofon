@@ -239,6 +239,7 @@ function App({ api = intercomApi, authApi }: AppProps) {
   const [page, setPage] = useState<Page>('home')
   const [flatOpen, setFlatOpen] = useState(false)
   const [authOpen, setAuthOpen] = useState(false)
+  const [dataSessionEnabled, setDataSessionEnabled] = useState(true)
   const [dashboardReload, setDashboardReload] = useState(0)
   const [deviceReload, setDeviceReload] = useState(0)
   const [dashboard, setDashboard] = useState<Remote<PropertyDashboard>>({ status: 'loading' })
@@ -248,14 +249,18 @@ function App({ api = intercomApi, authApi }: AppProps) {
   const [preparingAccessPointId, setPreparingAccessPointId] = useState<string | null>(null)
   const [doorIntent, setDoorIntent] = useState<PreparedDoorIntent | null>(null)
   const [doorExecuting, setDoorExecuting] = useState(false)
+  const [doorOutcomeUnknown, setDoorOutcomeUnknown] = useState(false)
   const [doorFeedback, setDoorFeedback] = useState<DoorFeedback | null>(null)
   const doorPreparationInFlight = useRef(false)
   const doorExecutionInFlight = useRef(false)
+  const sessionEpoch = useRef(0)
 
   useEffect(() => {
+    if (!dataSessionEnabled) return
+    const requestEpoch = sessionEpoch.current
     const controller = new AbortController()
     api.getDashboard(controller.signal).then((result) => {
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted || requestEpoch !== sessionEpoch.current) return
       const flatId = preferredFlat(result)
       setDashboard({ status: 'success', data: result })
       setSelectedFlatId(flatId)
@@ -263,25 +268,38 @@ function App({ api = intercomApi, authApi }: AppProps) {
       setDevices(flatId ? { status: 'loading', flatId } : { status: 'idle' })
       setDeviceReload((value) => value + 1)
     }).catch((error: unknown) => {
-      if (!controller.signal.aborted) setDashboard({ status: 'error', error })
+      if (!controller.signal.aborted && requestEpoch === sessionEpoch.current) setDashboard({ status: 'error', error })
     })
     return () => controller.abort()
-  }, [api, dashboardReload])
+  }, [api, dashboardReload, dataSessionEnabled])
 
   useEffect(() => {
-    if (!selectedFlatId) return
+    if (!dataSessionEnabled || !selectedFlatId) return
 
     const flatId = selectedFlatId
+    const requestEpoch = sessionEpoch.current
     const controller = new AbortController()
     api.getDevices(flatId, controller.signal).then((result) => {
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted || requestEpoch !== sessionEpoch.current) return
       setDevices({ status: 'success', flatId, data: result })
       setSelectedCameraId((current) => result.cameras.some((camera) => camera.id === current) ? current : (result.cameras[0]?.id ?? null))
     }).catch((error: unknown) => {
-      if (!controller.signal.aborted) setDevices({ status: 'error', flatId, error })
+      if (!controller.signal.aborted && requestEpoch === sessionEpoch.current) setDevices({ status: 'error', flatId, error })
     })
     return () => controller.abort()
-  }, [api, deviceReload, selectedFlatId])
+  }, [api, dataSessionEnabled, deviceReload, selectedFlatId])
+
+  useEffect(() => {
+    if (!doorIntent || doorExecuting) return
+    const expiresAt = new Date(doorIntent.expiresAt).getTime()
+    if (Number.isNaN(expiresAt)) return
+    const delay = Math.max(0, expiresAt - Date.now())
+    const timer = window.setTimeout(() => {
+      setDoorIntent(null)
+      setDoorFeedback({ kind: 'error', message: 'Подтверждение истекло. Подготовьте открытие заново.' })
+    }, Math.min(delay, 2_147_483_647))
+    return () => window.clearTimeout(timer)
+  }, [doorExecuting, doorIntent])
 
   const selectedFlat = useMemo<Flat | null>(() => {
     if (dashboard.status !== 'success') return null
@@ -290,7 +308,7 @@ function App({ api = intercomApi, authApi }: AppProps) {
 
   const inventory = devices.status === 'success' && devices.flatId === selectedFlatId ? devices.data : null
   const selectedCamera = inventory?.cameras.find((camera) => camera.id === selectedCameraId) ?? inventory?.cameras[0] ?? null
-  const doorInteractionLocked = preparingAccessPointId !== null || doorIntent !== null || doorExecuting
+  const doorInteractionLocked = preparingAccessPointId !== null || doorIntent !== null || doorExecuting || doorOutcomeUnknown
 
   function selectPage(next: Page) {
     setPage(next)
@@ -309,9 +327,32 @@ function App({ api = intercomApi, authApi }: AppProps) {
   }
 
   function finishAuthentication() {
+    sessionEpoch.current += 1
+    setDataSessionEnabled(true)
     setAuthOpen(false)
+    setDoorOutcomeUnknown(false)
+    setDoorFeedback(null)
     setDashboard({ status: 'loading' })
     setDashboardReload((value) => value + 1)
+  }
+
+  function finishLogout() {
+    sessionEpoch.current += 1
+    doorPreparationInFlight.current = false
+    doorExecutionInFlight.current = false
+    setDataSessionEnabled(false)
+    setAuthOpen(false)
+    setPage('home')
+    setFlatOpen(false)
+    setDashboard({ status: 'error', error: new IntercomApiError(401, 'authentication_required') })
+    setSelectedFlatId(null)
+    setDevices({ status: 'idle' })
+    setSelectedCameraId(null)
+    setPreparingAccessPointId(null)
+    setDoorIntent(null)
+    setDoorExecuting(false)
+    setDoorOutcomeUnknown(false)
+    setDoorFeedback(null)
   }
 
   function retryDashboard() {
@@ -327,11 +368,13 @@ function App({ api = intercomApi, authApi }: AppProps) {
 
   async function prepareDoor(flat: Flat, point: AccessPoint, lock: Lock) {
     if (doorPreparationInFlight.current || doorExecutionInFlight.current || doorIntent) return
+    const operationEpoch = sessionEpoch.current
     doorPreparationInFlight.current = true
     setPreparingAccessPointId(point.id)
     setDoorFeedback(null)
     try {
       const intent = await api.createDoorIntent(flat.id, point.id, lock.number)
+      if (operationEpoch !== sessionEpoch.current) return
       setDoorIntent({
         intentId: intent.intentId,
         expiresAt: intent.expiresAt,
@@ -341,10 +384,12 @@ function App({ api = intercomApi, authApi }: AppProps) {
         lockName: lock.name,
       })
     } catch {
-      setDoorFeedback({ kind: 'error', message: 'Не удалось подготовить открытие. Повторите попытку.' })
+      if (operationEpoch === sessionEpoch.current) setDoorFeedback({ kind: 'error', message: 'Не удалось подготовить открытие. Повторите попытку.' })
     } finally {
-      doorPreparationInFlight.current = false
-      setPreparingAccessPointId(null)
+      if (operationEpoch === sessionEpoch.current) {
+        doorPreparationInFlight.current = false
+        setPreparingAccessPointId(null)
+      }
     }
   }
 
@@ -356,25 +401,25 @@ function App({ api = intercomApi, authApi }: AppProps) {
   async function executeDoor() {
     if (!doorIntent || doorExecutionInFlight.current) return
     const intent = doorIntent
+    const operationEpoch = sessionEpoch.current
     doorExecutionInFlight.current = true
     setDoorExecuting(true)
     setDoorFeedback(null)
     try {
       await api.executeDoorIntent(intent.intentId)
+      if (operationEpoch !== sessionEpoch.current) return
       setDoorIntent(null)
       setDoorFeedback({ kind: 'success', message: `${intent.accessPointName} открыт` })
-    } catch (error) {
+    } catch {
+      if (operationEpoch !== sessionEpoch.current) return
       setDoorIntent(null)
-      if (error instanceof IntercomApiError && error.code === 'door_open_intent_not_found') {
-        setDoorFeedback({ kind: 'error', message: 'Подтверждение истекло или уже использовано. Подготовьте открытие заново.' })
-      } else if (error instanceof IntercomApiError && error.code === 'mutation_outcome_unknown') {
-        setDoorFeedback({ kind: 'error', message: 'Результат открытия неизвестен. Не повторяйте команду сразу — сначала проверьте дверь.' })
-      } else {
-        setDoorFeedback({ kind: 'error', message: 'Открытие не выполнено. Подготовьте новую команду и попробуйте снова.' })
-      }
+      setDoorOutcomeUnknown(true)
+      setDoorFeedback({ kind: 'error', message: 'Результат открытия неизвестен. Не повторяйте команду сразу — сначала проверьте дверь.' })
     } finally {
-      doorExecutionInFlight.current = false
-      setDoorExecuting(false)
+      if (operationEpoch === sessionEpoch.current) {
+        doorExecutionInFlight.current = false
+        setDoorExecuting(false)
+      }
     }
   }
 
@@ -477,7 +522,7 @@ function App({ api = intercomApi, authApi }: AppProps) {
       <main id="main-content" className="main-content">{mainContent}</main>
     </div>
     <nav className="mobile-nav" aria-label="Мобильная навигация">{navigation.slice(0, 4).map((item) => <button className={page === item.page ? 'active' : ''} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span></button>)}</nav>
-    {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} />}
+    {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} onLoggedOut={finishLogout} />}
     {doorIntent && <Modal className="door-dialog" labelledBy="door-confirm-title" onClose={closeDoorIntent} closeOnBackdrop>
       <button aria-label="Закрыть" className="dialog-close" disabled={doorExecuting} onClick={closeDoorIntent} type="button">×</button>
       <span className="dialog-icon"><Glyph>⌑</Glyph></span>

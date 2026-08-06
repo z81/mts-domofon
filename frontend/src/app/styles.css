@@ -231,6 +231,9 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(37, 108, 82, .35
 .form-error { margin-top: 16px !important; padding: 11px 13px; color: #8f2f2f !important; border-radius: 10px; background: #fbeaea; font-weight: 700; }
 .auth-dialog button:not(.dialog-close) { min-width: 120px; }
 .auth-link { min-height: 44px; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
+.field-hint { margin: -13px 0 17px !important; color: #8f2f2f !important; font-size: 12px; font-weight: 700; }
+.compatibility-consent { display: flex; align-items: flex-start; gap: 9px; color: #47564f; font-size: 12px; line-height: 1.45; cursor: pointer; }
+.compatibility-consent input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: var(--green); flex: 0 0 auto; }
 
 /* Real local-API states. */
 .api-pill { min-height: 32px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px; color: #567064; border: 1px solid #dae3dc; border-radius: 999px; background: #fff; font-size: 11px; font-weight: 700; }

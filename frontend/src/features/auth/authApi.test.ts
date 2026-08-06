@@ -32,6 +32,35 @@ function jsonResponse(body: unknown, status = 200) {
 }
 
 describe('production auth API boundary', () => {
+  it('uses the explicit legacy SMS routes with their exact canonical JSON bodies', async () => {
+    const authenticated: AuthProgress = {
+      status: 'authenticated',
+      session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' },
+    }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(otpProgress))
+      .mockResolvedValueOnce(jsonResponse(authenticated))
+    const api = createProductionAuthApi(fetcher)
+
+    await expect(api.startLegacySms({ phone: '+79990000000', accept_legacy_sms: true })).resolves.toEqual(otpProgress)
+    await expect(api.confirmLegacySms('flow / opaque', '123456')).resolves.toEqual(authenticated)
+
+    expect(fetcher).toHaveBeenNthCalledWith(1, '/api/v1/auth/legacy-sms/start', {
+      body: JSON.stringify({ phone: '+79990000000', accept_legacy_sms: true }),
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal: undefined,
+    })
+    expect(fetcher).toHaveBeenNthCalledWith(2, '/api/v1/auth/legacy-sms/flows/flow%20%2F%20opaque/confirm', {
+      body: JSON.stringify({ code: '123456' }),
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal: undefined,
+    })
+  })
+
   it('starts auth with the canonical Task 8 route and empty JSON body', async () => {
     const fetcher = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(jsonResponse(redirectProgress))

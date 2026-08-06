@@ -1,4 +1,4 @@
-import { act, render, screen, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuthApi } from '../features/auth/authApi'
@@ -108,6 +108,7 @@ function createApi(overrides: Partial<IntercomApi> = {}): IntercomApi {
 function anonymousAuthApi(): AuthApi {
   return {
     completeCallback: async () => { throw new Error('not used') },
+    confirmLegacySms: async () => { throw new Error('not used') },
     getSession: async () => ({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }),
     logout: async () => undefined,
     startAuth: async () => ({
@@ -115,7 +116,16 @@ function anonymousAuthApi(): AuthApi {
       flow_id: 'flow-1',
       authorization_url: 'https://login.mts.ru/amserver/UI/Login?realm=users',
     }),
+    startLegacySms: async () => { throw new Error('not used') },
     submitChallenge: async () => { throw new Error('not used') },
+  }
+}
+
+function authenticatedAuthApi(overrides: Partial<AuthApi> = {}): AuthApi {
+  return {
+    ...anonymousAuthApi(),
+    getSession: async () => ({ authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' }),
+    ...overrides,
   }
 }
 
@@ -351,7 +361,7 @@ describe('live intercom dashboard', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Подъезд 1 открыт')
   })
 
-  it('shows a stable expired-intent message and never reports success', async () => {
+  it('treats an expired-intent execute response as unknown and prevents an immediate repeat', async () => {
     const user = userEvent.setup()
     const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>(async () => {
       throw new IntercomApiError(404, 'door_open_intent_not_found')
@@ -360,9 +370,83 @@ describe('live intercom dashboard', () => {
     await user.click(await screen.findByRole('button', { name: 'Открыть Подъезд 1' }))
     await user.click(within(await screen.findByRole('dialog', { name: 'Открыть дверь?' })).getByRole('button', { name: 'Подтвердить открытие' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Подтверждение истекло или уже использовано')
+    expect(await screen.findByRole('alert')).toHaveTextContent('Результат открытия неизвестен. Не повторяйте команду сразу')
     expect(screen.queryByText(/открыт$/)).not.toBeInTheDocument()
     expect(screen.queryByRole('dialog', { name: 'Открыть дверь?' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Открыть Подъезд 1' })).toBeDisabled()
+    expect(document.body).not.toHaveTextContent(/подготовьте.*заново/i)
+  })
+
+  it('uses the same unknown-result safety state when an execute response is lost', async () => {
+    const user = userEvent.setup()
+    const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>(async () => {
+      throw new TypeError('network response lost')
+    })
+    render(<App api={createApi({ executeDoorIntent })} />)
+    await user.click(await screen.findByRole('button', { name: 'Открыть Подъезд 1' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Открыть дверь?' })).getByRole('button', { name: 'Подтвердить открытие' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Результат открытия неизвестен. Не повторяйте команду сразу')
+    expect(screen.getByRole('button', { name: 'Открыть Подъезд 1' })).toBeDisabled()
+    expect(executeDoorIntent).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases an unexecuted prepared intent only after its local expiry', async () => {
+    const user = userEvent.setup()
+    render(<App api={createApi({
+      createDoorIntent: async () => ({ intentId: 'short-intent', expiresAt: new Date(Date.now() + 120).toISOString() }),
+    })} />)
+    const open = await screen.findByRole('button', { name: 'Открыть Подъезд 1' })
+    await user.click(open)
+
+    expect(await screen.findByRole('dialog', { name: 'Открыть дверь?' })).toBeVisible()
+    expect(open).toBeDisabled()
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Открыть дверь?' })).not.toBeInTheDocument())
+    expect(await screen.findByRole('alert')).toHaveTextContent('Подтверждение истекло')
+    expect(open).toBeEnabled()
+  })
+
+  it('clears all intercom state and revokes the camera snapshot after logout', async () => {
+    const user = userEvent.setup()
+    const logout = vi.fn(async () => undefined)
+    const getDashboard = vi.fn<IntercomApi['getDashboard']>(async () => dashboard)
+    render(<App
+      api={createApi({
+        createDoorIntent: async () => ({ intentId: 'intent-to-clear', expiresAt: new Date(Date.now() + 60_000).toISOString() }),
+        getDashboard,
+      })}
+      authApi={authenticatedAuthApi({ logout })}
+    />)
+    expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у подъезда' })).toHaveAttribute('src', 'blob:snapshot-1')
+    await user.click(screen.getByRole('button', { name: 'Открыть Подъезд 1' }))
+    expect(await screen.findByRole('dialog', { name: 'Открыть дверь?' })).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
+    await user.click(await screen.findByRole('button', { name: 'Выйти' }))
+
+    expect(logout).toHaveBeenCalledTimes(1)
+    expect(await screen.findByRole('heading', { name: 'Войдите в MTS ID' })).toBeVisible()
+    expect(screen.queryByRole('img', { name: 'Кадр с камеры Камера у подъезда' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: 'Открыть дверь?' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Подъезд 1')).not.toBeInTheDocument()
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:snapshot-1')
+    expect(getDashboard).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps loaded intercom state when logout fails and shows a stable error', async () => {
+    const user = userEvent.setup()
+    const logout = vi.fn(async () => { throw new Error('storage secret') })
+    render(<App api={createApi()} authApi={authenticatedAuthApi({ logout })} />)
+    expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у подъезда' })).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
+    await user.click(await screen.findByRole('button', { name: 'Выйти' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось выйти')
+    expect(document.body).not.toHaveTextContent('storage secret')
+    expect(screen.getByRole('img', { name: 'Кадр с камеры Камера у подъезда' })).toBeVisible()
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled()
+    expect(logout).toHaveBeenCalledTimes(1)
   })
 
   it('does not invent incoming calls or events', async () => {

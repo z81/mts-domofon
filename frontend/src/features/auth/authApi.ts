@@ -35,6 +35,11 @@ export type AuthProgress =
   | { status: 'challenge'; flow_id: string; challenge: AuthChallenge }
   | { status: 'authenticated'; session: SessionView }
 
+export interface LegacySmsStartInput {
+  phone: string
+  accept_legacy_sms: true
+}
+
 export interface ErrorEnvelope {
   code: string
   message: string
@@ -56,6 +61,8 @@ export class AuthApiError extends Error {
 export interface AuthApi {
   readonly isSyntheticPreview?: boolean
   startAuth(signal?: AbortSignal): Promise<AuthProgress>
+  startLegacySms(input: LegacySmsStartInput, signal?: AbortSignal): Promise<AuthProgress>
+  confirmLegacySms(flowId: string, code: string, signal?: AbortSignal): Promise<AuthProgress>
   completeCallback(flowId: string, callbackUrl: string, signal?: AbortSignal): Promise<AuthProgress>
   submitChallenge(flowId: string, input: ChallengeInput, signal?: AbortSignal): Promise<AuthProgress>
   getSession(signal?: AbortSignal): Promise<SessionView>
@@ -86,6 +93,20 @@ export function createProductionAuthApi(fetcher: typeof fetch = fetch): AuthApi 
     isSyntheticPreview: false,
     startAuth: async (signal) => readLocalResponse<AuthProgress>(await fetcher('/api/v1/auth/start', {
       body: JSON.stringify({}),
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    })),
+    startLegacySms: async (input, signal) => readLocalResponse<AuthProgress>(await fetcher('/api/v1/auth/legacy-sms/start', {
+      body: JSON.stringify(input),
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    })),
+    confirmLegacySms: async (flowId, code, signal) => readLocalResponse<AuthProgress>(await fetcher(`/api/v1/auth/legacy-sms/flows/${encodeURIComponent(flowId)}/confirm`, {
+      body: JSON.stringify({ code }),
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       method: 'POST',
@@ -129,6 +150,8 @@ function nextSyntheticProgress(flowId: string, input: ChallengeInput): AuthProgr
 const syntheticAuthApi: AuthApi = {
   isSyntheticPreview: true,
   startAuth: async () => ({ status: 'challenge', flow_id: `preview-${crypto.randomUUID()}`, challenge: { type: 'phone' } }),
+  startLegacySms: async () => ({ status: 'challenge', flow_id: `preview-${crypto.randomUUID()}`, challenge: { type: 'sms_otp', resend_after_seconds: 30 } }),
+  confirmLegacySms: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'preview', authenticated_at: new Date().toISOString(), expires_at: null } }),
   completeCallback: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'preview', authenticated_at: new Date().toISOString(), expires_at: null } }),
   submitChallenge: async (flowId, input) => nextSyntheticProgress(flowId, input),
   getSession: async () => ({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }),
@@ -158,6 +181,14 @@ export function submitChallenge(flowId: string, input: ChallengeInput, signal?: 
   return defaultAuthApi.submitChallenge(flowId, input, signal)
 }
 
+export function startLegacySms(input: LegacySmsStartInput, signal?: AbortSignal): Promise<AuthProgress> {
+  return defaultAuthApi.startLegacySms(input, signal)
+}
+
+export function confirmLegacySms(flowId: string, code: string, signal?: AbortSignal): Promise<AuthProgress> {
+  return defaultAuthApi.confirmLegacySms(flowId, code, signal)
+}
+
 export function completeCallback(flowId: string, callbackUrl: string, signal?: AbortSignal): Promise<AuthProgress> {
   return defaultAuthApi.completeCallback(flowId, callbackUrl, signal)
 }
@@ -173,6 +204,8 @@ export function logout(): Promise<void> {
 export const authApi: AuthApi = {
   isSyntheticPreview: defaultAuthApi.isSyntheticPreview,
   startAuth,
+  startLegacySms,
+  confirmLegacySms,
   completeCallback,
   submitChallenge,
   getSession,
