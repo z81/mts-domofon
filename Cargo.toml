@@ -1,0 +1,41 @@
+[package]
+name = "domru-mts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+
+[lib]
+name = "domru_mts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "domru-mts"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8.9", features = ["macros", "ws"] }
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4.45", features = ["serde"] }
+futures-util = "0.3"
+http = "1"
+reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "gzip", "json", "multipart", "query", "rustls", "stream"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7.0", features = ["catch-panic", "compression-gzip", "cors", "fs", "limit", "request-id", "sensitive-headers", "set-header", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+subtle = "2.6.1"
+url = { version = "2", features = ["serde"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "url"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+wiremock = "0.6.5"
