@@ -24,6 +24,10 @@ use crate::{
 
 const SENSITIVE_QUERY_KEYS: &[&str] = &[
     "token",
+    "code",
+    "state",
+    "callback",
+    "callback_url",
     "access_token",
     "idt_token",
     "web_sso_access_token",

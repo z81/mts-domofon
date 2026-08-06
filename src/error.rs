@@ -13,7 +13,11 @@ use crate::request_id::RequestId;
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     InvalidRequest,
+    UnsupportedMediaType,
+    PayloadTooLarge,
+    MethodNotAllowed,
     AuthenticationChallengeRequired,
+    AuthFlowNotFound,
     UpstreamAuthenticationFailed,
     SessionExpired,
     Forbidden,
@@ -29,9 +33,13 @@ impl ErrorCode {
     fn status(self) -> StatusCode {
         match self {
             Self::InvalidRequest => StatusCode::BAD_REQUEST,
+            Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::AuthenticationChallengeRequired
             | Self::UpstreamAuthenticationFailed
             | Self::SessionExpired => StatusCode::UNAUTHORIZED,
+            Self::AuthFlowNotFound => StatusCode::NOT_FOUND,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
