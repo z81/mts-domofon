@@ -1,0 +1,8 @@
+{
+  "webSsoAccessToken": "synthetic-wsso",
+  "keycloakTokenPair": {
+    "accessToken": "synthetic-access",
+    "refreshToken": "synthetic-refresh"
+  },
+  "idToken": "synthetic-id-token"
+}
