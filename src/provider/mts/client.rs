@@ -33,6 +33,7 @@ const MAX_RETRY_AFTER_SECONDS: u64 = 60 * 60;
 const DEVICE_TOKEN: &str = "x-device-token";
 const DEVICE_TYPE: &str = "x-device-type";
 const REQUEST_ID: &str = "request-id";
+const X_AUTH_TOKEN: &str = "x-auth-token";
 const X_REQUEST_ID: &str = "x-request-id";
 
 #[async_trait]
@@ -114,6 +115,12 @@ enum Authorization {
 enum PreparedBody {
     Empty,
     Json(Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchKind {
+    Initial,
+    RetryAfterUnauthorized,
 }
 
 #[derive(Clone)]
@@ -234,7 +241,8 @@ impl MtsClient {
         self.validate_owner(&prepared)?;
         let safe_read = matches!(prepared.method, Method::GET | Method::HEAD);
         let is_authorized = prepared.authorization == Authorization::Authorized;
-        let (response, failed_authorization) = self.dispatch(&prepared).await?;
+        let (response, failed_authorization) =
+            self.dispatch(&prepared, DispatchKind::Initial).await?;
         if response.status() != StatusCode::UNAUTHORIZED || !safe_read || !is_authorized {
             return classify(response, false).await;
         }
@@ -248,7 +256,9 @@ impl MtsClient {
             self.inner.tokens.refresh_after_unauthorized().await?;
         }
         drop(refresh_guard);
-        let (response, _) = self.dispatch(&prepared).await?;
+        let (response, _) = self
+            .dispatch(&prepared, DispatchKind::RetryAfterUnauthorized)
+            .await?;
         classify(response, true).await
     }
 
@@ -273,6 +283,7 @@ impl MtsClient {
     async fn dispatch(
         &self,
         prepared: &PreparedRequest,
+        kind: DispatchKind,
     ) -> Result<(Response, Option<HeaderValue>), AppError> {
         self.validate_owner(prepared)?;
         let url = self.endpoint(prepared.base, &prepared.path)?;
@@ -294,6 +305,9 @@ impl MtsClient {
             let authorization = bearer_header(&access)?;
             builder = builder.header(AUTHORIZATION, authorization.clone());
             dispatched_authorization = Some(authorization);
+            if kind == DispatchKind::RetryAfterUnauthorized {
+                builder = retry_compatibility_header(builder, &access)?;
+            }
             if let Some(device) = self.inner.tokens.device_token().await {
                 builder = builder.header(DEVICE_TOKEN, secret_header(&device)?);
             }
@@ -368,6 +382,13 @@ fn common_headers(request: RequestBuilder) -> RequestBuilder {
         .header(DEVICE_TYPE, "ANDROID")
         .header(REQUEST_ID, Uuid::new_v4().to_string())
         .header(ACCEPT, "application/json")
+}
+
+fn retry_compatibility_header(
+    request: RequestBuilder,
+    token: &SecretString,
+) -> Result<RequestBuilder, AppError> {
+    Ok(request.header(X_AUTH_TOKEN, secret_header(token)?))
 }
 
 fn validate_provider_path(path: &str) -> Result<(), AppError> {
@@ -628,8 +649,24 @@ mod tests {
 
     use bytes::Bytes;
     use futures_util::stream;
+    use reqwest::Client;
+    use secrecy::SecretString;
 
-    use super::drain_stream_bounded;
+    use super::{X_AUTH_TOKEN, drain_stream_bounded, retry_compatibility_header};
+
+    #[test]
+    fn retry_compatibility_header_is_sensitive_and_redacted_from_debug() {
+        let token = SecretString::from("retry-secret-marker");
+        let request = retry_compatibility_header(Client::new().get("http://127.0.0.1/"), &token)
+            .unwrap()
+            .build()
+            .unwrap();
+        let header = &request.headers()[X_AUTH_TOKEN];
+
+        assert_eq!(header, "retry-secret-marker");
+        assert!(header.is_sensitive());
+        assert!(!format!("{:?}", request.headers()).contains("retry-secret-marker"));
+    }
 
     #[tokio::test]
     async fn bounded_error_reader_stops_polling_once_the_limit_is_reached() {

@@ -23,6 +23,7 @@ use wiremock::{
 struct TestTokens {
     access: Arc<RwLock<String>>,
     device: Arc<RwLock<Option<String>>>,
+    refresh_device: Option<String>,
     access_reads: Arc<AtomicUsize>,
     device_reads: Arc<AtomicUsize>,
     refreshes: Arc<AtomicUsize>,
@@ -34,6 +35,7 @@ impl TestTokens {
         Self {
             access: Arc::new(RwLock::new("access-test".into())),
             device: Arc::new(RwLock::new(device.map(str::to_owned))),
+            refresh_device: None,
             access_reads: Arc::new(AtomicUsize::new(0)),
             device_reads: Arc::new(AtomicUsize::new(0)),
             refreshes: Arc::new(AtomicUsize::new(0)),
@@ -43,6 +45,11 @@ impl TestTokens {
 
     fn with_refresh_barrier(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
         self.refresh_barrier = Some(barrier);
+        self
+    }
+
+    fn with_refresh_device(mut self, device: &str) -> Self {
+        self.refresh_device = Some(device.to_owned());
         self
     }
 
@@ -70,6 +77,9 @@ impl TokenSource for TestTokens {
             barrier.wait().await;
         }
         *self.access.write().await = "access-fresh".into();
+        if let Some(device) = &self.refresh_device {
+            *self.device.write().await = Some(device.clone());
+        }
         Ok(())
     }
 }
@@ -106,7 +116,7 @@ async fn safe_read_has_exact_headers_and_retries_once_with_fresh_credentials() {
         .respond_with(AuthResponder)
         .mount(&server)
         .await;
-    let tokens = Arc::new(TestTokens::new(Some("device-test")));
+    let tokens = Arc::new(TestTokens::new(Some("device-test")).with_refresh_device("device-fresh"));
     let client = client(&server, tokens.clone());
 
     let request = client
@@ -119,10 +129,13 @@ async fn safe_read_has_exact_headers_and_retries_once_with_fresh_credentials() {
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].headers["authorization"], "Bearer access-test");
+    assert!(requests[0].headers.get("x-auth-token").is_none());
+    assert_eq!(requests[0].headers["x-device-token"], "device-test");
     assert_eq!(requests[1].headers["authorization"], "Bearer access-fresh");
+    assert_eq!(requests[1].headers["x-auth-token"], "access-fresh");
+    assert_eq!(requests[1].headers["x-device-token"], "device-fresh");
     let mut request_ids = Vec::new();
     for request in requests {
-        assert_eq!(request.headers["x-device-token"], "device-test");
         assert_eq!(request.headers["x-device-type"], "ANDROID");
         assert_eq!(request.headers["accept"], "application/json");
         let request_id = request.headers["request-id"].to_str().unwrap();
@@ -237,6 +250,11 @@ async fn reused_prepared_request_gets_fresh_credentials_and_uuid_on_every_dispat
     assert_eq!(requests[0].headers["x-device-token"], "device-one");
     assert_eq!(requests[1].headers["authorization"], "Bearer access-two");
     assert_eq!(requests[1].headers["x-device-token"], "device-two");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.headers.get("x-auth-token").is_none())
+    );
     assert_ne!(
         requests[0].headers["request-id"],
         requests[1].headers["request-id"]
@@ -294,17 +312,44 @@ async fn a_second_unauthorized_response_is_not_retried_or_refreshed_again() {
         .respond_with(ResponseTemplate::new(401))
         .mount(&server)
         .await;
-    let tokens = Arc::new(TestTokens::new(None));
+    let tokens = Arc::new(
+        TestTokens::new(Some("device-secret-old")).with_refresh_device("device-secret-fresh"),
+    );
     let client = client(&server, tokens.clone());
 
     let request = client
         .authorized(Method::GET, ProviderBase::Gateway, "/resource")
         .unwrap();
+    let prepared_debug = format!("{request:?}");
+    for secret in [
+        "access-test",
+        "access-fresh",
+        "device-secret-old",
+        "device-secret-fresh",
+    ] {
+        assert!(!prepared_debug.contains(secret));
+    }
     let error = client.send_json::<OkResponse>(request).await.unwrap_err();
 
     assert_eq!(error.code, ErrorCode::SessionExpired);
     assert_eq!(tokens.refreshes.load(Ordering::SeqCst), 1);
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    let error_debug = format!("{error:?}");
+    let error_display = error.to_string();
+    for secret in [
+        "access-test",
+        "access-fresh",
+        "device-secret-old",
+        "device-secret-fresh",
+    ] {
+        assert!(!error_debug.contains(secret));
+        assert!(!error_display.contains(secret));
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].headers.get("x-auth-token").is_none());
+    assert_eq!(requests[1].headers["authorization"], "Bearer access-fresh");
+    assert_eq!(requests[1].headers["x-auth-token"], "access-fresh");
+    assert_eq!(requests[1].headers["x-device-token"], "device-secret-fresh");
 }
 
 #[tokio::test]
@@ -331,6 +376,7 @@ async fn mutation_is_never_refreshed_or_retried_after_unauthorized() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].body, br#"{"action":"open"}"#);
     assert_eq!(requests[0].headers["content-type"], "application/json");
+    assert!(requests[0].headers.get("x-auth-token").is_none());
 }
 
 #[tokio::test]
