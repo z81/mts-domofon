@@ -115,6 +115,33 @@ async fn shutdown_is_terminal_for_late_subscribers_and_future_publish_calls() {
     );
 }
 
+#[tokio::test]
+async fn publishing_shutdown_uses_the_single_retained_terminal_transition() {
+    let bus = RealtimeBus::new(4);
+    let mut existing = bus.subscribe();
+
+    let shutdown_id = bus.publish(DomainEvent::Shutdown);
+    assert_eq!(bus.publish(event("after-generic-shutdown")), shutdown_id);
+    assert_eq!(bus.shutdown(), shutdown_id);
+
+    let shutdown = existing.recv().await.unwrap();
+    assert_eq!(shutdown.id, shutdown_id);
+    assert_eq!(shutdown.event, DomainEvent::Shutdown);
+    assert_eq!(
+        existing.recv().await.unwrap_err(),
+        SubscriptionError::Closed
+    );
+
+    let mut late = bus.subscribe();
+    let retained = tokio::time::timeout(Duration::from_millis(100), late.recv())
+        .await
+        .expect("late subscriber must receive retained generic shutdown")
+        .unwrap();
+    assert_eq!(retained.id, shutdown_id);
+    assert_eq!(retained.event, DomainEvent::Shutdown);
+    assert_eq!(late.recv().await.unwrap_err(), SubscriptionError::Closed);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_publish_and_shutdown_have_one_terminal_ordering_boundary() {
     let bus = RealtimeBus::new(4);

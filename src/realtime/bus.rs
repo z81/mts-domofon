@@ -67,6 +67,9 @@ impl RealtimeBus {
         if let Some(shutdown) = &state.shutdown {
             return shutdown.id;
         }
+        if matches!(&event, DomainEvent::Shutdown) {
+            return Self::shutdown_locked(&mut state);
+        }
         if state.next_id == u64::MAX {
             return Self::shutdown_locked(&mut state);
         }
