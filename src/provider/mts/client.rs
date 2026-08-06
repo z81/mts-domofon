@@ -10,7 +10,8 @@ use futures_util::{Stream, StreamExt, pin_mut};
 use reqwest::{
     Client, Method, Request, RequestBuilder, Response, StatusCode,
     header::{
-        ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER,
+        ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
+        RETRY_AFTER,
     },
     redirect::Policy,
 };
@@ -36,6 +37,7 @@ const DEVICE_TOKEN: &str = "x-device-token";
 const DEVICE_TYPE: &str = "x-device-type";
 const REQUEST_ID: &str = "request-id";
 const X_AUTH_TOKEN: &str = "x-auth-token";
+const X_CALL_SESSION_ID: HeaderName = HeaderName::from_static("x-call-session-id");
 const X_REQUEST_ID: &str = "x-request-id";
 
 #[async_trait]
@@ -93,6 +95,7 @@ pub struct PreparedRequest {
     authorization: Authorization,
     response_accept: ResponseAccept,
     body: PreparedBody,
+    extra_headers: HeaderMap,
 }
 
 impl PreparedRequest {
@@ -119,6 +122,12 @@ impl PreparedRequest {
         self.body = PreparedBody::ExplicitEmpty;
         self
     }
+
+    pub(crate) fn call_session_id_header(mut self, value: &SecretString) -> Result<Self, AppError> {
+        self.extra_headers
+            .insert(X_CALL_SESSION_ID, secret_header(value)?);
+        Ok(self)
+    }
 }
 
 impl fmt::Debug for PreparedRequest {
@@ -130,6 +139,7 @@ impl fmt::Debug for PreparedRequest {
             .field("authorization", &self.authorization)
             .field("response_accept", &self.response_accept)
             .field("has_body", &!matches!(self.body, PreparedBody::Empty))
+            .field("extra_header_count", &self.extra_headers.len())
             .finish()
     }
 }
@@ -279,6 +289,7 @@ impl MtsClient {
             authorization: Authorization::Authorized,
             response_accept: ResponseAccept::Json,
             body: PreparedBody::Empty,
+            extra_headers: HeaderMap::new(),
         })
     }
 
@@ -327,6 +338,7 @@ impl MtsClient {
             authorization: Authorization::Authorized,
             response_accept: ResponseAccept::Json,
             body: PreparedBody::Empty,
+            extra_headers: HeaderMap::new(),
         })
     }
 
@@ -408,6 +420,7 @@ impl MtsClient {
             authorization,
             response_accept: ResponseAccept::Json,
             body: PreparedBody::Empty,
+            extra_headers: HeaderMap::new(),
         })
     }
 
@@ -422,6 +435,9 @@ impl MtsClient {
             PreparedTarget::ClientBuiltUrl(url) => url.clone(),
         };
         let mut builder = self.inner.http.request(prepared.method.clone(), url);
+        if !prepared.extra_headers.is_empty() {
+            builder = builder.headers(prepared.extra_headers.clone());
+        }
         match &prepared.body {
             PreparedBody::Empty => {}
             PreparedBody::ExplicitEmpty => {

@@ -1,5 +1,6 @@
 mod auth_api;
 mod bootstrap;
+pub mod call;
 mod client;
 mod dashboard;
 pub mod device;

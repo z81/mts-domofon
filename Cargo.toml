@@ -66,6 +66,11 @@ name = "door_open"
 path = "tests/door_open.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "call_api"
+path = "tests/call_api.rs"
+required-features = ["test-support"]
+
 [dependencies]
 aes-gcm = { version = "0.11.0", features = ["zeroize"] }
 async-trait = "0.1"

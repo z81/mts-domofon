@@ -18,6 +18,8 @@ pub enum ErrorCode {
     MethodNotAllowed,
     AuthenticationChallengeRequired,
     AuthFlowNotFound,
+    CallNotFound,
+    CallOpenIntentNotFound,
     DoorOpenIntentNotFound,
     MutationOutcomeUnknown,
     UpstreamAuthenticationFailed,
@@ -41,7 +43,10 @@ impl ErrorCode {
             Self::AuthenticationChallengeRequired
             | Self::UpstreamAuthenticationFailed
             | Self::SessionExpired => StatusCode::UNAUTHORIZED,
-            Self::AuthFlowNotFound | Self::DoorOpenIntentNotFound => StatusCode::NOT_FOUND,
+            Self::AuthFlowNotFound
+            | Self::CallNotFound
+            | Self::CallOpenIntentNotFound
+            | Self::DoorOpenIntentNotFound => StatusCode::NOT_FOUND,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
