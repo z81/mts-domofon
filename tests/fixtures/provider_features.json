@@ -1,0 +1,11 @@
+[
+  {
+    "featureName": "AUTH_TYPE",
+    "value": "WEB_SSO",
+    "futureField": true
+  },
+  {
+    "featureName": "FUTURE_CAPABILITY",
+    "value": "opaque"
+  }
+]

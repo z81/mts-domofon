@@ -1,0 +1,13 @@
+[
+  {
+    "configName": "ANDROID_APP_VERSION",
+    "platform": "ANDROID",
+    "value": "3.0.1",
+    "futureField": "ignored"
+  },
+  {
+    "configName": "WEB_DIAGNOSTIC",
+    "platform": "WEB",
+    "value": "opaque"
+  }
+]
