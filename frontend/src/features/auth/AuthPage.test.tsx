@@ -1,123 +1,136 @@
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { vi } from 'vitest'
 import { AuthPage } from './AuthPage'
-import { AuthApiError, type AuthApi, type AuthChallenge, type SessionView } from './authApi'
+import { AuthApiError, createDefaultAuthApi, type AuthApi, type AuthChallenge, type AuthProgress, type SessionView } from './authApi'
+
+const authenticated: AuthProgress = {
+  status: 'authenticated',
+  session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' },
+}
 
 function sequenceApi(challenges: readonly AuthChallenge[], session: SessionView = { authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }): AuthApi {
   let index = 0
   return {
-    completeCallback: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } }),
-    confirmLegacySms: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } }),
     getSession: async () => session,
+    importWebSsoResponse: async () => authenticated,
     startAuth: async () => ({ status: 'challenge', flow_id: 'memory-only-flow', challenge: challenges[0] }),
-    startLegacySms: async () => ({ status: 'challenge', flow_id: 'memory-only-legacy-flow', challenge: { type: 'sms_otp', resend_after_seconds: 30 } }),
     submitChallenge: async () => {
       const next = challenges[++index]
-      return next
-        ? { status: 'challenge', flow_id: 'memory-only-flow', challenge: next }
-        : { status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } }
+      return next ? { status: 'challenge', flow_id: 'memory-only-flow', challenge: next } : authenticated
     },
     logout: async () => undefined,
   }
 }
 
 describe('AuthPage', () => {
-  it('requires explicit compatibility consent and sends only a normalized valid phone', async () => {
-    const user = userEvent.setup()
+  it('offers no production legacy SMS entry point', async () => {
     const api = sequenceApi([{ type: 'phone' }])
-    const startLegacySms = vi.fn(api.startLegacySms)
-    api.startLegacySms = startLegacySms
     render(<AuthPage api={api} onClose={() => undefined} />)
 
-    await user.click(await screen.findByRole('button', { name: 'Войти по SMS' }))
-    expect(screen.getByText('Режим совместимости')).toBeVisible()
-    expect(startLegacySms).not.toHaveBeenCalled()
+    await screen.findByRole('button', { name: 'Войти с MTS ID' })
 
-    const phone = screen.getByRole('textbox', { name: 'Номер телефона для SMS' })
-    await user.type(phone, '+7 999')
-    expect(screen.getByRole('button', { name: 'Получить код по SMS' })).toBeDisabled()
-    expect(screen.getByText('Введите российский номер из 11 цифр')).toBeVisible()
-    expect(startLegacySms).not.toHaveBeenCalled()
-
-    await user.clear(phone)
-    await user.type(phone, '8 (999) 000-00-00')
-    expect(screen.getByRole('button', { name: 'Получить код по SMS' })).toBeDisabled()
-    await user.click(screen.getByRole('checkbox', { name: 'Я согласен использовать режим совместимости для входа по SMS' }))
-    await user.click(screen.getByRole('button', { name: 'Получить код по SMS' }))
-
-    expect(startLegacySms).toHaveBeenCalledTimes(1)
-    expect(startLegacySms).toHaveBeenCalledWith({ phone: '+79990000000', accept_legacy_sms: true })
-    expect(await screen.findByRole('heading', { name: 'Введите код из SMS' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Войти по SMS' })).not.toBeInTheDocument()
   })
 
-  it('accepts exactly six OTP digits and ignores a double confirmation click', async () => {
+  it('navigates to the exact valid MTS authorization URL in the current tab', async () => {
     const user = userEvent.setup()
     const api = sequenceApi([{ type: 'phone' }])
-    let finishConfirmation: ((value: Awaited<ReturnType<AuthApi['confirmLegacySms']>>) => void) | undefined
-    const confirmLegacySms = vi.fn(() => new Promise<Awaited<ReturnType<AuthApi['confirmLegacySms']>>>((resolve) => { finishConfirmation = resolve }))
-    api.confirmLegacySms = confirmLegacySms
+    const authorizationUrl = 'https://login.mts.ru/amserver/oauth2/authorize?client_id=vdome&state=opaque'
+    api.startAuth = async () => ({ status: 'browser_redirect', flow_id: 'browser / opaque', authorization_url: authorizationUrl })
+    const navigate = vi.fn()
+    render(<AuthPage api={api} navigate={navigate} onClose={() => undefined} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
+    expect(navigate).toHaveBeenCalledTimes(1)
+    expect(navigate).toHaveBeenCalledWith(authorizationUrl)
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(/callback|chrome|открыть mts id/i)
+  })
+
+  it.each([
+    'http://login.mts.ru/amserver/oauth2/authorize',
+    'https://evil.example/amserver/oauth2/authorize',
+    'https://token@login.mts.ru/amserver/oauth2/authorize',
+    'https://login.mts.ru:444/amserver/oauth2/authorize',
+    'https://login.mts.ru/amserver/UI/Login',
+  ])('rejects an invalid MTS authorization URL without navigation', async (authorizationUrl) => {
+    const user = userEvent.setup()
+    const api = sequenceApi([{ type: 'phone' }])
+    api.startAuth = async () => ({ status: 'browser_redirect', flow_id: 'browser-flow', authorization_url: authorizationUrl })
+    const navigate = vi.fn()
+    render(<AuthPage api={api} navigate={navigate} onClose={() => undefined} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
+
+    expect(navigate).not.toHaveBeenCalled()
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось начать вход')
+    expect(document.body).not.toHaveTextContent('provider-secret')
+  })
+
+  it('keeps MTS JSON import hidden until explicitly selected', async () => {
+    const user = userEvent.setup()
+    const api = sequenceApi([{ type: 'phone' }])
+    render(<AuthPage api={api} onClose={() => undefined} />)
+
+    await screen.findByRole('button', { name: 'Войти с MTS ID' })
+    expect(screen.queryByRole('textbox', { name: 'JSON от MTS' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Вставить ответ MTS' }))
+    const response = screen.getByRole('textbox', { name: 'JSON от MTS' })
+    expect(response).toHaveAttribute('autocomplete', 'off')
+    expect(response).toHaveAttribute('spellcheck', 'false')
+    expect(screen.getByRole('button', { name: 'Подключить' })).toBeDisabled()
+  })
+
+  it('clears imported MTS JSON before its request settles and authenticates once', async () => {
+    const user = userEvent.setup()
+    const api = sequenceApi([{ type: 'phone' }])
+    let finishImport: ((progress: AuthProgress) => void) | undefined
+    const importWebSsoResponse = vi.fn(() => new Promise<AuthProgress>((resolve) => { finishImport = resolve }))
+    api.importWebSsoResponse = importWebSsoResponse
     const onAuthenticated = vi.fn()
-    render(<AuthPage api={api} onClose={() => undefined} onAuthenticated={onAuthenticated} />)
+    render(<AuthPage api={api} onAuthenticated={onAuthenticated} onClose={() => undefined} />)
 
-    await user.click(await screen.findByRole('button', { name: 'Войти по SMS' }))
-    await user.type(screen.getByRole('textbox', { name: 'Номер телефона для SMS' }), '+7 999 000-00-00')
-    await user.click(screen.getByRole('checkbox', { name: 'Я согласен использовать режим совместимости для входа по SMS' }))
-    await user.click(screen.getByRole('button', { name: 'Получить код по SMS' }))
+    await user.click(await screen.findByRole('button', { name: 'Вставить ответ MTS' }))
+    const response = screen.getByRole('textbox', { name: 'JSON от MTS' })
+    await user.click(response)
+    await user.paste('{"response":"erase-me"}')
+    const submit = screen.getByRole('button', { name: 'Подключить' })
+    await user.dblClick(submit)
 
-    const otp = await screen.findByRole('textbox', { name: 'Шестизначный код из SMS' })
-    await user.type(otp, '12a34')
-    expect(otp).toHaveValue('1234')
-    expect(screen.getByRole('button', { name: 'Подтвердить код' })).toBeDisabled()
-    await user.type(otp, '56')
-    await user.dblClick(screen.getByRole('button', { name: 'Подтвердить код' }))
+    expect(importWebSsoResponse).toHaveBeenCalledTimes(1)
+    expect(importWebSsoResponse).toHaveBeenCalledWith('{"response":"erase-me"}')
+    expect(response).toHaveValue('')
 
-    expect(confirmLegacySms).toHaveBeenCalledTimes(1)
-    expect(confirmLegacySms).toHaveBeenCalledWith('memory-only-legacy-flow', '123456')
-    finishConfirmation?.({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } })
-    expect(await screen.findByRole('heading', { name: 'Сессия восстановлена' })).toBeVisible()
-    expect(onAuthenticated).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      finishImport?.(authenticated)
+    })
+    expect(onAuthenticated).toHaveBeenCalledWith(authenticated.session)
   })
 
-  it('keeps resend manual and locked for the server-provided delay', async () => {
+  it('shows only a generic error when importing MTS JSON fails', async () => {
     const user = userEvent.setup()
     const api = sequenceApi([{ type: 'phone' }])
-    const startLegacySms = vi.fn(api.startLegacySms)
-    api.startLegacySms = startLegacySms
+    api.importWebSsoResponse = async () => { throw new Error('provider response: never-render-this-secret') }
     render(<AuthPage api={api} onClose={() => undefined} />)
 
-    await user.click(await screen.findByRole('button', { name: 'Войти по SMS' }))
-    await user.type(screen.getByRole('textbox', { name: 'Номер телефона для SMS' }), '+79990000000')
-    await user.click(screen.getByRole('checkbox', { name: 'Я согласен использовать режим совместимости для входа по SMS' }))
-    await user.click(screen.getByRole('button', { name: 'Получить код по SMS' }))
+    await user.click(await screen.findByRole('button', { name: 'Вставить ответ MTS' }))
+    await user.click(screen.getByRole('textbox', { name: 'JSON от MTS' }))
+    await user.paste('{"secret":"never-render-this-secret"}')
+    await user.click(screen.getByRole('button', { name: 'Подключить' }))
 
-    const resend = await screen.findByRole('button', { name: 'Отправить код повторно' })
-    expect(resend).toBeDisabled()
-    expect(screen.getByText('Повторная отправка будет доступна через 30 сек.')).toBeVisible()
-    expect(startLegacySms).toHaveBeenCalledTimes(1)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось импортировать ответ MTS')
+    expect(document.body).not.toHaveTextContent('never-render-this-secret')
   })
 
-  it('shows a stable legacy SMS error without automatic retries', async () => {
+  it('keeps the explicit preview flow in-page and advances its first challenge', async () => {
     const user = userEvent.setup()
-    const api = sequenceApi([{ type: 'phone' }])
-    const startLegacySms = vi.fn(async () => { throw new Error('provider secret') })
-    api.startLegacySms = startLegacySms
-    render(<AuthPage api={api} onClose={() => undefined} />)
-
-    await user.click(await screen.findByRole('button', { name: 'Войти по SMS' }))
-    await user.type(screen.getByRole('textbox', { name: 'Номер телефона для SMS' }), '+79990000000')
-    await user.click(screen.getByRole('checkbox', { name: 'Я согласен использовать режим совместимости для входа по SMS' }))
-    await user.click(screen.getByRole('button', { name: 'Получить код по SMS' }))
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось отправить код')
-    expect(document.body).not.toHaveTextContent('provider secret')
-    expect(startLegacySms).toHaveBeenCalledTimes(1)
-  })
-
-  it('advances from phone to OTP and clears the submitted phone secret', async () => {
-    const user = userEvent.setup()
-    const api = sequenceApi([{ type: 'phone' }, { type: 'sms_otp', resend_after_seconds: 30 }])
-    render(<AuthPage api={api} onClose={() => undefined} />)
+    const fetcher = vi.fn<typeof fetch>()
+    const api = createDefaultAuthApi({ dev: true, syntheticPreviewEnabled: true, fetcher })
+    const navigate = vi.fn()
+    render(<AuthPage api={api} navigate={navigate} onClose={() => undefined} />)
 
     await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
     await user.type(screen.getByRole('textbox', { name: 'Номер телефона' }), '+7 999 000-00-00')
@@ -126,7 +139,29 @@ describe('AuthPage', () => {
     const otp = await screen.findByRole('textbox', { name: 'Код из SMS' })
     expect(otp).toHaveAttribute('autocomplete', 'one-time-code')
     expect(screen.queryByDisplayValue('+7 999 000-00-00')).not.toBeInTheDocument()
-    expect(document.body).not.toHaveTextContent(/демо|синтетическ|preview/i)
+    expect(navigate).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('starts only one auth request while the first request is pending', async () => {
+    const api = sequenceApi([{ type: 'phone' }])
+    let finishStart: ((progress: AuthProgress) => void) | undefined
+    const startAuth = vi.fn(() => new Promise<AuthProgress>((resolve) => { finishStart = resolve }))
+    api.startAuth = startAuth
+    render(<AuthPage api={api} onClose={() => undefined} />)
+
+    const start = await screen.findByRole('button', { name: 'Войти с MTS ID' })
+    act(() => {
+      start.click()
+      start.click()
+    })
+
+    expect(startAuth).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      finishStart?.({ status: 'challenge', flow_id: 'single-flow', challenge: { type: 'phone' } })
+    })
+    expect(await screen.findByRole('textbox', { name: 'Номер телефона' })).toBeVisible()
   })
 
   it('renders captcha, current password, account selection and consent rejection', async () => {
@@ -153,19 +188,6 @@ describe('AuthPage', () => {
     expect(screen.queryByDisplayValue('not-a-real-secret')).not.toBeInTheDocument()
   })
 
-  it('restores and logs out a session, and renders a rate-limit countdown', async () => {
-    const user = userEvent.setup()
-    const api = sequenceApi([{ type: 'phone' }], { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' })
-    api.startAuth = async () => { throw new AuthApiError({ code: 'rate_limited', message: 'Слишком много попыток', retryable: true, requestId: 'e7411f58-d5e9-4a43-b25d-88ddf2014713', retryAfterSeconds: 2 }) }
-    render(<AuthPage api={api} onClose={() => undefined} />)
-
-    expect(await screen.findByRole('heading', { name: 'Сессия восстановлена' })).toBeVisible()
-    await user.click(screen.getByRole('button', { name: 'Выйти' }))
-    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
-
-    expect(await screen.findByText(/Повторите через 2 сек/)).toBeVisible()
-  })
-
   it('clears a password immediately when challenge submission fails', async () => {
     const user = userEvent.setup()
     const api = sequenceApi([{ type: 'password' }])
@@ -181,49 +203,16 @@ describe('AuthPage', () => {
     expect(password).toHaveValue('')
   })
 
-  it('renders only an approved HTTPS login.mts.ru browser redirect', async () => {
+  it('restores and logs out a session, and renders a rate-limit countdown', async () => {
     const user = userEvent.setup()
-    const api = sequenceApi([{ type: 'phone' }])
-    api.startAuth = async () => ({ status: 'browser_redirect', flow_id: 'browser-flow', authorization_url: 'https://login.mts.ru/amserver/UI/Login?realm=users' })
+    const api = sequenceApi([{ type: 'phone' }], authenticated.session)
+    api.startAuth = async () => { throw new AuthApiError({ code: 'rate_limited', message: 'Слишком много попыток', retryable: true, requestId: 'e7411f58-d5e9-4a43-b25d-88ddf2014713', retryAfterSeconds: 2 }) }
     render(<AuthPage api={api} onClose={() => undefined} />)
 
+    expect(await screen.findByRole('heading', { name: 'Сессия восстановлена' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Выйти' }))
     await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
 
-    expect(await screen.findByRole('link', { name: 'Продолжить в MTS ID' })).toHaveAttribute('href', 'https://login.mts.ru/amserver/UI/Login?realm=users')
-    expect(screen.getByRole('textbox', { name: 'Адрес страницы после входа' })).toHaveAttribute('autocomplete', 'off')
-    expect(screen.getByRole('textbox', { name: 'Адрес страницы после входа' })).toHaveAttribute('spellcheck', 'false')
-  })
-
-  it('clears the callback before the request settles and never renders callback secrets on failure', async () => {
-    const user = userEvent.setup()
-    const api = sequenceApi([{ type: 'phone' }])
-    api.startAuth = async () => ({ status: 'browser_redirect', flow_id: 'browser-flow', authorization_url: 'https://login.mts.ru/amserver/UI/Login?realm=users' })
-    let rejectCallback: ((cause: unknown) => void) | undefined
-    api.completeCallback = async () => new Promise((_, reject) => { rejectCallback = reject })
-    const callbackSecret = 'https://gateway.vdome.mts.ru/user-service/api/auth/callback?code=never-render-this&state=state-secret'
-    render(<AuthPage api={api} onClose={() => undefined} />)
-
-    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
-    const input = screen.getByRole('textbox', { name: 'Адрес страницы после входа' })
-    await user.type(input, callbackSecret)
-    await user.click(screen.getByRole('button', { name: 'Завершить вход' }))
-
-    expect(input).toHaveValue('')
-    rejectCallback?.(new Error(callbackSecret))
-    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось завершить вход')
-    expect(document.body).not.toHaveTextContent('never-render-this')
-    expect(input).toHaveValue('')
-  })
-
-  it('rejects an untrusted browser redirect URL', async () => {
-    const user = userEvent.setup()
-    const api = sequenceApi([{ type: 'phone' }])
-    api.startAuth = async () => ({ status: 'browser_redirect', flow_id: 'browser-flow', authorization_url: 'https://evil.example/steal' })
-    render(<AuthPage api={api} onClose={() => undefined} />)
-
-    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Недопустимый адрес MTS ID')
-    expect(screen.queryByRole('link', { name: 'Продолжить в MTS ID' })).not.toBeInTheDocument()
+    expect(await screen.findByText(/Повторите через 2 сек/)).toBeVisible()
   })
 })

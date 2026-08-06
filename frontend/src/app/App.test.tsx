@@ -131,16 +131,14 @@ function createCallApi(overrides: Partial<CallApi> = {}): CallApi {
 
 function anonymousAuthApi(): AuthApi {
   return {
-    completeCallback: async () => { throw new Error('not used') },
-    confirmLegacySms: async () => { throw new Error('not used') },
     getSession: async () => ({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }),
+    importWebSsoResponse: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } }),
     logout: async () => undefined,
     startAuth: async () => ({
       status: 'browser_redirect',
       flow_id: 'flow-1',
       authorization_url: 'https://login.mts.ru/amserver/UI/Login?realm=users',
     }),
-    startLegacySms: async () => { throw new Error('not used') },
     submitChallenge: async () => { throw new Error('not used') },
   }
 }
