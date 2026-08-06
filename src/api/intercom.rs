@@ -2,13 +2,13 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Extension, Path, Query, State},
-    http::{HeaderValue, Response, header},
-    routing::get,
+    http::{HeaderValue, Response, StatusCode, header},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    domain::FlatId,
+    domain::{Capability, FlatId},
     error::{ApiError, AppError, ErrorCode},
     request_id::RequestId,
     state::AppState,
@@ -21,6 +21,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/devices", get(devices_scoped))
         .route("/api/v1/cameras/{camera_id}/snapshot", get(snapshot_scoped))
+        .route("/api/v1/cameras/{camera_id}/live", post(start_live))
+        .route("/api/v1/live/{session_id}/{asset}", get(read_live_asset))
+        .route("/api/v1/live/{session_id}", delete(stop_live))
         .route("/api/v1/flats/{flat_id}/devices", get(devices_nested))
         .route(
             "/api/v1/flats/{flat_id}/cameras/{camera_id}/snapshot",
@@ -34,6 +37,95 @@ pub fn router() -> Router<AppState> {
         .route("/api/places/{flat_id}/cameras", get(compat_cameras))
         .route("/api/snapshot/{flat_id}/{camera_id}", get(snapshot_nested))
         .route("/api/snapshot/{camera_id}", get(snapshot_scoped))
+}
+
+async fn start_live(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(camera_id): Path<String>,
+    Query(scope): Query<FlatScope>,
+) -> Result<Json<crate::service::live::LiveSessionView>, ApiError> {
+    validate_opaque_id(&scope.flat_id).map_err(|error| ApiError::new(request_id, error))?;
+    validate_opaque_id(&camera_id).map_err(|error| ApiError::new(request_id, error))?;
+    let flat_id = FlatId(scope.flat_id);
+    ensure_linked_flat(&state, request_id, &flat_id).await?;
+    let devices = state
+        .device_service()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?;
+    let camera = devices
+        .camera(&flat_id, &camera_id)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    if !matches!(camera.capabilities.live, Capability::Available) {
+        return Err(ApiError::new(
+            request_id,
+            AppError::new(ErrorCode::NotFound, "Live video is unavailable.", false),
+        ));
+    }
+    let source = state
+        .live_source_provider()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .live_source(&flat_id, &camera_id)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    let view = state
+        .live_session_manager()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .start(source)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    Ok(Json(view))
+}
+
+async fn read_live_asset(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path((session_id, asset)): Path<(String, String)>,
+) -> Result<Response<Body>, ApiError> {
+    let session_id = uuid::Uuid::parse_str(&session_id).map_err(|_| {
+        ApiError::new(
+            request_id,
+            AppError::new(ErrorCode::NotFound, "Live session was not found.", false),
+        )
+    })?;
+    let asset = state
+        .live_session_manager()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .read(session_id, &asset)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, asset.content_type)
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .body(Body::from(asset.bytes))
+        .map_err(|_| ApiError::new(request_id, runtime_unavailable()))
+}
+
+async fn stop_live(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let session_id = uuid::Uuid::parse_str(&session_id).map_err(|_| {
+        ApiError::new(
+            request_id,
+            AppError::new(ErrorCode::NotFound, "Live session was not found.", false),
+        )
+    })?;
+    state
+        .live_session_manager()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .stop(session_id)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

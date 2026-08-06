@@ -109,6 +109,15 @@ fn redacted_path(path: &str) -> String {
             return format!("{PREFIX}[REDACTED]");
         }
     }
+    const LIVE_PREFIX: &str = "/api/v1/live/";
+    if let Some(descendant) = path.strip_prefix(LIVE_PREFIX) {
+        if let Some((_session_id, suffix)) = descendant.split_once('/') {
+            return format!("{LIVE_PREFIX}[REDACTED]/{suffix}");
+        }
+        if !descendant.is_empty() {
+            return format!("{LIVE_PREFIX}[REDACTED]");
+        }
+    }
     path.to_owned()
 }
 

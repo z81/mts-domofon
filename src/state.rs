@@ -3,12 +3,12 @@ use std::sync::Arc;
 use crate::{
     auth::AuthCoordinator,
     provider::mts::{
-        MtsClient, MtsDashboardProvider, door::MtsDoorOpenProvider, intercom::MtsDeviceProvider,
-        media::MtsMediaProvider, sms::MtsLegacySmsAuth,
+        MtsClient, MtsDashboardProvider, door::MtsDoorOpenProvider, intercom::LiveSourceProvider,
+        intercom::MtsDeviceProvider, media::MtsMediaProvider, sms::MtsLegacySmsAuth,
     },
     service::{
-        calls::CallService, devices::DeviceService, door::DoorOpenService, media::MediaService,
-        property::PropertyService,
+        calls::CallService, devices::DeviceService, door::DoorOpenService,
+        live::LiveSessionManager, media::MediaService, property::PropertyService,
     },
     storage::SecretStore,
 };
@@ -21,6 +21,8 @@ pub struct AppState {
     property_service: Option<Arc<PropertyService>>,
     device_service: Option<Arc<DeviceService>>,
     media_service: Option<Arc<MediaService>>,
+    live_source_provider: Option<Arc<dyn LiveSourceProvider>>,
+    live_session_manager: Option<Arc<LiveSessionManager>>,
     door_open_service: Option<Arc<DoorOpenService>>,
     legacy_sms_auth: Option<Arc<MtsLegacySmsAuth>>,
     call_service: Option<Arc<CallService>>,
@@ -35,6 +37,8 @@ impl AppState {
             property_service: None,
             device_service: None,
             media_service: None,
+            live_source_provider: None,
+            live_session_manager: None,
             door_open_service: None,
             legacy_sms_auth: None,
             call_service: None,
@@ -50,9 +54,8 @@ impl AppState {
             Arc::new(MtsDashboardProvider::new((*mts_client).clone())),
             secret_store.clone(),
         ));
-        let device_service = Arc::new(DeviceService::new(Arc::new(MtsDeviceProvider::new(
-            (*mts_client).clone(),
-        ))));
+        let mts_devices = Arc::new(MtsDeviceProvider::new((*mts_client).clone()));
+        let device_service = Arc::new(DeviceService::new(mts_devices.clone()));
         let media_service = Arc::new(MediaService::new(
             Arc::clone(&device_service),
             Arc::new(MtsMediaProvider::new((*mts_client).clone())),
@@ -69,6 +72,8 @@ impl AppState {
             property_service: Some(property_service),
             device_service: Some(device_service),
             media_service: Some(media_service),
+            live_source_provider: Some(mts_devices),
+            live_session_manager: Some(Arc::new(LiveSessionManager::production())),
             door_open_service: Some(door_open_service),
             legacy_sms_auth: None,
             call_service: None,
@@ -125,6 +130,14 @@ impl AppState {
 
     pub fn media_service(&self) -> Option<&Arc<MediaService>> {
         self.media_service.as_ref()
+    }
+
+    pub fn live_source_provider(&self) -> Option<&Arc<dyn LiveSourceProvider>> {
+        self.live_source_provider.as_ref()
+    }
+
+    pub fn live_session_manager(&self) -> Option<&Arc<LiveSessionManager>> {
+        self.live_session_manager.as_ref()
     }
 
     pub fn door_open_service(&self) -> Option<&Arc<DoorOpenService>> {

@@ -333,6 +333,22 @@ async fn missing_runtime_services_fail_closed_with_an_error_envelope() {
     assert_eq!(body_json(response).await["code"], "internal");
 }
 
+#[tokio::test]
+async fn live_start_route_is_registered_and_fails_closed_without_services() {
+    let config = AppConfig::from_iter(std::iter::empty::<(&str, &str)>()).unwrap();
+    let response = build_router_with_config(AppState::default(), &config)
+        .oneshot(
+            Request::post("/api/v1/cameras/camera-owned/live?flatId=flat-owned")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 500);
+    assert_eq!(body_json(response).await["code"], "internal");
+}
+
 #[test]
 fn inventory_response_shape_stays_domain_native() {
     let inventory = DeviceInventory::default();
