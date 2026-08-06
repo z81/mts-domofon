@@ -232,3 +232,4 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(37, 108, 82, .35
 .captcha-preview { width: 160px; min-height: 58px; margin-top: 18px; display: grid; place-items: center; color: #18372c; border: 1px dashed #aac3b4; border-radius: 12px; background: repeating-linear-gradient(135deg,#eef5f0 0 8px,#dcebe1 8px 16px); font-size: 24px; font-weight: 900; letter-spacing: .22em; }
 .form-error { margin-top: 16px !important; padding: 11px 13px; color: #8f2f2f !important; border-radius: 10px; background: #fbeaea; font-weight: 700; }
 .auth-dialog button:not(.dialog-close) { min-width: 120px; }
+.auth-link { min-height: 44px; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
