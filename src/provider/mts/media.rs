@@ -62,6 +62,7 @@ impl SnapshotProvider for MtsMediaProvider {
                 Some("snapshots"),
             )?
             .explicit_empty_body()
+            .json_content_type()
             .response_accept(ResponseAccept::ImageWebp);
         let response = self.client.send_stream(request).await?;
         let content_type = image_content_type(&response)?;

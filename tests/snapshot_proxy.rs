@@ -87,6 +87,10 @@ async fn snapshot_uses_exact_opaque_path_headers_empty_post_and_bytes_response()
         "snapshot-device-secret"
     );
     assert_eq!(request.headers.get("x-device-type").unwrap(), "ANDROID");
+    assert_eq!(
+        request.headers.get("content-type").unwrap(),
+        "application/json"
+    );
     assert_eq!(request.headers.get("content-length").unwrap(), "0");
     assert!(Uuid::parse_str(request.headers.get("request-id").unwrap().to_str().unwrap()).is_ok());
     assert!(request.body.is_empty());

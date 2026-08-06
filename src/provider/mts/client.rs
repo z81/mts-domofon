@@ -123,6 +123,12 @@ impl PreparedRequest {
         self
     }
 
+    pub(crate) fn json_content_type(mut self) -> Self {
+        self.extra_headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        self
+    }
+
     pub(crate) fn call_session_id_header(mut self, value: &SecretString) -> Result<Self, AppError> {
         self.extra_headers
             .insert(X_CALL_SESSION_ID, secret_header(value)?);
