@@ -108,6 +108,35 @@ async fn stored_session_is_encrypted_and_round_trips() {
 }
 
 #[tokio::test]
+async fn call_push_state_is_encrypted_round_trips_and_can_be_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = [27_u8; 32];
+    let store = SecretStore::open(dir.path(), Some(key)).await.unwrap();
+    let state = br#"{"fcm_token":"push-private-marker","persistent_ids":["message-1"]}"#;
+
+    store.save_call_push_state(state).await.unwrap();
+
+    let raw = tokio::fs::read(dir.path().join("call-push.enc"))
+        .await
+        .unwrap();
+    assert!(raw.starts_with(b"VDM1"));
+    assert!(!String::from_utf8_lossy(&raw).contains("push-private-marker"));
+    let reopened = SecretStore::open(dir.path(), Some(key)).await.unwrap();
+    assert_eq!(
+        reopened
+            .load_call_push_state()
+            .await
+            .unwrap()
+            .unwrap()
+            .as_slice(),
+        state
+    );
+
+    reopened.clear_call_push_state().await.unwrap();
+    assert!(reopened.load_call_push_state().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn altered_ciphertext_is_a_storage_failure() {
     let dir = tempfile::tempdir().unwrap();
     let store = SecretStore::open(dir.path(), Some([9_u8; 32]))
