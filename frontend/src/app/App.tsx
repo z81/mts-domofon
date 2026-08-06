@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import Hls from 'hls.js'
 import { AuthPage } from '../features/auth/AuthPage'
 import { authApi as defaultAuthApi, type AuthApi } from '../features/auth/authApi'
 import { CallPage } from '../features/calls/CallPage'
@@ -221,10 +222,75 @@ function CameraSnapshot({ api, camera, flatId }: { api: IntercomApi; camera: Cam
   </div>
 }
 
+function CameraLive({ api, camera, flatId, onStop }: { api: IntercomApi; camera: Camera; flatId: string; onStop: () => void }) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const [status, setStatus] = useState<'starting' | 'ready' | 'error'>(
+    api.startLive && api.stopLive ? 'starting' : 'error',
+  )
+
+  useEffect(() => {
+    const startLive = api.startLive
+    const stopLive = api.stopLive
+    if (!startLive || !stopLive) return
+    const controller = new AbortController()
+    let active = true
+    let sessionId: string | null = null
+    let hls: Hls | null = null
+
+    startLive(flatId, camera.id, controller.signal).then((session) => {
+      sessionId = session.sessionId
+      if (!active) {
+        void stopLive(session.sessionId).catch(() => undefined)
+        return
+      }
+      const video = videoRef.current
+      if (!video) return
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = session.playlistUrl
+      } else if (Hls.isSupported()) {
+        hls = new Hls({ enableWorker: true, lowLatencyMode: true })
+        hls.loadSource(session.playlistUrl)
+        hls.attachMedia(video)
+      } else {
+        setStatus('error')
+        return
+      }
+      setStatus('ready')
+      void video.play().catch(() => undefined)
+    }).catch(() => {
+      if (active && !controller.signal.aborted) setStatus('error')
+    })
+
+    return () => {
+      active = false
+      controller.abort()
+      hls?.destroy()
+      if (sessionId) void stopLive(sessionId).catch(() => undefined)
+    }
+  }, [api, camera.id, flatId])
+
+  return <div className="camera-live">
+    <video aria-label={`Live-видео с камеры ${camera.name}`} controls playsInline ref={videoRef} />
+    <span className="live-badge"><i />LIVE</span>
+    {status === 'starting' && <div className="live-status" role="status"><span className="loading-ring" />Подключаем видео…</div>}
+    {status === 'error' && <div className="live-status" role="alert">Не удалось запустить видео</div>}
+    <button className="live-stop-button" onClick={onStop} type="button">Остановить</button>
+  </div>
+}
+
 function CameraPanel({ api, camera, flatId }: { api: IntercomApi; camera: Camera | null; flatId: string }) {
+  const [liveCameraKey, setLiveCameraKey] = useState<string | null>(null)
+  const cameraKey = camera ? `${flatId}:${camera.id}` : null
+  const live = cameraKey !== null && liveCameraKey === cameraKey
+  const liveAvailable = camera?.capabilities.live.state === 'available' && api.startLive && api.stopLive
+
   return <article className="camera-card">
     {camera
-      ? <CameraSnapshot api={api} camera={camera} flatId={flatId} />
+      ? live
+        ? <CameraLive api={api} camera={camera} flatId={flatId} onStop={() => setLiveCameraKey(null)} />
+        : <><CameraSnapshot api={api} camera={camera} flatId={flatId} />
+          {liveAvailable && <button className="live-start-button" onClick={() => setLiveCameraKey(cameraKey)} type="button">Смотреть live</button>}
+        </>
       : <div className="camera-placeholder"><p>Камер для этого объекта нет</p></div>}
   </article>
 }

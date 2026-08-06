@@ -66,10 +66,17 @@ export interface DoorIntent {
   expiresAt: string
 }
 
+export interface LiveSession {
+  sessionId: string
+  playlistUrl: string
+}
+
 export interface IntercomApi {
   getDashboard(signal?: AbortSignal): Promise<PropertyDashboard>
   getDevices(flatId: string, signal?: AbortSignal): Promise<DeviceInventory>
   getSnapshot(flatId: string, cameraId: string, signal?: AbortSignal): Promise<Blob>
+  startLive?(flatId: string, cameraId: string, signal?: AbortSignal): Promise<LiveSession>
+  stopLive?(sessionId: string): Promise<void>
   createDoorIntent(flatId: string, accessPointId: string, lockNumber: string, signal?: AbortSignal): Promise<DoorIntent>
   executeDoorIntent(intentId: string, signal?: AbortSignal): Promise<void>
 }
@@ -110,6 +117,18 @@ async function readJson<T>(response: Response): Promise<T> {
   }
 }
 
+async function readLiveSession(response: Response): Promise<LiveSession> {
+  const value = await readJson<unknown>(response)
+  if (!value || typeof value !== 'object') throw new IntercomApiError(502, 'invalid_live_response')
+  const { sessionId, playlistUrl } = value as Partial<LiveSession>
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+  if (typeof sessionId !== 'string' || !uuid.test(sessionId)
+    || playlistUrl !== `/api/v1/live/${sessionId}/index.m3u8`) {
+    throw new IntercomApiError(502, 'invalid_live_response')
+  }
+  return { sessionId, playlistUrl }
+}
+
 const jsonRequest = (signal?: AbortSignal): RequestInit => ({
   credentials: 'same-origin',
   headers: { Accept: 'application/json' },
@@ -137,6 +156,20 @@ export function createProductionIntercomApi(fetcher: typeof fetch = fetch): Inte
       const blob = await response.blob()
       if (blob.size === 0) throw new IntercomApiError(502, 'invalid_snapshot_response')
       return blob
+    },
+    startLive: async (flatId, cameraId, signal) => readLiveSession(await fetcher(`/api/v1/cameras/${encodeURIComponent(cameraId)}/live?flatId=${encodeURIComponent(flatId)}`, {
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+      method: 'POST',
+      signal,
+    })),
+    stopLive: async (sessionId) => {
+      const response = await fetcher(`/api/v1/live/${encodeURIComponent(sessionId)}`, {
+        credentials: 'same-origin',
+        method: 'DELETE',
+      })
+      if (!response.ok) throw await errorFrom(response)
+      if (response.status !== 204) throw new IntercomApiError(502, 'invalid_local_response')
     },
     createDoorIntent: async (flatId, accessPointId, lockNumber, signal) => readJson<DoorIntent>(await fetcher('/api/v1/access/intents', {
       body: JSON.stringify({ flatId, accessPointId, lockNumber }),

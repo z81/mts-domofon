@@ -166,6 +166,34 @@ beforeEach(() => {
 })
 
 describe('live intercom dashboard', () => {
+  it('starts live video with sound only after a button click and stops it', async () => {
+    const user = userEvent.setup()
+    const startLive = vi.fn(async () => ({
+      sessionId: '5d7a5769-adf9-4a41-9bd8-12427e0ae921',
+      playlistUrl: '/api/v1/live/5d7a5769-adf9-4a41-9bd8-12427e0ae921/index.m3u8',
+    }))
+    const stopLive = vi.fn(async () => undefined)
+    const liveInventory: DeviceInventory = {
+      ...inventory,
+      cameras: inventory.cameras.map((camera) => ({
+        ...camera,
+        capabilities: { ...camera.capabilities, live: available },
+      })),
+    }
+    vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('probably')
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
+    render(<App api={createApi({ getDevices: async () => liveInventory, startLive, stopLive })} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Смотреть live' }))
+
+    expect(startLive).toHaveBeenCalledWith('flat-81', 'camera-1', expect.any(AbortSignal))
+    const video = await screen.findByLabelText('Live-видео с камеры Камера у подъезда')
+    expect(video).toHaveAttribute('controls')
+    expect(video).not.toHaveAttribute('muted')
+    await user.click(screen.getByRole('button', { name: 'Остановить' }))
+    await waitFor(() => expect(stopLive).toHaveBeenCalledWith('5d7a5769-adf9-4a41-9bd8-12427e0ae921'))
+  })
+
   it('keeps a loading state until the real dashboard request settles', async () => {
     const pending = deferred<PropertyDashboard>()
     render(<App api={createApi({ getDashboard: () => pending.promise })} />)

@@ -66,6 +66,31 @@ describe('production intercom API boundary', () => {
     })
   })
 
+  it('starts and stops an opaque same-origin live session', async () => {
+    const session = {
+      sessionId: '5d7a5769-adf9-4a41-9bd8-12427e0ae921',
+      playlistUrl: '/api/v1/live/5d7a5769-adf9-4a41-9bd8-12427e0ae921/index.m3u8',
+    }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(session))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    const api = createProductionIntercomApi(fetcher)
+
+    await expect(api.startLive?.('flat/81', 'camera front/1')).resolves.toEqual(session)
+    await expect(api.stopLive?.(session.sessionId)).resolves.toBeUndefined()
+
+    expect(fetcher).toHaveBeenNthCalledWith(1, '/api/v1/cameras/camera%20front%2F1/live?flatId=flat%2F81', {
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+      method: 'POST',
+      signal: undefined,
+    })
+    expect(fetcher).toHaveBeenNthCalledWith(2, '/api/v1/live/5d7a5769-adf9-4a41-9bd8-12427e0ae921', {
+      credentials: 'same-origin',
+      method: 'DELETE',
+    })
+  })
+
   it('preserves a local 401 status without exposing an untrusted response body', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse({
       code: 'authentication_required',
