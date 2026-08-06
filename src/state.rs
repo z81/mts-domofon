@@ -3,9 +3,13 @@ use std::sync::Arc;
 use crate::{
     auth::AuthCoordinator,
     provider::mts::{
-        MtsClient, MtsDashboardProvider, intercom::MtsDeviceProvider, media::MtsMediaProvider,
+        MtsClient, MtsDashboardProvider, door::MtsDoorOpenProvider, intercom::MtsDeviceProvider,
+        media::MtsMediaProvider,
     },
-    service::{devices::DeviceService, media::MediaService, property::PropertyService},
+    service::{
+        devices::DeviceService, door::DoorOpenService, media::MediaService,
+        property::PropertyService,
+    },
     storage::SecretStore,
 };
 
@@ -17,6 +21,7 @@ pub struct AppState {
     property_service: Option<Arc<PropertyService>>,
     device_service: Option<Arc<DeviceService>>,
     media_service: Option<Arc<MediaService>>,
+    door_open_service: Option<Arc<DoorOpenService>>,
 }
 
 impl AppState {
@@ -28,6 +33,7 @@ impl AppState {
             property_service: None,
             device_service: None,
             media_service: None,
+            door_open_service: None,
         }
     }
 
@@ -47,6 +53,11 @@ impl AppState {
             Arc::clone(&device_service),
             Arc::new(MtsMediaProvider::new((*mts_client).clone())),
         ));
+        let door_open_service = Arc::new(DoorOpenService::new(
+            Arc::clone(&property_service),
+            Arc::clone(&device_service),
+            Arc::new(MtsDoorOpenProvider::new((*mts_client).clone())),
+        ));
         Self {
             secret_store: Some(Arc::new(secret_store)),
             auth_coordinator: Some(auth_coordinator),
@@ -54,6 +65,7 @@ impl AppState {
             property_service: Some(property_service),
             device_service: Some(device_service),
             media_service: Some(media_service),
+            door_open_service: Some(door_open_service),
         }
     }
 
@@ -68,6 +80,11 @@ impl AppState {
             media_service: Some(media_service),
             ..Self::default()
         }
+    }
+
+    pub fn with_door_open_service(mut self, door_open_service: Arc<DoorOpenService>) -> Self {
+        self.door_open_service = Some(door_open_service);
+        self
     }
 
     pub fn secret_store(&self) -> Option<&Arc<SecretStore>> {
@@ -92,5 +109,9 @@ impl AppState {
 
     pub fn media_service(&self) -> Option<&Arc<MediaService>> {
         self.media_service.as_ref()
+    }
+
+    pub fn door_open_service(&self) -> Option<&Arc<DoorOpenService>> {
+        self.door_open_service.as_ref()
     }
 }

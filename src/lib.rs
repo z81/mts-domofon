@@ -14,6 +14,7 @@ pub mod web;
 
 pub use domain::{
     AccessPoint, AccessPointKind, CallMode, CallSettings, CallSettingsPatch, CallSettingsStatus,
-    Camera, CameraCapabilities, Capability, CapabilitySet, DeviceInventory, Flat, FlatId,
-    ImageContentType, Lock, Page, PropertyDashboard, ProxiedMedia,
+    Camera, CameraCapabilities, Capability, CapabilitySet, DeviceInventory, DoorOpenIntentId,
+    DoorOpenIntentView, Flat, FlatId, ImageContentType, Lock, Page, PropertyDashboard,
+    ProxiedMedia,
 };

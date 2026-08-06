@@ -3,6 +3,7 @@ mod bootstrap;
 mod client;
 mod dashboard;
 pub mod device;
+pub mod door;
 pub mod dto;
 pub mod intercom;
 pub mod media;

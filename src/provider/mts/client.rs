@@ -282,6 +282,54 @@ impl MtsClient {
         })
     }
 
+    /// Prepares an authorized request containing two provider-owned opaque path segments with a
+    /// fixed segment between them. Opaque values are encoded by `Url` and are never interpreted as
+    /// raw paths.
+    pub fn authorized_with_two_path_segments(
+        &self,
+        method: Method,
+        base: ProviderBase,
+        fixed_prefix: &str,
+        first_segment: &str,
+        fixed_middle: &str,
+        second_segment: &str,
+    ) -> Result<PreparedRequest, AppError> {
+        if fixed_prefix.contains('?')
+            || first_segment.is_empty()
+            || second_segment.is_empty()
+            || matches!(first_segment, "." | "..")
+            || matches!(second_segment, "." | "..")
+            || !is_fixed_path_segment(fixed_middle)
+        {
+            return Err(AppError::invalid_request("invalid provider path segment"));
+        }
+
+        let mut url = self.endpoint(base, fixed_prefix)?;
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| AppError::invalid_request("invalid provider path"))?;
+            path.pop_if_empty()
+                .push(first_segment)
+                .push(fixed_middle)
+                .push(second_segment);
+        }
+        if !same_origin(&url, self.base(base)) || url.query().is_some() || url.fragment().is_some()
+        {
+            return Err(AppError::invalid_request("invalid provider path"));
+        }
+
+        Ok(PreparedRequest {
+            owner: self.inner.id,
+            method,
+            base,
+            target: PreparedTarget::ClientBuiltUrl(url),
+            authorization: Authorization::Authorized,
+            response_accept: ResponseAccept::Json,
+            body: PreparedBody::Empty,
+        })
+    }
+
     pub fn anonymous_gateway(
         &self,
         method: Method,

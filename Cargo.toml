@@ -56,6 +56,11 @@ name = "snapshot_proxy"
 path = "tests/snapshot_proxy.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "door_open"
+path = "tests/door_open.rs"
+required-features = ["test-support"]
+
 [dependencies]
 aes-gcm = { version = "0.11.0", features = ["zeroize"] }
 async-trait = "0.1"

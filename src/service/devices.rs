@@ -50,6 +50,27 @@ impl DeviceService {
             })
     }
 
+    pub async fn ensure_lock(
+        &self,
+        flat: &FlatId,
+        access_point_id: &str,
+        lock_number: &str,
+    ) -> Result<(), AppError> {
+        let access_points = self.provider.access_points(flat, None).await?;
+        if access_points.iter().any(|point| {
+            point.available
+                && point.id == access_point_id
+                && point.locks.iter().any(|lock| lock.number == lock_number)
+        }) {
+            return Ok(());
+        }
+        Err(AppError::new(
+            ErrorCode::NotFound,
+            "Door lock was not found for the requested flat.",
+            false,
+        ))
+    }
+
     async fn sources(
         &self,
         flat: &FlatId,

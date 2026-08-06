@@ -52,9 +52,9 @@ pub struct RedactedUri(String);
 
 impl RedactedUri {
     fn from_uri(uri: &Uri) -> Self {
-        let mut output = uri.path().to_owned();
+        let mut output = redacted_path(uri.path());
         if let Some(query) = uri.query() {
-            if is_auth_route_path(uri.path()) {
+            if is_query_sensitive_route_path(uri.path()) {
                 output.push_str("?[REDACTED]");
                 return Self(output);
             }
@@ -73,8 +73,13 @@ impl RedactedUri {
     }
 }
 
-fn is_auth_route_path(path: &str) -> bool {
-    path == "/api/v1/auth"
+fn is_query_sensitive_route_path(path: &str) -> bool {
+    path == "/api/v1/door-open-intents"
+        || path == "/api/v1/door-open-intents/confirm"
+        || path == "/api/v1/access/intents"
+        || path.starts_with("/api/v1/access/intents/")
+        || path == "/api/open-door"
+        || path == "/api/v1/auth"
         || path.starts_with("/api/v1/auth/")
         || matches!(
             path,
@@ -86,6 +91,20 @@ fn is_auth_route_path(path: &str) -> bool {
                 | "/api/refresh"
                 | "/api/logout"
         )
+}
+
+fn redacted_path(path: &str) -> String {
+    const PREFIX: &str = "/api/v1/access/intents/";
+    const SUFFIX: &str = "/execute";
+    if path
+        .strip_prefix(PREFIX)
+        .and_then(|remainder| remainder.strip_suffix(SUFFIX))
+        .filter(|intent_id| !intent_id.is_empty())
+        .is_some()
+    {
+        return format!("{PREFIX}[REDACTED]{SUFFIX}");
+    }
+    path.to_owned()
 }
 
 impl fmt::Display for RedactedUri {

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod door;
 pub mod health;
 pub mod intercom;
 
@@ -9,6 +10,7 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(auth::router())
+        .merge(door::router())
         .merge(intercom::router())
         .route("/health/live", get(health::live))
         .method_not_allowed_fallback(auth::method_not_allowed)
