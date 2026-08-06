@@ -42,6 +42,7 @@ impl ErrorCode {
     }
 }
 
+#[derive(Clone)]
 pub struct AppError {
     pub code: ErrorCode,
     pub message: String,

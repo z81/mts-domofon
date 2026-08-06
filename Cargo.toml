@@ -31,6 +31,11 @@ name = "dashboard_provider"
 path = "tests/dashboard_provider.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "auth_coordinator"
+path = "tests/auth_coordinator.rs"
+required-features = ["test-support"]
+
 [dependencies]
 aes-gcm = { version = "0.11.0", features = ["zeroize"] }
 async-trait = "0.1"

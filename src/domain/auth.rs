@@ -100,6 +100,33 @@ impl fmt::Debug for ChallengeInput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Anonymous,
+    Active,
+    Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SessionView {
+    pub authenticated: bool,
+    pub status: SessionStatus,
+    pub authenticated_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl SessionView {
+    pub fn anonymous() -> Self {
+        Self {
+            authenticated: false,
+            status: SessionStatus::Anonymous,
+            authenticated_at: None,
+            expires_at: None,
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AuthProgress {
@@ -110,6 +137,9 @@ pub enum AuthProgress {
     Challenge {
         flow_id: AuthFlowId,
         challenge: AuthChallenge,
+    },
+    Authenticated {
+        session: SessionView,
     },
 }
 
@@ -132,6 +162,10 @@ impl fmt::Debug for AuthProgress {
                 .debug_struct("Challenge")
                 .field("flow_id", flow_id)
                 .field("challenge", &"[REDACTED]")
+                .finish(),
+            Self::Authenticated { session } => formatter
+                .debug_struct("Authenticated")
+                .field("session", session)
                 .finish(),
         }
     }

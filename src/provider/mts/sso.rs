@@ -343,6 +343,13 @@ impl MtsSsoTransport {
             false,
         ))
     }
+
+    pub fn clear(&self) {
+        self.flows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 #[derive(serde::Deserialize)]

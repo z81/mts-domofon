@@ -81,6 +81,27 @@ async fn begin_rejects_an_oversized_authorization_url_without_creating_a_flow() 
     assert!(format!("{transport:?}").contains("active_flows: 0"));
 }
 
+#[tokio::test]
+async fn clearing_browser_state_closes_every_pending_flow() {
+    let transport = MtsSsoTransport::new("synthetic-device");
+    let AuthProgress::BrowserRedirect { flow_id, .. } = transport.begin().await.unwrap() else {
+        panic!("begin must return a browser redirect")
+    };
+
+    transport.clear();
+
+    let error = transport
+        .submit(
+            &flow_id,
+            ChallengeInput::Phone {
+                phone: "+7 999 000-00-00".to_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, domru_mts::error::ErrorCode::SessionExpired);
+}
+
 #[test]
 fn auth_types_use_the_exact_local_snake_case_wire_contract() {
     let flow_id = AuthFlowId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
