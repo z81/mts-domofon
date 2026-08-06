@@ -75,6 +75,7 @@ impl RedactedUri {
 
 fn is_query_sensitive_route_path(path: &str) -> bool {
     is_removed_mts_relay_path(path)
+        || is_camera_live_path(path)
         || path == "/api/v1/door-open-intents"
         || path == "/api/v1/door-open-intents/confirm"
         || path == "/api/v1/access/intents"
@@ -92,6 +93,12 @@ fn is_query_sensitive_route_path(path: &str) -> bool {
                 | "/api/refresh"
                 | "/api/logout"
         )
+}
+
+fn is_camera_live_path(path: &str) -> bool {
+    path.strip_prefix("/api/v1/cameras/")
+        .and_then(|descendant| descendant.strip_suffix("/live"))
+        .is_some_and(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
 }
 
 fn is_removed_mts_relay_path(path: &str) -> bool {
@@ -117,6 +124,9 @@ fn redacted_path(path: &str) -> String {
         if !descendant.is_empty() {
             return format!("{LIVE_PREFIX}[REDACTED]");
         }
+    }
+    if is_camera_live_path(path) {
+        return "/api/v1/cameras/[REDACTED]/live".to_owned();
     }
     path.to_owned()
 }
