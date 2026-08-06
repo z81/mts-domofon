@@ -180,7 +180,7 @@ async fn returns_real_property_dashboard_and_inventory() {
 
     let inventory = app
         .oneshot(
-            Request::get("/api/v1/flats/flat-owned/devices")
+            Request::get("/api/v1/devices?flatId=flat-owned")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -198,7 +198,7 @@ async fn proxies_an_owned_snapshot_with_private_cache_headers() {
     let (app, _directory, calls) = app().await;
     let response = app
         .oneshot(
-            Request::get("/api/v1/flats/flat-owned/cameras/camera-owned/snapshot")
+            Request::get("/api/v1/cameras/camera-owned/snapshot?flatId=flat-owned")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -220,9 +220,9 @@ async fn proxies_an_owned_snapshot_with_private_cache_headers() {
 async fn rejects_unowned_or_unbounded_snapshot_ids_before_provider_dispatch() {
     let (app, _directory, calls) = app().await;
     for uri in [
-        "/api/v1/flats/flat-owned/cameras/camera-other/snapshot".to_owned(),
+        "/api/v1/cameras/camera-other/snapshot?flatId=flat-owned".to_owned(),
         format!(
-            "/api/v1/flats/flat-owned/cameras/{}/snapshot",
+            "/api/v1/cameras/{}/snapshot?flatId=flat-owned",
             "x".repeat(513)
         ),
     ] {
@@ -243,7 +243,7 @@ async fn rejects_an_unlinked_flat_before_returning_its_devices() {
     let (app, _directory, _calls) = app().await;
     let response = app
         .oneshot(
-            Request::get("/api/v1/flats/flat-not-linked/devices")
+            Request::get("/api/v1/devices?flatId=flat-not-linked")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -252,6 +252,68 @@ async fn rejects_an_unlinked_flat_before_returning_its_devices() {
 
     assert_eq!(response.status(), 404);
     assert_eq!(body_json(response).await["code"], "not_found");
+}
+
+#[tokio::test]
+async fn keeps_nested_and_domru_z81_compatible_read_aliases_ownership_checked() {
+    let (app, _directory, calls) = app().await;
+
+    let nested = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/flats/flat-owned/devices")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nested.status(), 200);
+
+    let places = app
+        .clone()
+        .oneshot(Request::get("/api/places").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(places.status(), 200);
+    assert_eq!(body_json(places).await["data"][0]["id"], "flat-owned");
+
+    for (uri, key) in [
+        ("/api/places/flat-owned/accesscontrols", "accessPoints"),
+        ("/api/places/flat-owned/cameras", "cameras"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            body_json(response).await["data"][0]["id"],
+            if key == "accessPoints" {
+                "entrance-owned"
+            } else {
+                "camera-owned"
+            }
+        );
+    }
+
+    for uri in [
+        "/api/snapshot/flat-owned/camera-owned",
+        "/api/snapshot/camera-owned?flatId=flat-owned",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "owned-webp"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
