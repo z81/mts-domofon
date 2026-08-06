@@ -6,6 +6,7 @@ mod dashboard;
 pub mod device;
 pub mod door;
 pub mod dto;
+pub mod fcm;
 pub mod intercom;
 pub mod media;
 pub mod sms;

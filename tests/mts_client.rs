@@ -609,3 +609,65 @@ async fn stream_uses_the_authorized_contract_without_json_decoding() {
 
     assert_eq!(response.bytes().await.unwrap(), &b"stream-body"[..]);
 }
+
+#[tokio::test]
+async fn current_user_id_uses_security_self_wrapper_list_contract() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/domofon/api/security/v1/users/self"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "list": [{"id": "user-42", "ignored": "provider expansion"}],
+            "error": null,
+            "metadata": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(&server, Arc::new(TestTokens::new(Some("device-test"))));
+
+    let user_id = client.current_user_id().await.unwrap();
+
+    assert_eq!(user_id, "user-42");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests[0].headers["authorization"], "Bearer access-test");
+    assert_eq!(requests[0].headers["x-device-type"], "ANDROID");
+}
+
+#[tokio::test]
+async fn fcm_token_registration_uses_exact_apk_route_and_payload_keys() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/domofon/api/security/v1/users/user%2F42"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(&server, Arc::new(TestTokens::new(Some("device-test"))));
+    let token = SecretString::from("fcm-token-secret-marker");
+
+    client
+        .register_fcm_device_token("user/42", &token)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers["content-type"], "application/json");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "payload": {
+                "platform": "Android",
+                "brand": "VDome Web",
+                "manufacturer": "domru-mts",
+                "model": "Rust Service",
+                "systemVersion": "server",
+                "appVersion": {"versionName": "3.0.1"},
+                "BundleId": "ru.mts.vdome.resident",
+                "is_debug": "false"
+            },
+            "fcm_token": "fcm-token-secret-marker"
+        })
+    );
+}
