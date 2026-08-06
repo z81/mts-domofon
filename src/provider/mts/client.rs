@@ -466,8 +466,13 @@ impl MtsClient {
 
 fn provider_http_client() -> Result<Client, AppError> {
     Client::builder()
+        .retry(reqwest::retry::never())
         .redirect(Policy::none())
         .cookie_store(false)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(transport_error)

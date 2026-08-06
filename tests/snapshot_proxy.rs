@@ -128,6 +128,71 @@ async fn snapshot_accepts_only_exact_bounded_image_media_types() {
 }
 
 #[tokio::test]
+async fn snapshot_rejects_multiple_content_type_header_fields() {
+    let server = MockServer::start().await;
+    let template = ResponseTemplate::new(200)
+        .set_body_bytes(b"provider-secret-body")
+        .append_header("content-type", "image/webp")
+        .append_header("content-type", "image/jpeg");
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = MtsMediaProvider::new_for_test(client(&server), 32)
+        .unwrap()
+        .snapshot("camera-safe")
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
+    assert!(!format!("{error:?}").contains("provider-secret-body"));
+}
+
+#[tokio::test]
+async fn provider_client_does_not_negotiate_automatic_content_decoding() {
+    let server = MockServer::start().await;
+    response(&server, 200, Some("image/webp"), b"safe-image").await;
+
+    MtsMediaProvider::new_for_test(client(&server), 32)
+        .unwrap()
+        .snapshot("camera-safe")
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].headers.get("accept-encoding").is_none());
+}
+
+#[tokio::test]
+async fn snapshot_rejects_content_encoded_image_responses() {
+    const GZIP_SAFE_IMAGE: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x2b, 0x4e, 0x4c, 0x4b, 0xd5,
+        0xcd, 0xcc, 0x4d, 0x4c, 0x4f, 0x05, 0x00, 0xde, 0xec, 0xcb, 0xc2, 0x0a, 0x00, 0x00, 0x00,
+    ];
+    let server = MockServer::start().await;
+    let template = ResponseTemplate::new(200)
+        .set_body_bytes(GZIP_SAFE_IMAGE)
+        .insert_header("content-type", "image/webp")
+        .insert_header("content-encoding", "gzip");
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = MtsMediaProvider::new_for_test(client(&server), 32)
+        .unwrap()
+        .snapshot("camera-safe")
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
+}
+
+#[tokio::test]
 async fn snapshot_rejects_declared_and_streamed_oversize_and_empty_images() {
     for body in [b"12345".as_slice(), b"".as_slice()] {
         let server = MockServer::start().await;
