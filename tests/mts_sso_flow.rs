@@ -341,7 +341,11 @@ async fn callback_success_parses_all_persisted_token_classes_and_discards_id_tok
         .unwrap();
 
     assert_eq!(
-        tokens.web_sso_access_token.expose_secret(),
+        tokens
+            .web_sso_access_token
+            .as_ref()
+            .unwrap()
+            .expose_secret(),
         "synthetic-wsso"
     );
     assert_eq!(tokens.access_token.expose_secret(), "synthetic-access");

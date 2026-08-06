@@ -43,7 +43,7 @@ fn bundle(access: &str, refresh: &str, web_sso: &str) -> TokenBundle {
     TokenBundle {
         access_token: SecretString::from(access.to_owned()),
         refresh_token: SecretString::from(refresh.to_owned()),
-        web_sso_access_token: SecretString::from(web_sso.to_owned()),
+        web_sso_access_token: Some(SecretString::from(web_sso.to_owned())),
         device_token: Some(SecretString::from(DEVICE_OLD)),
     }
 }
@@ -457,7 +457,12 @@ async fn callback_completion_persists_then_installs_one_complete_bundle() {
         "callback-refresh-secret"
     );
     assert_eq!(
-        persisted.tokens.web_sso_access_token.expose_secret(),
+        persisted
+            .tokens
+            .web_sso_access_token
+            .as_ref()
+            .unwrap()
+            .expose_secret(),
         "callback-websso-secret"
     );
     assert_eq!(persisted.authenticated_at, instant(10));
@@ -606,7 +611,12 @@ async fn twenty_refreshes_of_one_generation_share_one_complete_rotation() {
         "refresh-generation-one"
     );
     assert_eq!(
-        persisted.tokens.web_sso_access_token.expose_secret(),
+        persisted
+            .tokens
+            .web_sso_access_token
+            .as_ref()
+            .unwrap()
+            .expose_secret(),
         "websso-generation-one"
     );
     assert_eq!(
@@ -823,7 +833,12 @@ async fn failed_websso_refresh_never_installs_partial_tokens_and_retry_uses_rota
         "complete-keycloak-refresh"
     );
     assert_eq!(
-        complete.tokens.web_sso_access_token.expose_secret(),
+        complete
+            .tokens
+            .web_sso_access_token
+            .as_ref()
+            .unwrap()
+            .expose_secret(),
         "complete-websso-access"
     );
 }

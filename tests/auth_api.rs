@@ -54,7 +54,7 @@ fn token_bundle() -> TokenBundle {
     TokenBundle {
         access_token: SecretString::from(ACCESS_SECRET),
         refresh_token: SecretString::from(REFRESH_SECRET),
-        web_sso_access_token: SecretString::from(WEB_SSO_SECRET),
+        web_sso_access_token: Some(SecretString::from(WEB_SSO_SECRET)),
         device_token: Some(SecretString::from(DEVICE_SECRET)),
     }
 }

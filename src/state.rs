@@ -4,7 +4,7 @@ use crate::{
     auth::AuthCoordinator,
     provider::mts::{
         MtsClient, MtsDashboardProvider, door::MtsDoorOpenProvider, intercom::MtsDeviceProvider,
-        media::MtsMediaProvider,
+        media::MtsMediaProvider, sms::MtsLegacySmsAuth,
     },
     service::{
         devices::DeviceService, door::DoorOpenService, media::MediaService,
@@ -22,6 +22,7 @@ pub struct AppState {
     device_service: Option<Arc<DeviceService>>,
     media_service: Option<Arc<MediaService>>,
     door_open_service: Option<Arc<DoorOpenService>>,
+    legacy_sms_auth: Option<Arc<MtsLegacySmsAuth>>,
 }
 
 impl AppState {
@@ -34,6 +35,7 @@ impl AppState {
             device_service: None,
             media_service: None,
             door_open_service: None,
+            legacy_sms_auth: None,
         }
     }
 
@@ -66,6 +68,7 @@ impl AppState {
             device_service: Some(device_service),
             media_service: Some(media_service),
             door_open_service: Some(door_open_service),
+            legacy_sms_auth: None,
         }
     }
 
@@ -84,6 +87,11 @@ impl AppState {
 
     pub fn with_door_open_service(mut self, door_open_service: Arc<DoorOpenService>) -> Self {
         self.door_open_service = Some(door_open_service);
+        self
+    }
+
+    pub fn with_legacy_sms_auth(mut self, legacy_sms_auth: Arc<MtsLegacySmsAuth>) -> Self {
+        self.legacy_sms_auth = Some(legacy_sms_auth);
         self
     }
 
@@ -113,5 +121,9 @@ impl AppState {
 
     pub fn door_open_service(&self) -> Option<&Arc<DoorOpenService>> {
         self.door_open_service.as_ref()
+    }
+
+    pub fn legacy_sms_auth(&self) -> Option<&Arc<MtsLegacySmsAuth>> {
+        self.legacy_sms_auth.as_ref()
     }
 }

@@ -394,7 +394,7 @@ impl CallbackResponse {
         Ok(TokenBundle {
             access_token: keycloak_token_pair.access_token,
             refresh_token: keycloak_token_pair.refresh_token,
-            web_sso_access_token,
+            web_sso_access_token: Some(web_sso_access_token),
             device_token: None,
         })
     }

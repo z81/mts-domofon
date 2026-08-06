@@ -108,6 +108,7 @@ enum SessionState {
 struct ExpiredSession {
     refresh_token: SecretString,
     device_token: Option<SecretString>,
+    uses_web_sso: bool,
     authenticated_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 }
@@ -116,6 +117,7 @@ struct RefreshMaterial {
     generation: u64,
     refresh_token: SecretString,
     device_token: Option<SecretString>,
+    uses_web_sso: bool,
     authenticated_at: DateTime<Utc>,
 }
 
@@ -196,6 +198,31 @@ impl AuthCoordinator {
         Ok(AuthProgress::Authenticated { session: view })
     }
 
+    pub async fn install_legacy_tokens(
+        &self,
+        access_token: SecretString,
+        refresh_token: SecretString,
+    ) -> Result<AuthProgress, AppError> {
+        let _operation = self.operation.lock().await;
+        let session = PersistedSession {
+            tokens: TokenBundle {
+                access_token,
+                refresh_token,
+                web_sso_access_token: None,
+                device_token: None,
+            },
+            authenticated_at: self.clock.now(),
+        };
+        self.store.save_session(&session).await?;
+        self.transport.clear();
+        let view = active_view(&session);
+        let mut state = self.state.write().await;
+        state.generation = next_generation(state.generation)?;
+        state.session = SessionState::Active(session);
+        state.last_refresh = None;
+        Ok(AuthProgress::Authenticated { session: view })
+    }
+
     pub async fn submit(
         &self,
         flow_id: &AuthFlowId,
@@ -233,24 +260,28 @@ impl AuthCoordinator {
                 return Err(error);
             }
         };
-        let web_sso_access_token = match self
-            .provider
-            .rotate_web_sso(&keycloak.access_token, material.device_token.as_ref())
-            .await
-        {
-            Ok(token) => token,
-            Err(error) => {
-                self.install_expired(
-                    RefreshMaterial {
-                        refresh_token: keycloak.refresh_token,
-                        ..material
-                    },
-                    replacement_generation,
-                    error.clone(),
-                )
-                .await;
-                return Err(error);
+        let web_sso_access_token = if material.uses_web_sso {
+            match self
+                .provider
+                .rotate_web_sso(&keycloak.access_token, material.device_token.as_ref())
+                .await
+            {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    self.install_expired(
+                        RefreshMaterial {
+                            refresh_token: keycloak.refresh_token,
+                            ..material
+                        },
+                        replacement_generation,
+                        error.clone(),
+                    )
+                    .await;
+                    return Err(error);
+                }
             }
+        } else {
+            None
         };
         let replacement = PersistedSession {
             tokens: TokenBundle {
@@ -326,6 +357,7 @@ impl AuthCoordinator {
         state.session = SessionState::Expired(ExpiredSession {
             refresh_token: material.refresh_token,
             device_token: material.device_token,
+            uses_web_sso: material.uses_web_sso,
             authenticated_at: material.authenticated_at,
             expires_at: self.clock.now(),
         });
@@ -387,12 +419,14 @@ fn refresh_material(state: &CoordinatorState) -> Result<RefreshMaterial, AppErro
             generation: state.generation,
             refresh_token: session.tokens.refresh_token.clone(),
             device_token: session.tokens.device_token.clone(),
+            uses_web_sso: session.tokens.web_sso_access_token.is_some(),
             authenticated_at: session.authenticated_at,
         }),
         SessionState::Expired(session) => Ok(RefreshMaterial {
             generation: state.generation,
             refresh_token: session.refresh_token.clone(),
             device_token: session.device_token.clone(),
+            uses_web_sso: session.uses_web_sso,
             authenticated_at: session.authenticated_at,
         }),
         SessionState::Anonymous => Err(session_expired_error()),

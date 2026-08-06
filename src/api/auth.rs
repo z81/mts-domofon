@@ -33,6 +33,11 @@ pub fn router() -> Router<AppState> {
             "/api/v1/auth/flows/{flow_id}/challenge",
             post(submit_challenge),
         )
+        .route("/api/v1/auth/legacy-sms/start", post(start_legacy_sms))
+        .route(
+            "/api/v1/auth/legacy-sms/flows/{flow_id}/confirm",
+            post(confirm_legacy_sms),
+        )
         .route("/api/v1/session", get(session).delete(logout))
         .route("/api/v1/session/refresh", post(refresh))
         .route("/api/login", post(compatibility_login))
@@ -50,6 +55,19 @@ struct StartRequest {}
 #[serde(deny_unknown_fields)]
 struct CallbackRequest {
     callback_url: SecretString,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySmsStartRequest {
+    phone: SecretString,
+    accept_legacy_sms: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySmsConfirmRequest {
+    code: SecretString,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +190,63 @@ async fn submit_challenge(
         .await
         .map(Json)
         .map_err(|error| ApiError::new(request_id, map_challenge_error(error)))
+}
+
+async fn start_legacy_sms(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    AuthJson(request): AuthJson<LegacySmsStartRequest>,
+) -> Result<Json<AuthProgress>, ApiError> {
+    if !request.accept_legacy_sms {
+        return Err(ApiError::new(
+            request_id,
+            AppError::invalid_request("Legacy SMS authentication requires explicit consent."),
+        ));
+    }
+    let legacy = state.legacy_sms_auth().cloned().ok_or_else(|| {
+        ApiError::new(
+            request_id,
+            AppError::new(
+                ErrorCode::Internal,
+                "Legacy SMS authentication is unavailable.",
+                false,
+            ),
+        )
+    })?;
+    legacy
+        .start(request.phone)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::new(request_id, error))
+}
+
+async fn confirm_legacy_sms(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    path: Result<Path<String>, PathRejection>,
+    AuthJson(request): AuthJson<LegacySmsConfirmRequest>,
+) -> Result<Json<AuthProgress>, ApiError> {
+    let flow_id = parse_flow_id(path, request_id)?;
+    let legacy = state.legacy_sms_auth().cloned().ok_or_else(|| {
+        ApiError::new(
+            request_id,
+            AppError::new(
+                ErrorCode::Internal,
+                "Legacy SMS authentication is unavailable.",
+                false,
+            ),
+        )
+    })?;
+    let tokens = legacy
+        .confirm(&flow_id, request.code)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    let coordinator = coordinator(&state, request_id)?;
+    coordinator
+        .install_legacy_tokens(tokens.access_token, tokens.refresh_token)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::new(request_id, error))
 }
 
 async fn session(

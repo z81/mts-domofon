@@ -175,7 +175,7 @@ impl fmt::Debug for AuthProgress {
 pub struct TokenBundle {
     pub access_token: SecretString,
     pub refresh_token: SecretString,
-    pub web_sso_access_token: SecretString,
+    pub web_sso_access_token: Option<SecretString>,
     pub device_token: Option<SecretString>,
 }
 
@@ -196,7 +196,10 @@ impl fmt::Debug for PersistedSession {
             .debug_struct("PersistedSession")
             .field("has_access_token", &true)
             .field("has_refresh_token", &true)
-            .field("has_web_sso_access_token", &true)
+            .field(
+                "has_web_sso_access_token",
+                &self.tokens.web_sso_access_token.is_some(),
+            )
             .field("has_device_token", &self.tokens.device_token.is_some())
             .field("authenticated_at", &self.authenticated_at)
             .finish()
@@ -211,7 +214,10 @@ impl TokenBundle {
         (
             self.access_token.expose_secret(),
             self.refresh_token.expose_secret(),
-            self.web_sso_access_token.expose_secret(),
+            self.web_sso_access_token
+                .as_ref()
+                .map(ExposeSecret::expose_secret)
+                .unwrap_or(""),
             self.device_token.as_ref().map(ExposeSecret::expose_secret),
         )
     }
@@ -224,7 +230,7 @@ impl PersistedSession {
             tokens: TokenBundle {
                 access_token: SecretString::from("access-test"),
                 refresh_token: SecretString::from("refresh-test"),
-                web_sso_access_token: SecretString::from("sso-test"),
+                web_sso_access_token: Some(SecretString::from("sso-test")),
                 device_token: Some(SecretString::from("device-token-test")),
             },
             authenticated_at: Utc::now(),

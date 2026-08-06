@@ -5,7 +5,8 @@ use domru_mts::{
     auth::AuthCoordinator,
     config::AppConfig,
     provider::mts::{
-        MtsAuthApi, MtsClient, TokenSource, device::MtsDeviceDescriptor, sso::MtsSsoTransport,
+        MtsAuthApi, MtsClient, TokenSource, device::MtsDeviceDescriptor, sms::MtsLegacySmsAuth,
+        sso::MtsSsoTransport,
     },
     state::AppState,
     storage::SecretStore,
@@ -26,7 +27,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         AuthCoordinator::restore(secret_store.clone(), sso_transport, provider_auth).await?;
     let token_source: Arc<dyn TokenSource> = auth_coordinator.clone();
     let mts_client = Arc::new(MtsClient::new(&config, token_source)?);
-    let state = AppState::with_dependencies(secret_store, auth_coordinator, mts_client);
+    let legacy_sms_auth = Arc::new(MtsLegacySmsAuth::new()?);
+    let state = AppState::with_dependencies(secret_store, auth_coordinator, mts_client)
+        .with_legacy_sms_auth(legacy_sms_auth);
 
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "server listening");

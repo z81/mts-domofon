@@ -98,7 +98,8 @@ impl Drop for TemporaryFile {
 struct StoredSession {
     access_token: Zeroizing<String>,
     refresh_token: Zeroizing<String>,
-    web_sso_access_token: Zeroizing<String>,
+    #[serde(default)]
+    web_sso_access_token: Option<Zeroizing<String>>,
     device_token: Option<Zeroizing<String>>,
     authenticated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -108,13 +109,11 @@ impl From<&PersistedSession> for StoredSession {
         Self {
             access_token: Zeroizing::new(session.tokens.access_token.expose_secret().to_owned()),
             refresh_token: Zeroizing::new(session.tokens.refresh_token.expose_secret().to_owned()),
-            web_sso_access_token: Zeroizing::new(
-                session
-                    .tokens
-                    .web_sso_access_token
-                    .expose_secret()
-                    .to_owned(),
-            ),
+            web_sso_access_token: session
+                .tokens
+                .web_sso_access_token
+                .as_ref()
+                .map(|token| Zeroizing::new(token.expose_secret().to_owned())),
             device_token: session
                 .tokens
                 .device_token
@@ -131,9 +130,9 @@ impl From<StoredSession> for PersistedSession {
             tokens: TokenBundle {
                 access_token: secrecy::SecretString::from(session.access_token.to_string()),
                 refresh_token: secrecy::SecretString::from(session.refresh_token.to_string()),
-                web_sso_access_token: secrecy::SecretString::from(
-                    session.web_sso_access_token.to_string(),
-                ),
+                web_sso_access_token: session
+                    .web_sso_access_token
+                    .map(|token| secrecy::SecretString::from(token.to_string())),
                 device_token: session
                     .device_token
                     .map(|token| secrecy::SecretString::from(token.to_string())),

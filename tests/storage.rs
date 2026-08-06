@@ -26,7 +26,7 @@ fn synthetic_session() -> PersistedSession {
         tokens: TokenBundle {
             access_token: SecretString::from("access-test"),
             refresh_token: SecretString::from("refresh-test"),
-            web_sso_access_token: SecretString::from("sso-test"),
+            web_sso_access_token: Some(SecretString::from("sso-test")),
             device_token: Some(SecretString::from("device-token-test")),
         },
         authenticated_at: Utc::now(),
@@ -79,8 +79,18 @@ async fn stored_session_is_encrypted_and_round_trips() {
         session.tokens.refresh_token.expose_secret()
     );
     assert_eq!(
-        loaded.tokens.web_sso_access_token.expose_secret(),
-        session.tokens.web_sso_access_token.expose_secret()
+        loaded
+            .tokens
+            .web_sso_access_token
+            .as_ref()
+            .unwrap()
+            .expose_secret(),
+        session
+            .tokens
+            .web_sso_access_token
+            .as_ref()
+            .unwrap()
+            .expose_secret()
     );
     assert_eq!(
         loaded

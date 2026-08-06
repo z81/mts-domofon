@@ -7,6 +7,7 @@ pub mod door;
 pub mod dto;
 pub mod intercom;
 pub mod media;
+pub mod sms;
 pub mod sso;
 
 pub use auth_api::{KeycloakRotation, MtsAuthApi, ProviderAuthApi};
