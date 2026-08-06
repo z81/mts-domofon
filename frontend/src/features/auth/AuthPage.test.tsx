@@ -66,6 +66,9 @@ describe('AuthPage', () => {
 
     expect(navigate).not.toHaveBeenCalled()
     expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось начать вход')
+    expect(screen.getByRole('button', { name: 'Войти с MTS ID' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Вставить ответ MTS' })).toBeVisible()
+    expect(screen.queryByRole('heading', { name: 'Переходим в MTS ID' })).not.toBeInTheDocument()
     expect(document.body).not.toHaveTextContent('provider-secret')
   })
 

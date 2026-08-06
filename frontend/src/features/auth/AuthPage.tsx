@@ -78,8 +78,9 @@ export function AuthPage({ api = authApi, navigate = navigateSameTab, onClose, o
 
   function applyProgress(progress: AuthProgress) {
     if (progress.status === 'browser_redirect') {
+      const authorizationUrl = directMtsLoginUrl(progress.authorization_url)
       setView('redirecting')
-      navigate(directMtsLoginUrl(progress.authorization_url))
+      navigate(authorizationUrl)
       return
     }
     if (progress.status === 'challenge') {
