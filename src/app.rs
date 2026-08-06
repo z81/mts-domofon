@@ -5,7 +5,7 @@ use axum::{
     extract::Request,
     http::{Uri, header},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use tower_http::{
     sensitive_headers::SetSensitiveHeadersLayer,
@@ -15,8 +15,11 @@ use tracing::{Level, Span};
 
 use crate::{
     api,
+    config::AppConfig,
+    error::{ApiError, AppError, ErrorCode},
     request_id::{self, RequestId},
     state::AppState,
+    web::WebAssets,
 };
 
 const SENSITIVE_QUERY_KEYS: &[&str] = &[
@@ -126,9 +129,41 @@ pub fn with_http_middleware(router: Router) -> Router {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    with_http_middleware(api::router().with_state(state))
+    let config = AppConfig::from_env().expect("application configuration was validated at startup");
+    build_router_with_config(state, &config)
+}
+
+pub fn build_router_with_config(state: AppState, config: &AppConfig) -> Router {
+    let web_assets = WebAssets::new(config.web_dist_dir.clone());
+    let router = api::router()
+        .with_state(state)
+        .fallback(move |request: Request| {
+            let web_assets = web_assets.clone();
+            async move {
+                if request.uri().path().starts_with("/api") {
+                    return api_not_found(&request);
+                }
+                web_assets.serve(request).await
+            }
+        });
+    with_http_middleware(router)
 }
 
 pub async fn test_router() -> Router {
-    build_router(AppState::default())
+    let config = AppConfig::from_iter(std::iter::empty::<(&str, &str)>())
+        .expect("default application configuration is valid");
+    build_router_with_config(AppState::default(), &config)
+}
+
+fn api_not_found(request: &Request) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .copied()
+        .unwrap_or_else(RequestId::generate);
+    ApiError::new(
+        request_id,
+        AppError::new(ErrorCode::NotFound, "Resource not found.", false),
+    )
+    .into_response()
 }
