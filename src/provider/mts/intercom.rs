@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use async_trait::async_trait;
 use reqwest::Method;
@@ -24,6 +24,8 @@ const MAX_SCOPE_BYTES: usize = 512;
 const MAX_ID_BYTES: usize = 512;
 const MAX_NAME_BYTES: usize = 2_048;
 const MAX_LOCK_NAME_BYTES: usize = 512;
+const MAX_LOCKS_PER_ACCESS_POINT: usize = 64;
+const MAX_CAMERAS_PER_ACCESS_POINT: usize = 64;
 const UNKNOWN_KIND: &str = "unknown";
 
 #[async_trait]
@@ -112,10 +114,13 @@ impl DeviceProvider for MtsDeviceProvider {
                 flat,
                 category,
                 BTreeMap::new(),
-                |merged, dto| merge_access_point(flat, merged, dto),
+                merge_access_point,
             )
             .await?;
-        Ok(merged.into_values().collect())
+        Ok(merged
+            .into_values()
+            .map(|point| point.into_access_point(flat))
+            .collect())
     }
 
     async fn cameras(&self, flat: &FlatId) -> Result<Vec<Camera>, AppError> {
@@ -188,51 +193,94 @@ fn validate_page<T>(
     Ok(())
 }
 
+struct AccessPointAccumulator {
+    id: String,
+    name: String,
+    locks: BTreeMap<String, Lock>,
+    camera_ids: BTreeSet<String>,
+}
+
+impl AccessPointAccumulator {
+    fn new(id: String, name: String) -> Self {
+        Self {
+            id,
+            name,
+            locks: BTreeMap::new(),
+            camera_ids: BTreeSet::new(),
+        }
+    }
+
+    fn merge_locks(&mut self, candidates: Vec<Lock>) -> Result<(), AppError> {
+        for candidate in candidates {
+            if let Some(existing) = self.locks.get_mut(&candidate.number) {
+                if existing.name != candidate.name {
+                    return Err(schema_error());
+                }
+                match (existing.permanently_open, candidate.permanently_open) {
+                    (Some(left), Some(right)) if left != right => return Err(schema_error()),
+                    (None, Some(value)) => existing.permanently_open = Some(value),
+                    _ => {}
+                }
+            } else {
+                if self.locks.len() >= MAX_LOCKS_PER_ACCESS_POINT {
+                    return Err(schema_error());
+                }
+                self.locks.insert(candidate.number.clone(), candidate);
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_camera_id(&mut self, candidate: Option<String>) -> Result<(), AppError> {
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        validate_optional_id(&candidate)?;
+        if !self.camera_ids.contains(&candidate)
+            && self.camera_ids.len() >= MAX_CAMERAS_PER_ACCESS_POINT
+        {
+            return Err(schema_error());
+        }
+        self.camera_ids.insert(candidate);
+        Ok(())
+    }
+
+    fn into_access_point(self, flat: &FlatId) -> AccessPoint {
+        AccessPoint {
+            id: self.id,
+            flat_id: flat.clone(),
+            name: self.name,
+            kind: AccessPointKind::Unknown(UNKNOWN_KIND.to_owned()),
+            locks: self.locks.into_values().collect(),
+            camera_ids: self.camera_ids.into_iter().collect(),
+            available: true,
+        }
+    }
+}
+
 fn merge_access_point(
-    flat: &FlatId,
-    merged: &mut BTreeMap<String, AccessPoint>,
+    merged: &mut BTreeMap<String, AccessPointAccumulator>,
     dto: AccessPointDto,
 ) -> Result<(), AppError> {
     validate_identity(&dto.id, &dto.name)?;
-    let point = map_access_point(flat, dto)?;
-    match merged.entry(point.id.clone()) {
+    let locks = parse_locks(dto.locks)?;
+    match merged.entry(dto.id.clone()) {
         Entry::Vacant(entry) => {
+            let mut point = AccessPointAccumulator::new(dto.id, dto.name);
+            point.merge_locks(locks)?;
+            point.merge_camera_id(dto.camera)?;
             entry.insert(point);
         }
         Entry::Occupied(mut entry) => {
             let existing = entry.get_mut();
-            if existing.name != point.name {
+            if existing.name != dto.name {
                 return Err(schema_error());
             }
-            existing.available |= point.available;
-            merge_locks(&mut existing.locks, point.locks)?;
-            existing.camera_ids.extend(point.camera_ids);
-            existing.camera_ids.sort();
-            existing.camera_ids.dedup();
+            existing.merge_locks(locks)?;
+            existing.merge_camera_id(dto.camera)?;
         }
     }
     Ok(())
-}
-
-fn map_access_point(flat: &FlatId, dto: AccessPointDto) -> Result<AccessPoint, AppError> {
-    let mut locks = Vec::new();
-    merge_locks(&mut locks, parse_locks(dto.locks)?)?;
-    let camera_ids = match dto.camera {
-        Some(id) => {
-            validate_optional_id(&id)?;
-            vec![id]
-        }
-        None => Vec::new(),
-    };
-    Ok(AccessPoint {
-        id: dto.id,
-        flat_id: flat.clone(),
-        name: dto.name,
-        kind: AccessPointKind::Unknown(UNKNOWN_KIND.to_owned()),
-        locks,
-        camera_ids,
-        available: true,
-    })
 }
 
 fn parse_locks<const LIMIT: usize>(
@@ -251,30 +299,6 @@ fn parse_locks<const LIMIT: usize>(
             })
         })
         .collect()
-}
-
-fn merge_locks(target: &mut Vec<Lock>, candidates: Vec<Lock>) -> Result<(), AppError> {
-    let mut merged: BTreeMap<String, Lock> = BTreeMap::new();
-    for candidate in target.drain(..).chain(candidates) {
-        match merged.entry(candidate.number.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(candidate);
-            }
-            Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut();
-                if existing.name != candidate.name {
-                    return Err(schema_error());
-                }
-                match (existing.permanently_open, candidate.permanently_open) {
-                    (Some(left), Some(right)) if left != right => return Err(schema_error()),
-                    (None, Some(value)) => existing.permanently_open = Some(value),
-                    _ => {}
-                }
-            }
-        }
-    }
-    target.extend(merged.into_values());
-    Ok(())
 }
 
 fn merge_camera(

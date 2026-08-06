@@ -518,6 +518,102 @@ async fn access_point_locks_reject_malformed_required_fields_and_nested_bounds()
     }
 }
 
+#[tokio::test]
+async fn duplicate_access_point_locks_are_aggregate_bounded_across_pages() {
+    let server = MockServer::start().await;
+    let mut first_page_rows = (0..64)
+        .map(|number| duplicate_access_row(Some(number), None))
+        .collect::<Vec<_>>();
+    while first_page_rows.len() < 100 {
+        first_page_rows.push(duplicate_access_row(Some(0), None));
+    }
+    let pages = [
+        access_page(first_page_rows, 0, false),
+        access_page(vec![duplicate_access_row(Some(64), None)], 1, true),
+    ];
+    mount_access_pages(&server, "flat-aggregate-locks", &pages).await;
+    let provider = MtsDeviceProvider::new(client(&server));
+
+    let error = provider
+        .access_points(&FlatId("flat-aggregate-locks".to_owned()), None)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn duplicate_access_point_cameras_are_aggregate_bounded_across_pages() {
+    let server = MockServer::start().await;
+    let mut first_page_rows = (0..64)
+        .map(|number| duplicate_access_row(None, Some(format!("camera-{number}"))))
+        .collect::<Vec<_>>();
+    while first_page_rows.len() < 100 {
+        first_page_rows.push(duplicate_access_row(None, Some("camera-0".to_owned())));
+    }
+    let pages = [
+        access_page(first_page_rows, 0, false),
+        access_page(
+            vec![duplicate_access_row(None, Some("camera-64".to_owned()))],
+            1,
+            true,
+        ),
+    ];
+    mount_access_pages(&server, "flat-aggregate-cameras", &pages).await;
+    let provider = MtsDeviceProvider::new(client(&server));
+
+    let error = provider
+        .access_points(&FlatId("flat-aggregate-cameras".to_owned()), None)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+fn duplicate_access_row(lock_number: Option<i64>, camera: Option<String>) -> serde_json::Value {
+    let locks = lock_number.map_or(serde_json::Value::Null, |number| {
+        serde_json::json!([{
+            "number": number,
+            "name": format!("Door {number}"),
+            "isPermanentlyOpen": null
+        }])
+    });
+    serde_json::json!({
+        "id": "access-aggregate",
+        "name": "Aggregate access point",
+        "camera": camera,
+        "addresses": null,
+        "locks": locks
+    })
+}
+
+fn access_page(content: Vec<serde_json::Value>, number: u32, last: bool) -> serde_json::Value {
+    serde_json::json!({
+        "content": content,
+        "totalElements": 101,
+        "totalPages": 2,
+        "number": number,
+        "size": 100,
+        "last": last,
+        "first": number == 0,
+        "empty": false
+    })
+}
+
+async fn mount_access_pages(server: &MockServer, flat: &str, pages: &[serde_json::Value]) {
+    for (number, page) in pages.iter().enumerate() {
+        Mock::given(method("GET"))
+            .and(path(ACCESS_PATH))
+            .and(query_param("flatId", flat))
+            .and(query_param("page", number.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(server)
+            .await;
+    }
+}
+
 fn single_access_page(id: &str, locks: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "content": [{
