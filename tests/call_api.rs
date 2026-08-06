@@ -406,6 +406,12 @@ fn provider_client(server: &MockServer) -> MtsClient {
     MtsClient::new_for_test(base.clone(), base, Arc::new(ProviderTokens)).unwrap()
 }
 
+fn provider_client_with_bases(gateway: &MockServer, resident: &MockServer) -> MtsClient {
+    let gateway = Url::parse(&format!("{}/", gateway.uri())).unwrap();
+    let resident = Url::parse(&format!("{}/", resident.uri())).unwrap();
+    MtsClient::new_for_test(gateway, resident, Arc::new(ProviderTokens)).unwrap()
+}
+
 #[tokio::test]
 async fn call_open_provider_sends_call_scoped_header_without_a_lock_number() {
     let server = MockServer::start().await;
@@ -440,7 +446,8 @@ async fn call_open_provider_sends_call_scoped_header_without_a_lock_number() {
 
 #[tokio::test]
 async fn remote_ignore_action_uses_the_opaque_session_route_and_explicit_empty_body() {
-    let server = MockServer::start().await;
+    let gateway = MockServer::start().await;
+    let resident = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(
             "/domofon/api/intercom/v1/calls/session%20%2F%2099/action/ignore",
@@ -448,9 +455,9 @@ async fn remote_ignore_action_uses_the_opaque_session_route_and_explicit_empty_b
         .and(wire_header("content-length", "0"))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
-        .mount(&server)
+        .mount(&gateway)
         .await;
-    let provider = MtsCallActionProvider::new(provider_client(&server));
+    let provider = MtsCallActionProvider::new(provider_client_with_bases(&gateway, &resident));
 
     provider
         .action(
@@ -460,5 +467,10 @@ async fn remote_ignore_action_uses_the_opaque_session_route_and_explicit_empty_b
         .await
         .unwrap();
 
-    assert!(server.received_requests().await.unwrap()[0].body.is_empty());
+    assert!(
+        gateway.received_requests().await.unwrap()[0]
+            .body
+            .is_empty()
+    );
+    assert!(resident.received_requests().await.unwrap().is_empty());
 }

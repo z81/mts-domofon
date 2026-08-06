@@ -104,7 +104,7 @@ impl CallActionProvider for MtsCallActionProvider {
             .client
             .authorized_with_two_path_segments(
                 Method::POST,
-                ProviderBase::Resident,
+                ProviderBase::Gateway,
                 CALLS_PREFIX,
                 call_session_id,
                 "action",
