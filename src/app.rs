@@ -23,5 +23,5 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 pub async fn test_router() -> Router {
-    build_router(AppState)
+    build_router(AppState::default())
 }

@@ -322,19 +322,32 @@ fn decode_external_key(encoded: &str) -> Result<Zeroizing<[u8; 32]>, AppError> {
     Ok(key)
 }
 
+async fn open_owner_only_temporary_file(
+    path: PathBuf,
+) -> Result<(fs::File, TemporaryFile), AppError> {
+    let (file, temporary) = tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        Ok::<_, std::io::Error>((file, TemporaryFile::new(path)))
+    })
+    .await
+    .map_err(|_| storage_failure())?
+    .map_err(|_| storage_failure())?;
+    Ok((fs::File::from_std(file), temporary))
+}
+
 async fn create_synced_temporary_file(
     data_dir: &Path,
     file_name: &str,
     contents: &[u8],
 ) -> Result<TemporaryFile, AppError> {
     let temporary = data_dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options
-        .open(&temporary)
-        .await
-        .map_err(|_| storage_failure())?;
-    let temporary = TemporaryFile::new(temporary);
+    let (mut file, temporary) = open_owner_only_temporary_file(temporary).await?;
 
     set_owner_only_permissions(temporary.path()).await?;
     file.write_all(contents)
@@ -523,4 +536,27 @@ fn storage_failure() -> AppError {
 
 fn invalid_external_key() -> AppError {
     AppError::invalid_request("VDOME_SECRET_KEY must be Base64-encoded 32 bytes.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sensitive_temporary_file_is_owner_only_at_open_time() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".session.enc.synthetic.tmp");
+
+        let (_file, temporary) = open_owner_only_temporary_file(path).await.unwrap();
+
+        let mode = std::fs::metadata(temporary.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

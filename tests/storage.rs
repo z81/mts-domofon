@@ -1,4 +1,10 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    io::Read,
+    path::Path,
+    process::{Child, Command, ExitStatus},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -9,6 +15,7 @@ use chrono::Utc;
 use domru_mts::{
     domain::auth::{PersistedSession, TokenBundle},
     error::ErrorCode,
+    state::AppState,
     storage::SecretStore,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -24,6 +31,25 @@ fn synthetic_session() -> PersistedSession {
         },
         authenticated_at: Utc::now(),
     }
+}
+
+#[tokio::test]
+async fn app_state_shares_the_production_secret_store_across_clones() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SecretStore::open(dir.path(), Some([17_u8; 32]))
+        .await
+        .unwrap();
+    let state = AppState::with_secret_store(store);
+    let cloned = state.clone();
+    let original_store = state.secret_store().expect("production store is present");
+    let cloned_store = cloned.secret_store().expect("cloned store is present");
+
+    assert!(Arc::ptr_eq(original_store, cloned_store));
+    original_store
+        .save_session(&synthetic_session())
+        .await
+        .unwrap();
+    assert!(cloned_store.load_session().await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -282,20 +308,20 @@ async fn repeated_session_saves_use_distinct_nonces_and_keep_latest_data() {
     let store = SecretStore::open(dir.path(), Some([10_u8; 32]))
         .await
         .unwrap();
-    let first = synthetic_session();
-    store.save_session(&first).await.unwrap();
+    let session = synthetic_session();
+    store.save_session(&session).await.unwrap();
     let first_raw = tokio::fs::read(dir.path().join("session.enc"))
         .await
         .unwrap();
-    let mut second = synthetic_session();
-    second.authenticated_at += chrono::Duration::seconds(1);
 
-    store.save_session(&second).await.unwrap();
+    store.save_session(&session).await.unwrap();
 
     let second_raw = tokio::fs::read(dir.path().join("session.enc"))
         .await
         .unwrap();
-    assert_ne!(first_raw, second_raw);
+    assert_eq!(&first_raw[..4], b"VDM1");
+    assert_eq!(&second_raw[..4], b"VDM1");
+    assert_ne!(&first_raw[4..16], &second_raw[4..16]);
     assert_eq!(
         store
             .load_session()
@@ -303,7 +329,7 @@ async fn repeated_session_saves_use_distinct_nonces_and_keep_latest_data() {
             .unwrap()
             .unwrap()
             .authenticated_at,
-        second.authenticated_at
+        session.authenticated_at
     );
 }
 
@@ -410,6 +436,59 @@ fn vdome_secret_key_environment_is_used_by_the_production_constructor() {
             .unwrap();
         assert!(store.load_session().await.unwrap().is_some());
     });
+}
+
+#[test]
+fn production_startup_rejects_invalid_vdome_secret_key_without_disclosing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let invalid_key = "synthetic-invalid-startup-secret";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_domru-mts"))
+        .env_clear()
+        .env("VDOME_BIND", "127.0.0.1:0")
+        .env("VDOME_DATA_DIR", dir.path())
+        .env("VDOME_SECRET_KEY", invalid_key)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let Some(status) = wait_for_exit(&mut child, Duration::from_secs(2)) else {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("production startup did not reject invalid VDOME_SECRET_KEY");
+    };
+    let mut stderr = String::new();
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+
+    assert!(!status.success());
+    assert!(!stdout.contains(invalid_key));
+    assert!(!stderr.contains(invalid_key));
+    assert!(!dir.path().join("master.key").exists());
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
