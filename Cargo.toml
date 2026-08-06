@@ -20,6 +20,7 @@ base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4.45", features = ["serde"] }
 futures-util = "0.3"
+fs2 = "0.4"
 http = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "gzip", "json", "multipart", "query", "rustls", "stream"] }
 rand = "0.9"
