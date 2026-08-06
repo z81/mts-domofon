@@ -41,6 +41,11 @@ name = "auth_api"
 path = "tests/auth_api.rs"
 required-features = ["test-support"]
 
+[[test]]
+name = "intercom_provider"
+path = "tests/contract/intercom_provider.rs"
+required-features = ["test-support"]
+
 [dependencies]
 aes-gcm = { version = "0.11.0", features = ["zeroize"] }
 async-trait = "0.1"

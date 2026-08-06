@@ -1,0 +1,29 @@
+{
+  "content": [
+    {
+      "id": "access-z",
+      "name": "Entrance Z",
+      "camera": "camera-live",
+      "addresses": ["Synthetic address"],
+      "locks": [
+        {"number": 2, "name": "Vehicle gate", "isPermanentlyOpen": null},
+        {"number": 1, "name": "Pedestrian door", "isPermanentlyOpen": false}
+      ],
+      "futureField": {"providerOnly": true}
+    },
+    {
+      "id": "access-shared",
+      "name": "Shared entrance",
+      "camera": null,
+      "addresses": null,
+      "locks": [{"number": 3, "name": "Side door", "isPermanentlyOpen": true}]
+    }
+  ],
+  "totalElements": 4,
+  "totalPages": 2,
+  "number": 0,
+  "size": 100,
+  "last": false,
+  "first": true,
+  "empty": false
+}

@@ -1,0 +1,24 @@
+{
+  "content": [
+    {
+      "id": "access-a",
+      "name": "Entrance A",
+      "camera": null,
+      "addresses": [],
+      "locks": null
+    },
+    {
+      "id": "access-shared",
+      "name": "Shared entrance",
+      "camera": "camera-archive",
+      "locks": [{"number": 4, "name": "Service door", "isPermanentlyOpen": false}]
+    }
+  ],
+  "totalElements": 4,
+  "totalPages": 2,
+  "number": 1,
+  "size": 100,
+  "last": true,
+  "first": false,
+  "empty": false
+}

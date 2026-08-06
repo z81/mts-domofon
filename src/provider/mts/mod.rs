@@ -4,6 +4,7 @@ mod client;
 mod dashboard;
 pub mod device;
 pub mod dto;
+pub mod intercom;
 pub mod sso;
 
 pub use auth_api::{KeycloakRotation, MtsAuthApi, ProviderAuthApi};

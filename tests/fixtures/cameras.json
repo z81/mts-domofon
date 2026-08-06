@@ -1,0 +1,49 @@
+{
+  "content": [
+    {
+      "id": "camera-live",
+      "name": "Live camera",
+      "addresses": null,
+      "streams": {"rtsp": "rtsp://media.invalid/live/private"},
+      "streamsToWatch": null,
+      "streamMode": "rtsp",
+      "ivideon": null,
+      "intercoms": [{"id": "access-z", "locks": null}],
+      "additive": "retained privately"
+    },
+    {
+      "id": "camera-archive",
+      "name": "Archive camera",
+      "addresses": ["Synthetic address"],
+      "streams": null,
+      "streamsToWatch": {},
+      "streamMode": null,
+      "ivideon": {
+        "cameraId": "provider-camera-secret",
+        "status": "active",
+        "cause": null,
+        "server": "https://provider.invalid/private",
+        "token": "synthetic-provider-token-secret",
+        "depth": 86400
+      },
+      "intercoms": null
+    },
+    {
+      "id": "camera-bare",
+      "name": "Snapshot camera",
+      "addresses": null,
+      "streams": null,
+      "streamsToWatch": null,
+      "streamMode": null,
+      "ivideon": {"status": "inactive"},
+      "intercoms": null
+    }
+  ],
+  "totalElements": 3,
+  "totalPages": 1,
+  "number": 0,
+  "size": 100,
+  "last": true,
+  "first": true,
+  "empty": false
+}
