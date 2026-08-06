@@ -10,6 +10,7 @@ use url::Url;
 const MAX_STREAMS_PER_MAP: usize = 32;
 const MAX_STREAM_KEY_BYTES: usize = 128;
 const MAX_STREAM_VALUE_BYTES: usize = 4_096;
+const MAX_IVIDEON_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_LOCKS_PER_ITEM: usize = 64;
 const MAX_INTERCOMS_PER_CAMERA: usize = 64;
 
@@ -186,9 +187,28 @@ fn live_source(value: &str) -> Option<SecretString> {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct IvideonEvidence {
     #[serde(default)]
+    pub(crate) camera_id: Option<String>,
+    #[serde(default, deserialize_with = "optional_ivideon_token")]
+    pub(crate) token: Option<SecretString>,
+    #[serde(default)]
     pub(crate) depth: Option<u64>,
+}
+
+fn optional_ivideon_token<'de, D>(deserializer: D) -> Result<Option<SecretString>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_IVIDEON_TOKEN_BYTES)
+    {
+        return Err(D::Error::custom("Ivideon token exceeds its byte bound"));
+    }
+    Ok(value.map(SecretString::from))
 }
 
 #[derive(Deserialize)]

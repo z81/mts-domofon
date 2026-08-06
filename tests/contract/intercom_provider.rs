@@ -7,6 +7,7 @@ use domru_mts::{
     provider::mts::{
         MtsClient, TokenSource,
         intercom::{DeviceProvider, LiveSourceProvider, MtsDeviceProvider},
+        ivideon::{IvideonLiveResolver, IvideonLiveUrlResolver},
     },
     service::devices::DeviceService,
 };
@@ -175,7 +176,7 @@ async fn cameras_map_independent_capabilities_without_disclosing_private_media_d
     );
     assert_eq!(cameras[0].flat_id, flat);
     assert_eq!(cameras[0].capabilities.snapshot, Capability::Available);
-    assert_eq!(cameras[0].capabilities.live, unavailable());
+    assert_eq!(cameras[0].capabilities.live, Capability::Available);
     assert_eq!(cameras[0].capabilities.archive, Capability::Available);
     assert_eq!(cameras[1].capabilities.snapshot, Capability::Available);
     assert_eq!(cameras[1].capabilities.live, unavailable());
@@ -236,6 +237,216 @@ async fn live_source_prefers_rtsp_to_watch_without_exposing_it_in_inventory() {
     let public = serde_json::to_string(&cameras).unwrap();
     assert!(!public.contains("watch.invalid"));
     assert!(!public.contains("fallback.invalid"));
+}
+
+#[tokio::test]
+async fn ivideon_resolver_replays_the_apk_live_stream_contract_exactly() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/cameras/ivideon-camera/live_stream"))
+        .and(query_param("expect", "body"))
+        .and(query_param("q", "2"))
+        .and(query_param("video_codecs", "h265,h264"))
+        .and(query_param("audio_codecs", "pcmu,pcma,aac,mp3"))
+        .and(query_param("access_token", "private-ivideon-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url": "https://ivideon-media.invalid/private.m3u8?token=private-media-token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let base = Url::parse(&format!("{}/", server.uri())).unwrap();
+    let resolver = IvideonLiveResolver::new_for_test(base).unwrap();
+
+    let source = resolver
+        .resolve_live_url(
+            "ivideon-camera",
+            &SecretString::from("private-ivideon-token"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        source.expose_secret(),
+        "https://ivideon-media.invalid/private.m3u8?token=private-media-token"
+    );
+}
+
+#[tokio::test]
+async fn partial_ivideon_evidence_falls_back_to_rtsp_without_becoming_live_by_itself() {
+    let server = MockServer::start().await;
+    let page = single_camera_page(
+        "camera-partial-ivideon",
+        serde_json::json!({"rtsp": "rtsp://fallback.invalid/private"}),
+        serde_json::Value::Null,
+        serde_json::json!({"cameraId": "ivideon-without-token", "depth": 0}),
+    );
+    Mock::given(method("GET"))
+        .and(path(CAMERA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page))
+        .mount(&server)
+        .await;
+    let provider = MtsDeviceProvider::new(client(&server));
+
+    let source = provider
+        .live_source(
+            &FlatId("flat-partial-ivideon".to_owned()),
+            "camera-partial-ivideon",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(source.expose_secret(), "rtsp://fallback.invalid/private");
+}
+
+#[tokio::test]
+async fn live_source_prefers_ivideon_to_embedded_rtsp_like_the_apk() {
+    let mts = MockServer::start().await;
+    let ivideon = MockServer::start().await;
+    let page = single_camera_page(
+        "camera-apk-priority",
+        serde_json::json!({"rtsp": "rtsp://fallback.invalid/private"}),
+        serde_json::Value::Null,
+        serde_json::json!({
+            "cameraId": "ivideon-priority-camera",
+            "token": "private-priority-token",
+            "server": "https://provider-controlled.invalid/ignored",
+            "depth": 0
+        }),
+    );
+    Mock::given(method("GET"))
+        .and(path(CAMERA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page))
+        .mount(&mts)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cameras/ivideon-priority-camera/live_stream"))
+        .and(query_param("access_token", "private-priority-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url": "rtsps://ivideon-media.invalid/private-priority"
+        })))
+        .expect(1)
+        .mount(&ivideon)
+        .await;
+    let ivideon_base = Url::parse(&format!("{}/", ivideon.uri())).unwrap();
+    let resolver = Arc::new(IvideonLiveResolver::new_for_test(ivideon_base).unwrap());
+    let provider = MtsDeviceProvider::new_with_live_url_resolver(client(&mts), resolver);
+
+    let source = provider
+        .live_source(
+            &FlatId("flat-apk-priority".to_owned()),
+            "camera-apk-priority",
+        )
+        .await
+        .unwrap();
+    let cameras = provider
+        .cameras(&FlatId("flat-apk-priority".to_owned()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        source.expose_secret(),
+        "rtsps://ivideon-media.invalid/private-priority"
+    );
+    assert_eq!(cameras[0].capabilities.live, Capability::Available);
+}
+
+#[tokio::test]
+async fn duplicate_camera_rows_fail_closed_on_conflicting_ivideon_credentials() {
+    let server = MockServer::start().await;
+    let private_marker = "private-conflicting-ivideon-token";
+    let page = serde_json::json!({
+        "content": [
+            {
+                "id": "camera-conflicting-ivideon", "name": "Synthetic camera",
+                "streams": null, "streamsToWatch": null, "intercoms": null,
+                "ivideon": {"cameraId": "ivideon-a", "token": "token-a", "depth": 0}
+            },
+            {
+                "id": "camera-conflicting-ivideon", "name": "Synthetic camera",
+                "streams": null, "streamsToWatch": null, "intercoms": null,
+                "ivideon": {"cameraId": "ivideon-a", "token": private_marker, "depth": 0}
+            }
+        ],
+        "totalElements": 2, "totalPages": 1, "number": 0, "size": 100,
+        "last": true, "first": true, "empty": false
+    });
+    Mock::given(method("GET"))
+        .and(path(CAMERA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page))
+        .mount(&server)
+        .await;
+    let provider = MtsDeviceProvider::new(client(&server));
+
+    let error = provider
+        .live_source(
+            &FlatId("flat-conflicting-ivideon".to_owned()),
+            "camera-conflicting-ivideon",
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
+    assert!(!format!("{error:?}").contains(private_marker));
+    assert!(!error.to_string().contains(private_marker));
+}
+
+#[tokio::test]
+async fn ivideon_resolver_rejects_redirects_oversized_bodies_and_non_loopback_test_hosts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/cameras/redirect/live_stream"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            "/redirect-target?access_token=should-not-be-sent",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cameras/oversized/live_stream"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(r#"{{"url":"rtsp://media.invalid/{}"}}"#, "x".repeat(20_000)),
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/cameras/userinfo/live_stream"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url": "https://user:password@ivideon-media.invalid/private.m3u8"
+        })))
+        .mount(&server)
+        .await;
+    let base = Url::parse(&format!("{}/", server.uri())).unwrap();
+    let resolver = IvideonLiveResolver::new_for_test(base).unwrap();
+    let token = SecretString::from("private-rejected-token");
+
+    let redirect = resolver
+        .resolve_live_url("redirect", &token)
+        .await
+        .unwrap_err();
+    let oversized = resolver
+        .resolve_live_url("oversized", &token)
+        .await
+        .unwrap_err();
+    let userinfo = resolver
+        .resolve_live_url("userinfo", &token)
+        .await
+        .unwrap_err();
+    let foreign =
+        IvideonLiveResolver::new_for_test(Url::parse("https://attacker.invalid/").unwrap())
+            .err()
+            .unwrap();
+
+    assert_eq!(redirect.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(oversized.code, ErrorCode::UpstreamSchemaChanged);
+    assert_eq!(userinfo.code, ErrorCode::UpstreamSchemaChanged);
+    assert_eq!(foreign.code, ErrorCode::InvalidRequest);
+    for error in [redirect, oversized, userinfo, foreign] {
+        assert!(!format!("{error:?}").contains("private-rejected-token"));
+        assert!(!error.to_string().contains("private-rejected-token"));
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
 #[tokio::test]

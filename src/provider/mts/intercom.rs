@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use reqwest::Method;
@@ -14,6 +17,7 @@ use crate::{
 use super::{
     MtsClient, ProviderBase,
     dto::intercom::{AccessPointDto, BoundedVec, CameraDto, LockDto, SpringPage},
+    ivideon::{IvideonLiveResolver, IvideonLiveUrlResolver},
 };
 
 const ACCESS_POINTS_PATH: &str = "/vdome-smart-facade/devices/api/v1/accessPoints";
@@ -48,11 +52,23 @@ pub trait LiveSourceProvider: Send + Sync {
 #[derive(Clone)]
 pub struct MtsDeviceProvider {
     client: MtsClient,
+    ivideon: Arc<dyn IvideonLiveUrlResolver>,
 }
 
 impl MtsDeviceProvider {
     pub fn new(client: MtsClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            ivideon: Arc::new(IvideonLiveResolver::production()),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn new_with_live_url_resolver(
+        client: MtsClient,
+        ivideon: Arc<dyn IvideonLiveUrlResolver>,
+    ) -> Self {
+        Self { client, ivideon }
     }
 
     async fn fold_pages<T, S, F>(
@@ -148,30 +164,28 @@ impl LiveSourceProvider for MtsDeviceProvider {
                 CAMERAS_PATH,
                 flat,
                 None,
-                None::<SecretString>,
+                LiveSourceSelection::default(),
                 |selected, dto: CameraDto| {
                     if dto.id != camera_id {
                         return Ok(());
                     }
-                    let candidate = dto
+                    let direct = dto
                         .streams_to_watch
                         .as_ref()
                         .and_then(|streams| streams.selected())
                         .or_else(|| dto.streams.as_ref().and_then(|streams| streams.selected()));
-                    if let (Some(existing), Some(candidate)) =
-                        (selected.as_ref(), candidate.as_ref())
-                        && existing.expose_secret() != candidate.expose_secret()
-                    {
-                        return Err(schema_error());
-                    }
-                    if selected.is_none() {
-                        *selected = candidate;
-                    }
-                    Ok(())
+                    selected.merge_direct(direct)?;
+                    selected.merge_ivideon(ivideon_candidate(dto.ivideon.as_ref())?)
                 },
             )
             .await?;
-        source.ok_or_else(|| {
+        if let Some(ivideon) = source.ivideon {
+            return self
+                .ivideon
+                .resolve_live_url(&ivideon.camera_id, &ivideon.access_token)
+                .await;
+        }
+        source.direct.ok_or_else(|| {
             AppError::new(
                 ErrorCode::NotFound,
                 "Live camera source was not found.",
@@ -179,6 +193,71 @@ impl LiveSourceProvider for MtsDeviceProvider {
             )
         })
     }
+}
+
+#[derive(Default)]
+struct LiveSourceSelection {
+    ivideon: Option<IvideonCandidate>,
+    direct: Option<SecretString>,
+}
+
+impl LiveSourceSelection {
+    fn merge_ivideon(&mut self, candidate: Option<IvideonCandidate>) -> Result<(), AppError> {
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        if let Some(existing) = self.ivideon.as_ref()
+            && (existing.camera_id != candidate.camera_id
+                || existing.access_token.expose_secret() != candidate.access_token.expose_secret())
+        {
+            return Err(schema_error());
+        }
+        self.ivideon.get_or_insert(candidate);
+        Ok(())
+    }
+
+    fn merge_direct(&mut self, candidate: Option<SecretString>) -> Result<(), AppError> {
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        if self
+            .direct
+            .as_ref()
+            .is_some_and(|existing| existing.expose_secret() != candidate.expose_secret())
+        {
+            return Err(schema_error());
+        }
+        self.direct.get_or_insert(candidate);
+        Ok(())
+    }
+}
+
+struct IvideonCandidate {
+    camera_id: String,
+    access_token: SecretString,
+}
+
+fn ivideon_candidate(
+    evidence: Option<&super::dto::intercom::IvideonEvidence>,
+) -> Result<Option<IvideonCandidate>, AppError> {
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    if let Some(access_token) = evidence.token.as_ref() {
+        validate_private_value(access_token.expose_secret(), 16 * 1024)?;
+    }
+    let Some(camera_id) = evidence.camera_id.as_ref() else {
+        return Ok(None);
+    };
+    validate_optional_id(camera_id)?;
+    validate_private_value(camera_id, MAX_ID_BYTES)?;
+    let Some(access_token) = evidence.token.clone() else {
+        return Ok(None);
+    };
+    Ok(Some(IvideonCandidate {
+        camera_id: camera_id.clone(),
+        access_token,
+    }))
 }
 
 fn page_path(path: &str, flat: &FlatId, category: Option<&str>, page: u32) -> String {
@@ -380,10 +459,11 @@ fn merge_camera(
 }
 
 fn map_camera(flat: &FlatId, dto: CameraDto) -> Result<Camera, AppError> {
-    let live = dto
-        .streams_to_watch
-        .as_ref()
-        .is_some_and(|streams| streams.available())
+    let live = ivideon_candidate(dto.ivideon.as_ref())?.is_some()
+        || dto
+            .streams_to_watch
+            .as_ref()
+            .is_some_and(|streams| streams.available())
         || dto
             .streams
             .as_ref()
@@ -444,6 +524,13 @@ fn validate_identity(id: &str, name: &str) -> Result<(), AppError> {
 
 fn validate_optional_id(id: &str) -> Result<(), AppError> {
     if id.trim().is_empty() || id.len() > MAX_ID_BYTES {
+        return Err(schema_error());
+    }
+    Ok(())
+}
+
+fn validate_private_value(value: &str, max_bytes: usize) -> Result<(), AppError> {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
         return Err(schema_error());
     }
     Ok(())

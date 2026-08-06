@@ -8,6 +8,7 @@ pub mod door;
 pub mod dto;
 pub mod fcm;
 pub mod intercom;
+pub mod ivideon;
 pub mod media;
 pub mod sms;
 pub mod sso;
