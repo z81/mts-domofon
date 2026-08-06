@@ -67,6 +67,11 @@ path = "tests/snapshot_proxy.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "live_session"
+path = "tests/live_session.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "door_open"
 path = "tests/door_open.rs"
 required-features = ["test-support"]
@@ -106,6 +111,7 @@ tower-http = { version = "0.7.0", features = ["catch-panic", "compression-gzip",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 subtle = "2.6.1"
+tempfile = "3"
 url = { version = "2", features = ["serde"] }
 utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "url"] }
 uuid = { version = "1", features = ["serde", "v4"] }
@@ -113,6 +119,5 @@ zeroize = { version = "1.9.0", features = ["derive", "serde"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
-tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 wiremock = "0.6.5"
