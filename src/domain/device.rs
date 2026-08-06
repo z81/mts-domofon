@@ -69,7 +69,7 @@ impl<'de> Deserialize<'de> for AccessPointKind {
 pub struct Lock {
     pub number: String,
     pub name: String,
-    pub permanently_open: bool,
+    pub permanently_open: Option<bool>,
 }
 
 /// A camera associated with a linked flat.

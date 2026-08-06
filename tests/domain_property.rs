@@ -75,12 +75,12 @@ fn keeps_multiple_locks_on_an_access_point() {
             Lock {
                 number: "1".to_owned(),
                 name: "Pedestrian door".to_owned(),
-                permanently_open: false,
+                permanently_open: None,
             },
             Lock {
                 number: "2".to_owned(),
                 name: "Vehicle gate".to_owned(),
-                permanently_open: false,
+                permanently_open: Some(false),
             },
         ],
         camera_ids: vec!["camera-synthetic".to_owned()],
@@ -91,6 +91,8 @@ fn keeps_multiple_locks_on_an_access_point() {
 
     assert_eq!(value["locks"].as_array().unwrap().len(), 2);
     assert_eq!(value["locks"][1]["number"], "2");
+    assert!(value["locks"][0]["permanentlyOpen"].is_null());
+    assert_eq!(value["locks"][1]["permanentlyOpen"], false);
     assert_eq!(value["cameraIds"][0], "camera-synthetic");
 }
 

@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, btree_map::Entry};
 use async_trait::async_trait;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use url::form_urlencoded;
 
 use crate::{
@@ -13,7 +12,7 @@ use crate::{
 
 use super::{
     MtsClient, ProviderBase,
-    dto::intercom::{AccessPointDto, CameraDto, SpringPage},
+    dto::intercom::{AccessPointDto, BoundedVec, CameraDto, LockDto, SpringPage},
 };
 
 const ACCESS_POINTS_PATH: &str = "/vdome-smart-facade/devices/api/v1/accessPoints";
@@ -24,6 +23,7 @@ const MAX_ITEMS: u64 = 5_000;
 const MAX_SCOPE_BYTES: usize = 512;
 const MAX_ID_BYTES: usize = 512;
 const MAX_NAME_BYTES: usize = 2_048;
+const MAX_LOCK_NAME_BYTES: usize = 512;
 const UNKNOWN_KIND: &str = "unknown";
 
 #[async_trait]
@@ -47,21 +47,24 @@ impl MtsDeviceProvider {
         Self { client }
     }
 
-    async fn pages<T>(
+    async fn fold_pages<T, S, F>(
         &self,
         path: &str,
         flat: &FlatId,
         category: Option<&str>,
-    ) -> Result<Vec<T>, AppError>
+        mut state: S,
+        mut merge: F,
+    ) -> Result<S, AppError>
     where
         T: DeserializeOwned,
+        F: FnMut(&mut S, T) -> Result<(), AppError>,
     {
         validate_scope(&flat.0)?;
         if let Some(category) = category {
             validate_scope(category)?;
         }
 
-        let mut items = Vec::new();
+        let mut raw_count = 0_u64;
         let mut expected_total_pages = None;
         let mut expected_total_elements = None;
         for number in 0..MAX_PAGES {
@@ -74,15 +77,19 @@ impl MtsDeviceProvider {
 
             let total_pages = *expected_total_pages.get_or_insert(page.total_pages);
             let total_elements = *expected_total_elements.get_or_insert(page.total_elements);
-            if (items.len() as u64).saturating_add(page.content.len() as u64) > MAX_ITEMS
-                || (items.len() as u64).saturating_add(page.content.len() as u64) > total_elements
-            {
+            raw_count = raw_count.saturating_add(page.content.len() as u64);
+            if raw_count > MAX_ITEMS || raw_count > total_elements {
                 return Err(schema_error());
             }
-            items.extend(page.content);
+            for item in page.content {
+                merge(&mut state, item)?;
+            }
 
             if page.last {
-                return Ok(items);
+                if raw_count != total_elements {
+                    return Err(schema_error());
+                }
+                return Ok(state);
             }
             if total_pages == 0 || number + 1 >= total_pages {
                 return Err(schema_error());
@@ -99,13 +106,25 @@ impl DeviceProvider for MtsDeviceProvider {
         flat: &FlatId,
         category: Option<&str>,
     ) -> Result<Vec<AccessPoint>, AppError> {
-        let dtos = self.pages(ACCESS_POINTS_PATH, flat, category).await?;
-        merge_access_points(flat, dtos)
+        let merged = self
+            .fold_pages(
+                ACCESS_POINTS_PATH,
+                flat,
+                category,
+                BTreeMap::new(),
+                |merged, dto| merge_access_point(flat, merged, dto),
+            )
+            .await?;
+        Ok(merged.into_values().collect())
     }
 
     async fn cameras(&self, flat: &FlatId) -> Result<Vec<Camera>, AppError> {
-        let dtos = self.pages(CAMERAS_PATH, flat, None).await?;
-        merge_cameras(flat, dtos)
+        let merged = self
+            .fold_pages(CAMERAS_PATH, flat, None, BTreeMap::new(), |merged, dto| {
+                merge_camera(flat, merged, dto)
+            })
+            .await?;
+        Ok(merged.into_values().collect())
     }
 }
 
@@ -136,13 +155,28 @@ fn validate_page<T>(
     expected_total_pages: Option<u32>,
     expected_total_elements: Option<u64>,
 ) -> Result<(), AppError> {
-    let expected_last = page.total_pages == 0 || page.number + 1 == page.total_pages;
+    let computed_total_pages = if page.total_elements == 0 {
+        0
+    } else {
+        page.total_elements.div_ceil(u64::from(PAGE_SIZE)) as u32
+    };
+    let next_page_number = page.number.checked_add(1).ok_or_else(schema_error)?;
+    let expected_last = page.total_pages == 0 || next_page_number == page.total_pages;
+    let expected_content_len = if page.total_pages == 0 {
+        0
+    } else {
+        let consumed = u64::from(page.number) * u64::from(PAGE_SIZE);
+        page.total_elements
+            .saturating_sub(consumed)
+            .min(u64::from(PAGE_SIZE)) as usize
+    };
     if page.number != expected_number
-        || page.size == 0
-        || page.size > PAGE_SIZE
-        || page.content.len() > page.size as usize
+        || page.size != PAGE_SIZE
         || page.total_pages > MAX_PAGES
         || page.total_elements > MAX_ITEMS
+        || page.total_pages != computed_total_pages
+        || (page.total_pages > 0 && page.number >= page.total_pages)
+        || page.content.len() != expected_content_len
         || page.first != (page.number == 0)
         || page.empty != page.content.is_empty()
         || page.last != expected_last
@@ -154,45 +188,43 @@ fn validate_page<T>(
     Ok(())
 }
 
-fn merge_access_points(
+fn merge_access_point(
     flat: &FlatId,
-    dtos: Vec<AccessPointDto>,
-) -> Result<Vec<AccessPoint>, AppError> {
-    let mut merged: BTreeMap<String, AccessPoint> = BTreeMap::new();
-    for dto in dtos {
-        validate_identity(&dto.id, &dto.name)?;
-        let point = map_access_point(flat, dto);
-        match merged.entry(point.id.clone()) {
-            Entry::Vacant(entry) => {
-                entry.insert(point);
+    merged: &mut BTreeMap<String, AccessPoint>,
+    dto: AccessPointDto,
+) -> Result<(), AppError> {
+    validate_identity(&dto.id, &dto.name)?;
+    let point = map_access_point(flat, dto)?;
+    match merged.entry(point.id.clone()) {
+        Entry::Vacant(entry) => {
+            entry.insert(point);
+        }
+        Entry::Occupied(mut entry) => {
+            let existing = entry.get_mut();
+            if existing.name != point.name {
+                return Err(schema_error());
             }
-            Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut();
-                if existing.name != point.name {
-                    return Err(schema_error());
-                }
-                existing.available |= point.available;
-                existing.locks.extend(point.locks);
-                existing.camera_ids.extend(point.camera_ids);
-                normalize_locks(&mut existing.locks);
-                existing.camera_ids.sort();
-                existing.camera_ids.dedup();
-            }
+            existing.available |= point.available;
+            merge_locks(&mut existing.locks, point.locks)?;
+            existing.camera_ids.extend(point.camera_ids);
+            existing.camera_ids.sort();
+            existing.camera_ids.dedup();
         }
     }
-    Ok(merged.into_values().collect())
+    Ok(())
 }
 
-fn map_access_point(flat: &FlatId, dto: AccessPointDto) -> AccessPoint {
-    let mut locks = parse_locks(&dto.locks);
-    normalize_locks(&mut locks);
-    let camera_ids = dto
-        .camera
-        .as_str()
-        .filter(|id| !id.trim().is_empty() && id.len() <= MAX_ID_BYTES)
-        .map(|id| vec![id.to_owned()])
-        .unwrap_or_default();
-    AccessPoint {
+fn map_access_point(flat: &FlatId, dto: AccessPointDto) -> Result<AccessPoint, AppError> {
+    let mut locks = Vec::new();
+    merge_locks(&mut locks, parse_locks(dto.locks)?)?;
+    let camera_ids = match dto.camera {
+        Some(id) => {
+            validate_optional_id(&id)?;
+            vec![id]
+        }
+        None => Vec::new(),
+    };
+    Ok(AccessPoint {
         id: dto.id,
         flat_id: flat.clone(),
         name: dto.name,
@@ -200,94 +232,107 @@ fn map_access_point(flat: &FlatId, dto: AccessPointDto) -> AccessPoint {
         locks,
         camera_ids,
         available: true,
-    }
+    })
 }
 
-fn parse_locks(value: &Value) -> Vec<Lock> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|lock| {
-            let lock = lock.as_object()?;
-            let number = lock.get("number")?.as_i64()?.to_string();
-            let name = lock.get("name")?.as_str()?;
-            if name.len() > MAX_NAME_BYTES {
-                return None;
+fn parse_locks<const LIMIT: usize>(
+    dtos: Option<BoundedVec<LockDto, LIMIT>>,
+) -> Result<Vec<Lock>, AppError> {
+    let dtos = dtos.map(BoundedVec::into_vec).unwrap_or_default();
+    dtos.into_iter()
+        .map(|dto| {
+            if dto.name.trim().is_empty() || dto.name.len() > MAX_LOCK_NAME_BYTES {
+                return Err(schema_error());
             }
-            Some(Lock {
-                number,
-                name: name.to_owned(),
-                permanently_open: lock
-                    .get("isPermanentlyOpen")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+            Ok(Lock {
+                number: dto.number.to_string(),
+                name: dto.name,
+                permanently_open: dto.is_permanently_open,
             })
         })
         .collect()
 }
 
-fn normalize_locks(locks: &mut Vec<Lock>) {
-    locks.sort_by(|left, right| {
-        (&left.number, &left.name, left.permanently_open).cmp(&(
-            &right.number,
-            &right.name,
-            right.permanently_open,
-        ))
-    });
-    locks.dedup();
-}
-
-fn merge_cameras(flat: &FlatId, dtos: Vec<CameraDto>) -> Result<Vec<Camera>, AppError> {
-    let mut merged: BTreeMap<String, Camera> = BTreeMap::new();
-    for dto in dtos {
-        validate_identity(&dto.id, &dto.name)?;
-        let camera = map_camera(flat, dto);
-        match merged.entry(camera.id.clone()) {
+fn merge_locks(target: &mut Vec<Lock>, candidates: Vec<Lock>) -> Result<(), AppError> {
+    let mut merged: BTreeMap<String, Lock> = BTreeMap::new();
+    for candidate in target.drain(..).chain(candidates) {
+        match merged.entry(candidate.number.clone()) {
             Entry::Vacant(entry) => {
-                entry.insert(camera);
+                entry.insert(candidate);
             }
             Entry::Occupied(mut entry) => {
                 let existing = entry.get_mut();
-                if existing.name != camera.name {
+                if existing.name != candidate.name {
                     return Err(schema_error());
                 }
-                existing.access_point_id =
-                    [existing.access_point_id.take(), camera.access_point_id]
-                        .into_iter()
-                        .flatten()
-                        .min();
-                merge_capability(&mut existing.capabilities.live, camera.capabilities.live);
-                merge_capability(
-                    &mut existing.capabilities.archive,
-                    camera.capabilities.archive,
-                );
+                match (existing.permanently_open, candidate.permanently_open) {
+                    (Some(left), Some(right)) if left != right => return Err(schema_error()),
+                    (None, Some(value)) => existing.permanently_open = Some(value),
+                    _ => {}
+                }
             }
         }
     }
-    Ok(merged.into_values().collect())
+    target.extend(merged.into_values());
+    Ok(())
 }
 
-fn map_camera(flat: &FlatId, dto: CameraDto) -> Camera {
-    let live = has_stream(&dto.streams_to_watch) || has_stream(&dto.streams);
+fn merge_camera(
+    flat: &FlatId,
+    merged: &mut BTreeMap<String, Camera>,
+    dto: CameraDto,
+) -> Result<(), AppError> {
+    validate_identity(&dto.id, &dto.name)?;
+    let camera = map_camera(flat, dto)?;
+    match merged.entry(camera.id.clone()) {
+        Entry::Vacant(entry) => {
+            entry.insert(camera);
+        }
+        Entry::Occupied(mut entry) => {
+            let existing = entry.get_mut();
+            if existing.name != camera.name {
+                return Err(schema_error());
+            }
+            existing.access_point_id = [existing.access_point_id.take(), camera.access_point_id]
+                .into_iter()
+                .flatten()
+                .min();
+            merge_capability(&mut existing.capabilities.live, camera.capabilities.live);
+            merge_capability(
+                &mut existing.capabilities.archive,
+                camera.capabilities.archive,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn map_camera(flat: &FlatId, dto: CameraDto) -> Result<Camera, AppError> {
+    let live = dto
+        .streams_to_watch
+        .as_ref()
+        .is_some_and(|streams| streams.available())
+        || dto
+            .streams
+            .as_ref()
+            .is_some_and(|streams| streams.available());
     let archive = dto
         .ivideon
-        .as_object()
-        .and_then(|ivideon| ivideon.get("depth"))
-        .is_some_and(|depth| {
-            depth.as_u64().is_some_and(|depth| depth > 0)
-                || depth.as_i64().is_some_and(|depth| depth > 0)
-        });
-    let access_point_id = dto
-        .intercoms
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|intercom| intercom.get("id")?.as_str())
-        .filter(|id| !id.trim().is_empty() && id.len() <= MAX_ID_BYTES)
-        .min()
-        .map(str::to_owned);
-    Camera {
+        .as_ref()
+        .and_then(|ivideon| ivideon.depth)
+        .is_some_and(|depth| depth > 0);
+    let intercoms = dto.intercoms.map(BoundedVec::into_vec).unwrap_or_default();
+    let mut access_point_ids = Vec::new();
+    for intercom in intercoms {
+        if let Some(id) = intercom.id {
+            validate_optional_id(&id)?;
+            access_point_ids.push(id);
+        }
+    }
+    access_point_ids.sort();
+    access_point_ids.dedup();
+    let access_point_id = access_point_ids.into_iter().next();
+    Ok(Camera {
         id: dto.id,
         flat_id: flat.clone(),
         name: dto.name,
@@ -297,15 +342,6 @@ fn map_camera(flat: &FlatId, dto: CameraDto) -> Camera {
             live: capability(live),
             archive: capability(archive),
         },
-    }
-}
-
-fn has_stream(value: &Value) -> bool {
-    value.as_object().is_some_and(|streams| {
-        streams
-            .values()
-            .filter_map(Value::as_str)
-            .any(|stream| !stream.trim().is_empty())
     })
 }
 
@@ -329,6 +365,13 @@ fn validate_identity(id: &str, name: &str) -> Result<(), AppError> {
         || name.trim().is_empty()
         || name.len() > MAX_NAME_BYTES
     {
+        return Err(schema_error());
+    }
+    Ok(())
+}
+
+fn validate_optional_id(id: &str) -> Result<(), AppError> {
+    if id.trim().is_empty() || id.len() > MAX_ID_BYTES {
         return Err(schema_error());
     }
     Ok(())

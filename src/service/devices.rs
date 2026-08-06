@@ -16,10 +16,7 @@ impl DeviceService {
     }
 
     pub async fn inventory(&self, flat: &FlatId) -> Result<DeviceInventory, AppError> {
-        let (access_points, cameras) = tokio::join!(
-            self.provider.access_points(flat, None),
-            self.provider.cameras(flat)
-        );
+        let (access_points, cameras) = self.sources(flat).await;
         let (mut access_points, mut cameras) = match (access_points, cameras) {
             (Ok(access_points), Ok(cameras)) => (access_points, cameras),
             (Ok(access_points), Err(_)) => (access_points, Vec::new()),
@@ -36,9 +33,12 @@ impl DeviceService {
     }
 
     pub async fn camera(&self, flat: &FlatId, camera_id: &str) -> Result<Camera, AppError> {
-        self.inventory(flat)
-            .await?
-            .cameras
+        let (access_points, cameras) = self.sources(flat).await;
+        let mut access_points = access_points.unwrap_or_default();
+        let mut cameras = cameras?;
+        stamp_and_sort_access_points(flat, &mut access_points);
+        stamp_associate_and_sort_cameras(flat, &access_points, &mut cameras);
+        cameras
             .into_iter()
             .find(|camera| camera.id == camera_id)
             .ok_or_else(|| {
@@ -48,6 +48,19 @@ impl DeviceService {
                     false,
                 )
             })
+    }
+
+    async fn sources(
+        &self,
+        flat: &FlatId,
+    ) -> (
+        Result<Vec<AccessPoint>, AppError>,
+        Result<Vec<Camera>, AppError>,
+    ) {
+        tokio::join!(
+            self.provider.access_points(flat, None),
+            self.provider.cameras(flat)
+        )
     }
 }
 
