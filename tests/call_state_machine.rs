@@ -1,17 +1,28 @@
 use chrono::{Duration, TimeZone, Utc};
 use domru_mts::domain::call::{
     CallCommand, CallEffect, CallEndReason, CallId, CallMedia, CallPhase, CallRegistry,
-    CallRevision, CallSession, CallTransitionError, DomainEvent, IncomingInvite, reduce,
+    CallRevision, CallSession, CallTransitionError, DomainEvent, IncomingInvite, ProviderCallId,
+    reduce,
 };
 use secrecy::SecretString;
+use uuid::Uuid;
 
 fn at(second: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(1_800_000_000 + second, 0).unwrap()
 }
 
-fn invite(id: &str) -> IncomingInvite {
+fn call_id(label: &str) -> CallId {
+    let mut bytes = [0_u8; 16];
+    for (index, byte) in label.bytes().enumerate() {
+        bytes[index % bytes.len()] ^= byte;
+    }
+    CallId::from_uuid(Uuid::from_bytes(bytes))
+}
+
+fn invite_with_id(id: CallId, provider_id: &str) -> IncomingInvite {
     IncomingInvite::new(
-        CallId::new(id),
+        id,
+        ProviderCallId::new(SecretString::from(provider_id)),
         CallMedia::AudioVideo,
         SecretString::from("route-secret-701"),
         SecretString::from("session-secret-702"),
@@ -20,8 +31,48 @@ fn invite(id: &str) -> IncomingInvite {
     .with_address(SecretString::from("Secret street, 42"))
 }
 
+fn invite(id: &str) -> IncomingInvite {
+    invite_with_id(call_id(id), &format!("provider-call-id-secret-{id}"))
+}
+
 fn ringing(id: &str) -> CallSession {
     CallSession::ringing(invite(id), at(0))
+}
+
+fn connecting(id: &str) -> CallSession {
+    reduce(
+        &ringing(id),
+        CallCommand::Accept {
+            revision: CallRevision(1),
+        },
+        at(1),
+    )
+    .unwrap()
+    .state
+}
+
+fn active(id: &str) -> CallSession {
+    reduce(
+        &connecting(id),
+        CallCommand::Connected {
+            revision: CallRevision(2),
+        },
+        at(2),
+    )
+    .unwrap()
+    .state
+}
+
+fn ending(id: &str) -> CallSession {
+    reduce(
+        &active(id),
+        CallCommand::Hangup {
+            revision: CallRevision(3),
+        },
+        at(3),
+    )
+    .unwrap()
+    .state
 }
 
 #[test]
@@ -256,6 +307,164 @@ fn reject_remote_end_race_is_terminal_and_idempotent() {
 }
 
 #[test]
+fn remote_end_before_reject_preserves_the_remote_terminal_reason() {
+    let remote_first = reduce(
+        &ringing("remote-first"),
+        CallCommand::RemoteEnded(CallEndReason::RemoteHangup),
+        at(1),
+    )
+    .unwrap()
+    .state;
+
+    let late_reject = reduce(
+        &remote_first,
+        CallCommand::Reject {
+            revision: CallRevision(1),
+        },
+        at(2),
+    )
+    .unwrap();
+    assert!(!late_reject.changed);
+    assert_eq!(late_reject.state, remote_first);
+}
+
+#[test]
+fn every_nonterminal_phase_handles_remote_end_and_duplicate_invites() {
+    for (name, id, state) in [
+        ("ringing", "ringing-remote", ringing("ringing-remote")),
+        (
+            "connecting",
+            "connecting-remote",
+            connecting("connecting-remote"),
+        ),
+        ("active", "active-remote", active("active-remote")),
+        ("ending", "ending-remote", ending("ending-remote")),
+    ] {
+        let duplicate = reduce(
+            &state,
+            CallCommand::ObserveInvite(invite(id)),
+            state.updated_at() + Duration::seconds(1),
+        )
+        .unwrap_or_else(|error| panic!("duplicate in {name}: {error}"));
+        assert!(!duplicate.changed, "duplicate in {name}");
+        assert_eq!(duplicate.state, state, "duplicate in {name}");
+
+        let remote = reduce(
+            &state,
+            CallCommand::RemoteEnded(CallEndReason::RemoteHangup),
+            state.updated_at() + Duration::seconds(1),
+        )
+        .unwrap_or_else(|error| panic!("remote end in {name}: {error}"));
+        assert_eq!(
+            remote.state.phase(),
+            &CallPhase::Ended(CallEndReason::RemoteHangup),
+            "remote end in {name}"
+        );
+    }
+}
+
+#[test]
+fn connecting_hangup_and_active_or_ending_timeout_are_legal() {
+    let hanging_up = reduce(
+        &connecting("connecting-hangup"),
+        CallCommand::Hangup {
+            revision: CallRevision(2),
+        },
+        at(2),
+    )
+    .unwrap();
+    assert_eq!(hanging_up.state.phase(), &CallPhase::Ending);
+    assert_eq!(hanging_up.effect, CallEffect::Hangup);
+
+    for (name, state) in [
+        ("active", active("active-timeout")),
+        ("ending", ending("ending-timeout")),
+    ] {
+        let timed_out = reduce(
+            &state,
+            CallCommand::Timeout,
+            state.updated_at() + Duration::seconds(1),
+        )
+        .unwrap_or_else(|error| panic!("timeout in {name}: {error}"));
+        assert_eq!(
+            timed_out.state.phase(),
+            &CallPhase::Ended(CallEndReason::Timeout),
+            "timeout in {name}"
+        );
+    }
+}
+
+#[test]
+fn phase_invalid_commands_are_rejected_without_mutating_state() {
+    struct Case {
+        name: &'static str,
+        state: CallSession,
+        command: CallCommand,
+    }
+
+    let cases = vec![
+        Case {
+            name: "ringing cannot hang up",
+            state: ringing("invalid-ring-hangup"),
+            command: CallCommand::Hangup {
+                revision: CallRevision(1),
+            },
+        },
+        Case {
+            name: "ringing cannot connect before accept",
+            state: ringing("invalid-ring-connected"),
+            command: CallCommand::Connected {
+                revision: CallRevision(1),
+            },
+        },
+        Case {
+            name: "connecting cannot accept twice",
+            state: connecting("invalid-connecting-accept"),
+            command: CallCommand::Accept {
+                revision: CallRevision(2),
+            },
+        },
+        Case {
+            name: "active cannot reject",
+            state: active("invalid-active-reject"),
+            command: CallCommand::Reject {
+                revision: CallRevision(3),
+            },
+        },
+        Case {
+            name: "ending cannot accept",
+            state: ending("invalid-ending-accept"),
+            command: CallCommand::Accept {
+                revision: CallRevision(4),
+            },
+        },
+        Case {
+            name: "ending cannot hang up twice",
+            state: ending("invalid-ending-hangup"),
+            command: CallCommand::Hangup {
+                revision: CallRevision(4),
+            },
+        },
+    ];
+
+    for case in cases {
+        let want_phase = *case.state.phase();
+        let error = reduce(
+            &case.state,
+            case.command,
+            case.state.updated_at() + Duration::seconds(1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            CallTransitionError::InvalidTransition(want_phase),
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
 fn multiple_ringers_are_allowed_but_only_one_can_reserve_media() {
     let mut calls = CallRegistry::new(4);
     calls.observe_invite(invite("first"), at(0)).unwrap();
@@ -264,7 +473,7 @@ fn multiple_ringers_are_allowed_but_only_one_can_reserve_media() {
 
     calls
         .apply(
-            &CallId::new("first"),
+            &call_id("first"),
             CallCommand::Accept {
                 revision: CallRevision(1),
             },
@@ -273,7 +482,7 @@ fn multiple_ringers_are_allowed_but_only_one_can_reserve_media() {
         .unwrap();
     let error = calls
         .apply(
-            &CallId::new("second"),
+            &call_id("second"),
             CallCommand::Accept {
                 revision: CallRevision(1),
             },
@@ -282,11 +491,145 @@ fn multiple_ringers_are_allowed_but_only_one_can_reserve_media() {
         .unwrap_err();
     assert_eq!(
         error,
-        CallTransitionError::ActiveCallExists(CallId::new("first"))
+        CallTransitionError::ActiveCallExists(call_id("first"))
     );
     assert_eq!(
-        calls.session(&CallId::new("second")).unwrap().phase(),
+        calls.session(&call_id("second")).unwrap().phase(),
         &CallPhase::Ringing
+    );
+}
+
+fn registry_with_media_owner() -> CallRegistry {
+    let mut calls = CallRegistry::new(8);
+    calls.observe_invite(invite("owner"), at(0)).unwrap();
+    calls.observe_invite(invite("target"), at(1)).unwrap();
+    calls
+        .apply(
+            &call_id("owner"),
+            CallCommand::Accept {
+                revision: CallRevision(1),
+            },
+            at(2),
+        )
+        .unwrap();
+    calls
+}
+
+#[test]
+fn media_owner_check_does_not_mask_missing_stale_or_nonmonotonic_targets() {
+    let mut missing = registry_with_media_owner();
+    assert_eq!(
+        missing
+            .apply(
+                &call_id("missing"),
+                CallCommand::Accept {
+                    revision: CallRevision(1),
+                },
+                at(3),
+            )
+            .unwrap_err(),
+        CallTransitionError::CallNotFound(call_id("missing"))
+    );
+
+    let mut stale = registry_with_media_owner();
+    assert_eq!(
+        stale
+            .apply(
+                &call_id("target"),
+                CallCommand::Accept {
+                    revision: CallRevision(0),
+                },
+                at(3),
+            )
+            .unwrap_err(),
+        CallTransitionError::StaleRevision {
+            expected: CallRevision(1),
+            actual: CallRevision(0),
+        }
+    );
+
+    let mut backwards = registry_with_media_owner();
+    assert_eq!(
+        backwards
+            .apply(
+                &call_id("target"),
+                CallCommand::Accept {
+                    revision: CallRevision(1),
+                },
+                at(0),
+            )
+            .unwrap_err(),
+        CallTransitionError::NonMonotonicTimestamp {
+            previous: at(1),
+            supplied: at(0),
+        }
+    );
+}
+
+#[test]
+fn media_owner_check_does_not_mask_invalid_or_terminal_target_behavior() {
+    let mut invalid = CallRegistry::new(8);
+    invalid.observe_invite(invite("target"), at(0)).unwrap();
+    invalid
+        .apply(
+            &call_id("target"),
+            CallCommand::Reject {
+                revision: CallRevision(1),
+            },
+            at(1),
+        )
+        .unwrap();
+    invalid.observe_invite(invite("owner"), at(2)).unwrap();
+    invalid
+        .apply(
+            &call_id("owner"),
+            CallCommand::Accept {
+                revision: CallRevision(1),
+            },
+            at(3),
+        )
+        .unwrap();
+    assert_eq!(
+        invalid
+            .apply(
+                &call_id("target"),
+                CallCommand::Accept {
+                    revision: CallRevision(2),
+                },
+                at(4),
+            )
+            .unwrap_err(),
+        CallTransitionError::InvalidTransition(CallPhase::Ending)
+    );
+
+    let mut terminal = CallRegistry::new(8);
+    terminal.observe_invite(invite("ended"), at(0)).unwrap();
+    terminal
+        .apply(&call_id("ended"), CallCommand::Timeout, at(1))
+        .unwrap();
+    terminal.observe_invite(invite("owner"), at(2)).unwrap();
+    terminal
+        .apply(
+            &call_id("owner"),
+            CallCommand::Accept {
+                revision: CallRevision(1),
+            },
+            at(3),
+        )
+        .unwrap();
+    let repeat = terminal
+        .apply(
+            &call_id("ended"),
+            CallCommand::Accept {
+                revision: CallRevision(1),
+            },
+            at(4),
+        )
+        .unwrap();
+    assert!(!repeat.changed);
+    assert_eq!(
+        repeat.state.phase(),
+        &CallPhase::Ended(CallEndReason::Missed)
     );
 }
 
@@ -318,23 +661,19 @@ fn terminal_history_is_bounded_and_terminal_commands_do_not_resurrect_calls() {
             .observe_invite(invite(id), at(index as i64 * 2))
             .unwrap();
         calls
-            .apply(
-                &CallId::new(id),
-                CallCommand::Timeout,
-                at(index as i64 * 2 + 1),
-            )
+            .apply(&call_id(id), CallCommand::Timeout, at(index as i64 * 2 + 1))
             .unwrap();
     }
 
     let ids: Vec<_> = calls
         .history()
-        .map(|session| session.id().as_str())
+        .map(|session| session.id().clone())
         .collect();
-    assert_eq!(ids, vec!["middle", "newest"]);
+    assert_eq!(ids, vec![call_id("middle"), call_id("newest")]);
 
     let repeat = calls
         .apply(
-            &CallId::new("newest"),
+            &call_id("newest"),
             CallCommand::RemoteEnded(CallEndReason::RemoteHangup),
             at(10),
         )
@@ -347,11 +686,41 @@ fn terminal_history_is_bounded_and_terminal_commands_do_not_resurrect_calls() {
 }
 
 #[test]
+fn zero_history_configuration_still_retains_terminal_idempotency() {
+    let mut calls = CallRegistry::new(0);
+    calls.observe_invite(invite("retained"), at(0)).unwrap();
+    calls
+        .apply(&call_id("retained"), CallCommand::Timeout, at(1))
+        .unwrap();
+
+    let repeat = calls
+        .apply(
+            &call_id("retained"),
+            CallCommand::Reject {
+                revision: CallRevision(1),
+            },
+            at(2),
+        )
+        .unwrap();
+    assert!(!repeat.changed);
+    assert_eq!(
+        repeat.state.phase(),
+        &CallPhase::Ended(CallEndReason::Missed)
+    );
+}
+
+#[test]
 fn public_events_are_redacted_and_observation_has_no_door_effect() {
-    let session = CallSession::ringing(invite("public-id"), at(0));
+    let public_id = CallId::from_uuid(
+        Uuid::parse_str("01980000-0000-7000-8000-000000000001").expect("fixed public call UUID"),
+    );
+    let session = CallSession::ringing(
+        invite_with_id(public_id.clone(), "provider-call-id-secret-700"),
+        at(0),
+    );
     let observed = reduce(
         &session,
-        CallCommand::ObserveInvite(invite("public-id")),
+        CallCommand::ObserveInvite(invite_with_id(public_id, "provider-call-id-secret-700")),
         at(1),
     )
     .unwrap();
@@ -359,6 +728,7 @@ fn public_events_are_redacted_and_observation_has_no_door_effect() {
 
     let json = serde_json::to_string(&observed.event).unwrap();
     for forbidden in [
+        "provider-call-id-secret-700",
         "route-secret-701",
         "session-secret-702",
         "+79990001122",
@@ -374,6 +744,20 @@ fn public_events_are_redacted_and_observation_has_no_door_effect() {
     }
     assert_eq!(
         json,
-        r#"{"type":"call_updated","call":{"id":"public-id","revision":1,"phase":"ringing","media":"audio_video","observed_at":"2027-01-15T08:00:00Z","updated_at":"2027-01-15T08:00:00Z"}}"#
+        r#"{"type":"call_updated","call":{"id":"01980000-0000-7000-8000-000000000001","revision":1,"phase":"ringing","media":"audio_video","observed_at":"2027-01-15T08:00:00Z","updated_at":"2027-01-15T08:00:00Z"}}"#
+    );
+    assert!(CallId::parse("provider-call-id-secret-700").is_err());
+    assert!(serde_json::from_str::<CallId>(r#""provider-call-id-secret-700""#).is_err());
+}
+
+#[test]
+fn revision_exhaustion_is_a_typed_error_instead_of_wrapping() {
+    assert_eq!(
+        CallRevision(u64::MAX - 1).checked_next().unwrap(),
+        CallRevision(u64::MAX)
+    );
+    assert_eq!(
+        CallRevision(u64::MAX).checked_next().unwrap_err(),
+        CallTransitionError::RevisionExhausted
     );
 }

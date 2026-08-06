@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
@@ -18,9 +18,13 @@ pub struct EventEnvelope {
 }
 
 struct BusInner {
+    state: Mutex<BusState>,
+}
+
+struct BusState {
     sender: broadcast::Sender<EventEnvelope>,
-    next_id: AtomicU64,
-    shutdown_id: Mutex<Option<EventId>>,
+    next_id: u64,
+    shutdown: Option<EventEnvelope>,
 }
 
 #[derive(Clone)]
@@ -30,53 +34,120 @@ pub struct RealtimeBus {
 
 impl RealtimeBus {
     pub fn new(capacity: usize) -> Self {
+        Self::build(capacity, 1)
+    }
+
+    pub fn with_next_event_id(capacity: usize, next_id: EventId) -> Result<Self, BusConfigError> {
+        if next_id.0 == 0 {
+            return Err(BusConfigError::ZeroEventId);
+        }
+        Ok(Self::build(capacity, next_id.0))
+    }
+
+    fn build(capacity: usize, next_id: u64) -> Self {
         let (sender, _) = broadcast::channel(capacity.max(1));
         Self {
             inner: Arc::new(BusInner {
-                sender,
-                next_id: AtomicU64::new(1),
-                shutdown_id: Mutex::new(None),
+                state: Mutex::new(BusState {
+                    sender,
+                    next_id,
+                    shutdown: None,
+                }),
             }),
         }
     }
 
+    /// Publishes one event in ID order.
+    ///
+    /// Once shutdown wins the ordering lock, later calls do not publish and return the existing
+    /// shutdown ID. If the ID space is exhausted, ID `u64::MAX` is used for an ordered shutdown
+    /// notification instead of allowing the sequence to wrap.
     pub fn publish(&self, event: DomainEvent) -> EventId {
-        let id = EventId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let _ = self.inner.sender.send(EventEnvelope { id, event });
+        let mut state = self.lock_state();
+        if let Some(shutdown) = &state.shutdown {
+            return shutdown.id;
+        }
+        if state.next_id == u64::MAX {
+            return Self::shutdown_locked(&mut state);
+        }
+        let id = EventId(state.next_id);
+        state.next_id += 1;
+        let _ = state.sender.send(EventEnvelope { id, event });
         id
     }
 
     pub fn subscribe(&self) -> EventSubscription {
+        let state = self.lock_state();
         EventSubscription {
-            receiver: self.inner.sender.subscribe(),
+            receiver: state.sender.subscribe(),
+            pending_terminal: state.shutdown.clone(),
+            terminal_received: false,
         }
     }
 
     pub fn shutdown(&self) -> EventId {
-        let mut shutdown_id = self
-            .inner
-            .shutdown_id
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(id) = *shutdown_id {
-            return id;
+        let mut state = self.lock_state();
+        if let Some(shutdown) = &state.shutdown {
+            return shutdown.id;
         }
-        let id = self.publish(DomainEvent::Shutdown);
-        *shutdown_id = Some(id);
+        Self::shutdown_locked(&mut state)
+    }
+
+    fn shutdown_locked(state: &mut BusState) -> EventId {
+        let id = EventId(state.next_id);
+        let shutdown = EventEnvelope {
+            id,
+            event: DomainEvent::Shutdown,
+        };
+        let _ = state.sender.send(shutdown.clone());
+        state.shutdown = Some(shutdown);
         id
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, BusState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl fmt::Debug for RealtimeBus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RealtimeBus")
+            .finish_non_exhaustive()
     }
 }
 
 pub struct EventSubscription {
     receiver: broadcast::Receiver<EventEnvelope>,
+    pending_terminal: Option<EventEnvelope>,
+    terminal_received: bool,
 }
 
 impl EventSubscription {
     pub async fn recv(&mut self) -> Result<EventEnvelope, SubscriptionError> {
-        self.receiver.recv().await.map_err(|error| match error {
-            broadcast::error::RecvError::Closed => SubscriptionError::Closed,
-            broadcast::error::RecvError::Lagged(skipped) => SubscriptionError::Lagged { skipped },
-        })
+        if self.terminal_received {
+            return Err(SubscriptionError::Closed);
+        }
+        if let Some(shutdown) = self.pending_terminal.take() {
+            self.terminal_received = true;
+            return Ok(shutdown);
+        }
+
+        match self.receiver.recv().await {
+            Ok(envelope) => {
+                if envelope.event == DomainEvent::Shutdown {
+                    self.terminal_received = true;
+                }
+                Ok(envelope)
+            }
+            Err(broadcast::error::RecvError::Closed) => Err(SubscriptionError::Closed),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(SubscriptionError::Lagged { skipped })
+            }
+        }
     }
 }
 
@@ -86,4 +157,10 @@ pub enum SubscriptionError {
     Lagged { skipped: u64 },
     #[error("realtime subscription closed")]
     Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BusConfigError {
+    #[error("the first realtime event ID must be non-zero")]
+    ZeroEventId,
 }

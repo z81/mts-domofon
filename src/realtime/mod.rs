@@ -1,3 +1,5 @@
 mod bus;
 
-pub use bus::{EventEnvelope, EventId, EventSubscription, RealtimeBus, SubscriptionError};
+pub use bus::{
+    BusConfigError, EventEnvelope, EventId, EventSubscription, RealtimeBus, SubscriptionError,
+};

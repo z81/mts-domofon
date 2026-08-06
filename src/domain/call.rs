@@ -8,15 +8,35 @@ use secrecy::SecretString;
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[serde(transparent)]
-pub struct CallId(String);
+pub struct CallId(uuid::Uuid);
 
 impl CallId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+
+    pub fn parse(value: &str) -> Result<Self, uuid::Error> {
+        uuid::Uuid::parse_str(value).map(Self)
+    }
+
+    pub fn as_uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+}
+
+impl Default for CallId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for CallId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -25,6 +45,15 @@ impl CallId {
 )]
 #[serde(transparent)]
 pub struct CallRevision(pub u64);
+
+impl CallRevision {
+    pub fn checked_next(self) -> Result<Self, CallTransitionError> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(CallTransitionError::RevisionExhausted)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,8 +84,28 @@ pub enum CallPhase {
 }
 
 #[derive(Clone)]
+pub struct ProviderCallId(SecretString);
+
+impl ProviderCallId {
+    pub fn new(value: SecretString) -> Self {
+        Self(value)
+    }
+
+    pub fn as_secret(&self) -> &SecretString {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ProviderCallId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProviderCallId([REDACTED])")
+    }
+}
+
+#[derive(Clone)]
 pub struct IncomingInvite {
     id: CallId,
+    provider_call_id: ProviderCallId,
     media: CallMedia,
     action_route_id: SecretString,
     call_session_id: SecretString,
@@ -67,12 +116,14 @@ pub struct IncomingInvite {
 impl IncomingInvite {
     pub fn new(
         id: CallId,
+        provider_call_id: ProviderCallId,
         media: CallMedia,
         action_route_id: SecretString,
         call_session_id: SecretString,
     ) -> Self {
         Self {
             id,
+            provider_call_id,
             media,
             action_route_id,
             call_session_id,
@@ -99,6 +150,10 @@ impl IncomingInvite {
         self.media
     }
 
+    pub fn provider_call_id(&self) -> &ProviderCallId {
+        &self.provider_call_id
+    }
+
     pub fn action_route_id(&self) -> &SecretString {
         &self.action_route_id
     }
@@ -114,6 +169,7 @@ impl fmt::Debug for IncomingInvite {
             .debug_struct("IncomingInvite")
             .field("id", &self.id)
             .field("media", &self.media)
+            .field("has_provider_call_id", &true)
             .field("has_action_route_id", &true)
             .field("has_call_session_id", &true)
             .field("has_caller_phone", &self.caller_phone.is_some())
@@ -285,6 +341,8 @@ pub enum CallTransitionError {
         expected: CallRevision,
         actual: CallRevision,
     },
+    #[error("call revision space is exhausted")]
+    RevisionExhausted,
     #[error("command is invalid while call is in phase {0:?}")]
     InvalidTransition(CallPhase),
     #[error("call timestamp moved backwards")]
@@ -363,7 +421,7 @@ pub fn reduce(
     };
 
     let mut next = state.clone();
-    next.revision = CallRevision(next.revision.0 + 1);
+    next.revision = next.revision.checked_next()?;
     next.phase = phase;
     next.updated_at = now;
     next.media_reserved = media_reserved;
@@ -391,6 +449,7 @@ pub struct CallRegistry {
 
 impl CallRegistry {
     pub fn new(history_capacity: usize) -> Self {
+        let history_capacity = history_capacity.max(1);
         Self {
             current: BTreeMap::new(),
             history: VecDeque::with_capacity(history_capacity),
@@ -420,17 +479,18 @@ impl CallRegistry {
         command: CallCommand,
         now: DateTime<Utc>,
     ) -> Result<Transition, CallTransitionError> {
-        if matches!(command, CallCommand::Accept { .. })
-            && let Some(owner) = self
-                .current
-                .values()
-                .find(|call| call.id() != id && call.media_reserved)
-        {
-            return Err(CallTransitionError::ActiveCallExists(owner.id().clone()));
-        }
-
         if let Some(state) = self.current.get(id) {
+            let previously_reserved = state.media_reserved;
             let transition = reduce(state, command, now)?;
+            if !previously_reserved
+                && transition.state.media_reserved
+                && let Some(owner) = self
+                    .current
+                    .values()
+                    .find(|call| call.id() != id && call.media_reserved)
+            {
+                return Err(CallTransitionError::ActiveCallExists(owner.id().clone()));
+            }
             if transition.state.is_terminal() {
                 self.current.remove(id);
                 self.push_history(transition.state.clone());
