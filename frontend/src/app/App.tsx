@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { AuthPage } from '../features/auth/AuthPage'
-import type { AuthApi } from '../features/auth/authApi'
+import { authApi as defaultAuthApi, type AuthApi } from '../features/auth/authApi'
 import { CallPage } from '../features/calls/CallPage'
 import {
   callApi,
@@ -250,7 +250,7 @@ function UnavailablePage({ eyebrow, title, copy }: { eyebrow: string; title: str
   </>
 }
 
-function App({ api = intercomApi, authApi, callsApi = callApi }: AppProps) {
+function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }: AppProps) {
   const [page, setPage] = useState<Page>('home')
   const [flatOpen, setFlatOpen] = useState(false)
   const [authOpen, setAuthOpen] = useState(false)
@@ -269,10 +269,21 @@ function App({ api = intercomApi, authApi, callsApi = callApi }: AppProps) {
   const [currentCall, setCurrentCall] = useState<CurrentCall | null>(null)
   const [callLoading, setCallLoading] = useState(true)
   const [callPollingError, setCallPollingError] = useState(false)
+  const [callSessionAuthenticated, setCallSessionAuthenticated] = useState<boolean | null>(null)
   const doorPreparationInFlight = useRef(false)
   const doorExecutionInFlight = useRef(false)
   const sessionEpoch = useRef(0)
   const autoOpenedCallId = useRef<string | null>(null)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    authApi.getSession(controller.signal).then((session) => {
+      if (!controller.signal.aborted) setCallSessionAuthenticated(session.authenticated)
+    }).catch(() => {
+      if (!controller.signal.aborted) setCallSessionAuthenticated(false)
+    })
+    return () => controller.abort()
+  }, [authApi])
 
   useEffect(() => {
     if (!dataSessionEnabled) return
@@ -308,7 +319,7 @@ function App({ api = intercomApi, authApi, callsApi = callApi }: AppProps) {
     return () => controller.abort()
   }, [api, dataSessionEnabled, deviceReload, selectedFlatId])
 
-  const callPollingEnabled = dataSessionEnabled && dashboard.status === 'success'
+  const callPollingEnabled = dataSessionEnabled && callSessionAuthenticated === true
 
   useEffect(() => {
     if (!callPollingEnabled) return
@@ -386,6 +397,7 @@ function App({ api = intercomApi, authApi, callsApi = callApi }: AppProps) {
     setCurrentCall(null)
     setCallLoading(true)
     setCallPollingError(false)
+    setCallSessionAuthenticated(true)
     setDashboard({ status: 'loading' })
     setDashboardReload((value) => value + 1)
   }
@@ -410,6 +422,7 @@ function App({ api = intercomApi, authApi, callsApi = callApi }: AppProps) {
     setCurrentCall(null)
     setCallLoading(false)
     setCallPollingError(false)
+    setCallSessionAuthenticated(false)
   }
 
   function retryDashboard() {
@@ -539,9 +552,7 @@ function App({ api = intercomApi, authApi, callsApi = callApi }: AppProps) {
   }
 
   let mainContent: ReactNode
-  if (page === 'calls' && dashboard.status === 'success') {
-    mainContent = <CallPage api={callsApi} call={activeCurrentCall} loading={callPollingEnabled && callLoading} pollingError={callPollingEnabled && callPollingError} />
-  } else if (dashboard.status === 'loading') {
+  if (dashboard.status === 'loading') {
     mainContent = <div className="loading-card" role="status"><span className="loading-ring" /><p>Загружаем объекты…</p></div>
   } else if (dashboard.status === 'error' && isUnauthorized(dashboard.error)) {
     mainContent = <StateCard eyebrow="MTS ID" title="Войдите в MTS ID" action={<button className="primary-button" onClick={() => setAuthOpen(true)} type="button">Войти с MTS ID</button>}><p>Авторизация нужна, чтобы загрузить ваши квартиры и домофоны.</p></StateCard>
@@ -575,7 +586,12 @@ function App({ api = intercomApi, authApi, callsApi = callApi }: AppProps) {
         </div>
         <div className="top-actions"><span className="api-pill"><span />Локальный API</span><button className="avatar" aria-label="Профиль подключения" onClick={() => setAuthOpen(true)} type="button">М</button></div>
       </header>
-      <main id="main-content" className="main-content">{mainContent}</main>
+      <main id="main-content" className="main-content">
+        {callPollingEnabled && <div className="persistent-call-page" hidden={page !== 'calls'}>
+          <CallPage api={callsApi} call={activeCurrentCall} loading={callLoading} pollingError={callPollingError} />
+        </div>}
+        {(page !== 'calls' || !callPollingEnabled) && mainContent}
+      </main>
     </div>
     <nav className="mobile-nav" aria-label="Мобильная навигация">{navigation.slice(0, 4).map((item) => <button className={page === item.page ? 'active' : ''} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span>{item.page === 'calls' && incomingCall && <span className="call-nav-badge mobile-call-badge">Входящий</span>}</button>)}</nav>
     {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} onLoggedOut={finishLogout} />}

@@ -195,7 +195,7 @@ function CallPageSession({
       if (mediaAbort.signal.aborted || peerRef.current !== peer) return
       const localSdp = peer.localDescription?.sdp
       if (!localSdp) throw new Error('Browser did not produce local SDP')
-      await api.answer(selectedCall.id, selectedCall.revision, localSdp)
+      await api.answer(selectedCall.id, selectedCall.revision, localSdp, mediaAbort.signal)
       setAnswerSubmittedRevision(selectedCall.revision)
       setFeedback({ kind: 'status', message: 'Ответ отправлен. Подключаем аудио и видео…' })
     } catch (error) {

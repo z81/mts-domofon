@@ -152,7 +152,7 @@ describe('browser WebRTC answer', () => {
 
     await user.click(screen.getByRole('button', { name: 'Принять вызов' }))
 
-    await waitFor(() => expect(answer).toHaveBeenCalledWith('call / 81', 4, 'v=0\r\na=candidate:complete\r\n'))
+    await waitFor(() => expect(answer).toHaveBeenCalledWith('call / 81', 4, 'v=0\r\na=candidate:complete\r\n', expect.any(AbortSignal)))
     expect(peer.setRemoteDescription).toHaveBeenCalledWith({ type: 'offer', sdp: ringingCall.remoteSdp })
     expect(media.getUserMedia).toHaveBeenCalledWith({ audio: true, video: false })
     expect(peer.addTrack).toHaveBeenCalledWith(media.localTrack, media.localStream)
@@ -177,7 +177,7 @@ describe('browser WebRTC answer', () => {
     expect(answer).not.toHaveBeenCalled()
 
     act(() => peer.completeIce('v=0\r\na=candidate:last\r\n'))
-    await waitFor(() => expect(answer).toHaveBeenCalledWith('call / 81', 4, 'v=0\r\na=candidate:last\r\n'))
+    await waitFor(() => expect(answer).toHaveBeenCalledWith('call / 81', 4, 'v=0\r\na=candidate:last\r\n', expect.any(AbortSignal)))
   })
 
   it('stops a broken ICE gather after the bounded wait without posting partial SDP', async () => {
@@ -315,6 +315,33 @@ describe('browser WebRTC answer', () => {
 
     expect(media.getUserMedia).not.toHaveBeenCalled()
     expect(peer.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('aborts an in-flight answer request when the call session is torn down', async () => {
+    const user = userEvent.setup()
+    const peer = new FakePeerConnection()
+    const media = mediaFixture()
+    let answerSignal: AbortSignal | undefined
+    const answer = vi.fn<CallApi['answer']>((_callId, _revision, _sdp, signal) => {
+      answerSignal = signal
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+      })
+    })
+    const view = render(<CallPage
+      api={createApi({ answer })}
+      call={ringingCall}
+      createPeerConnection={() => peer as unknown as RTCPeerConnection}
+      getUserMedia={media.getUserMedia}
+    />)
+
+    await user.click(screen.getByRole('button', { name: 'Принять вызов' }))
+    await waitFor(() => expect(answer).toHaveBeenCalledTimes(1))
+    view.unmount()
+
+    expect(answerSignal?.aborted).toBe(true)
+    expect(peer.close).toHaveBeenCalledTimes(1)
+    expect(media.localTrack.stop).toHaveBeenCalledTimes(1)
   })
 })
 

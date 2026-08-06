@@ -473,23 +473,25 @@ describe('live intercom dashboard', () => {
     expect(logout).toHaveBeenCalledTimes(1)
   })
 
-  it('does not poll calls before the authenticated dashboard session is usable', async () => {
+  it('polls calls while the unrelated dashboard request is still loading', async () => {
     const pendingDashboard = deferred<PropertyDashboard>()
     const getCurrent = vi.fn<CallApi['getCurrent']>(async () => null)
     render(<App
       api={createApi({ getDashboard: () => pendingDashboard.promise })}
+      authApi={authenticatedAuthApi()}
       callsApi={createCallApi({ getCurrent })}
     />)
 
-    expect(getCurrent).not.toHaveBeenCalled()
-    await act(async () => pendingDashboard.resolve(dashboard))
     await waitFor(() => expect(getCurrent).toHaveBeenCalledTimes(1))
+    await act(async () => pendingDashboard.resolve(dashboard))
+    expect(getCurrent).toHaveBeenCalledTimes(1)
   })
 
-  it('does not poll calls when the data session is unauthorized', async () => {
+  it('does not poll calls for an anonymous session', async () => {
     const getCurrent = vi.fn<CallApi['getCurrent']>(async () => null)
     render(<App
       api={createApi({ getDashboard: async () => { throw new IntercomApiError(401, 'authentication_required') } })}
+      authApi={anonymousAuthApi()}
       callsApi={createCallApi({ getCurrent })}
     />)
 
@@ -497,15 +499,45 @@ describe('live intercom dashboard', () => {
     expect(getCurrent).not.toHaveBeenCalled()
   })
 
+  it('shows a ringing call before the dashboard request settles', async () => {
+    const pendingDashboard = deferred<PropertyDashboard>()
+    render(<App
+      api={createApi({ getDashboard: () => pendingDashboard.promise })}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({ getCurrent: async () => ringingCall })}
+    />)
+
+    expect(await screen.findByRole('heading', { name: 'Домофон у подъезда' })).toBeVisible()
+    expect(screen.getByRole('status')).toHaveTextContent('Входящий вызов')
+  })
+
   it('switches to the calls page and marks navigation for a real incoming call', async () => {
     render(<App
       api={createApi()}
+      authApi={authenticatedAuthApi()}
       callsApi={createCallApi({ getCurrent: async () => ringingCall })}
     />)
 
     expect(await screen.findByRole('heading', { name: 'Домофон у подъезда' })).toBeVisible()
     expect(screen.getByRole('status')).toHaveTextContent('Входящий вызов')
     expect(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: /Звонки.*Входящий/ })).toHaveClass('active')
+  })
+
+  it('keeps the browser call session mounted while navigating away and back', async () => {
+    const user = userEvent.setup()
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({ getCurrent: async () => ringingCall })}
+    />)
+    const callHeading = await screen.findByRole('heading', { name: 'Домофон у подъезда' })
+    const navigation = within(screen.getByRole('complementary', { name: 'Основная навигация' }))
+
+    await user.click(navigation.getByRole('button', { name: 'Главная' }))
+    expect(callHeading).not.toBeVisible()
+    await user.click(navigation.getByRole('button', { name: /Звонки.*Входящий/ }))
+
+    expect(screen.getByRole('heading', { name: 'Домофон у подъезда' })).toBe(callHeading)
   })
 
   it('aborts call polling and clears the call UI after logout', async () => {
@@ -532,7 +564,7 @@ describe('live intercom dashboard', () => {
 
   it('does not invent an incoming call when the call endpoint returns no current call', async () => {
     const user = userEvent.setup()
-    render(<App api={createApi()} callsApi={createCallApi()} />)
+    render(<App api={createApi()} authApi={authenticatedAuthApi()} callsApi={createCallApi()} />)
     expect(await screen.findByText('Подъезд 1')).toBeVisible()
 
     await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
