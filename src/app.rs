@@ -74,7 +74,8 @@ impl RedactedUri {
 }
 
 fn is_query_sensitive_route_path(path: &str) -> bool {
-    path == "/api/v1/door-open-intents"
+    is_removed_mts_relay_path(path)
+        || path == "/api/v1/door-open-intents"
         || path == "/api/v1/door-open-intents/confirm"
         || path == "/api/v1/access/intents"
         || path.starts_with("/api/v1/access/intents/")
@@ -91,6 +92,10 @@ fn is_query_sensitive_route_path(path: &str) -> bool {
                 | "/api/refresh"
                 | "/api/logout"
         )
+}
+
+fn is_removed_mts_relay_path(path: &str) -> bool {
+    path == "/amserver" || path.starts_with("/amserver/") || path == "/wsso/authenticate"
 }
 
 fn redacted_path(path: &str) -> String {
@@ -182,6 +187,9 @@ pub fn build_router_with_config(state: AppState, config: &AppConfig) -> Router {
         .fallback(move |request: Request| {
             let web_assets = web_assets.clone();
             async move {
+                if is_removed_mts_relay_path(request.uri().path()) {
+                    return axum::http::StatusCode::NOT_FOUND.into_response();
+                }
                 let Some(path) = ValidatedPath::parse(request.uri().path()) else {
                     return axum::http::StatusCode::NOT_FOUND.into_response();
                 };

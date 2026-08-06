@@ -161,6 +161,39 @@ async fn request_tracing_redacts_sensitive_query_values() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn request_tracing_redacts_the_entire_mts_relay_query() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(BufferWriter(Arc::clone(&output)))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+
+    let app = app::test_router().await;
+    for path in [
+        "/amserver?ordinary=visible-looking&code=relay-secret",
+        "/amserver/oauth2/authorize?ordinary=visible-looking&code=relay-secret",
+        "/wsso/authenticate?ordinary=visible-looking&code=relay-secret",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .with_subscriber(dispatch.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let formatted = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(formatted.contains("/amserver/oauth2/authorize"));
+    assert!(formatted.contains("[REDACTED]"));
+    assert!(!formatted.contains("ordinary"));
+    assert!(!formatted.contains("visible-looking"));
+    assert!(!formatted.contains("relay-secret"));
+}
+
 #[tokio::test]
 async fn handler_receives_original_uri_and_redacted_uri_extension() {
     let _tracing_guard = TRACING_TEST_LOCK.lock().await;
