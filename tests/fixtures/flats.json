@@ -1,0 +1,49 @@
+[
+  {
+    "company": {
+      "id": "company-synthetic",
+      "name": "Synthetic Company"
+    },
+    "parts": [
+      {
+        "id": "flat synthetic+one",
+        "name": "Internal one",
+        "displayName": "Entrance One",
+        "estatePartType": "building",
+        "buildingId": "building-one",
+        "futurePartField": true
+      },
+      {
+        "id": "flat-synthetic-two",
+        "name": "Fallback Two",
+        "displayName": "   ",
+        "estatePartType": "building",
+        "buildingId": "building-two"
+      }
+    ],
+    "buildings": [
+      {
+        "id": "building-two",
+        "address": {
+          "fullAddress": "Synthetic City, Hidden Lane 22",
+          "shortAddress": "Hidden Lane 22",
+          "futureAddressField": "ignored"
+        }
+      },
+      {
+        "id": "building-one",
+        "address": {
+          "fullAddress": "Synthetic City, Hidden Lane 17",
+          "shortAddress": "Hidden Lane 17"
+        }
+      }
+    ],
+    "category": {
+      "id": "category-synthetic",
+      "name": "Apartment"
+    },
+    "futureTopLevelField": {
+      "ignored": true
+    }
+  }
+]

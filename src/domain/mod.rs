@@ -6,4 +6,7 @@ pub mod property;
 
 pub use device::{AccessPoint, AccessPointKind, Camera, CameraCapabilities, DeviceInventory, Lock};
 pub use page::Page;
-pub use property::{Capability, CapabilitySet, Flat, FlatId};
+pub use property::{
+    CallMode, CallSettings, CallSettingsPatch, CallSettingsStatus, Capability, CapabilitySet, Flat,
+    FlatId, PropertyDashboard,
+};

@@ -1,0 +1,43 @@
+[
+  {
+    "id": "service-call-synthetic",
+    "status": "active",
+    "message": null,
+    "name": "Synthetic application calls",
+    "type": "base",
+    "alias": "app_call",
+    "createdAt": "2026-08-05T10:00:00Z",
+    "updatedAt": "2026-08-05T10:00:00Z",
+    "futureServiceField": true
+  },
+  {
+    "id": "service-archive-synthetic",
+    "status": "active",
+    "message": "synthetic",
+    "name": "Synthetic archive",
+    "type": "base",
+    "alias": "cloud_archive",
+    "createdAt": "2026-08-05T10:00:00Z",
+    "updatedAt": "2026-08-05T10:00:00Z"
+  },
+  {
+    "id": "service-unknown-synthetic",
+    "status": "active",
+    "message": null,
+    "name": "Synthetic unknown",
+    "type": "future",
+    "alias": "provider-secret-future-alias",
+    "createdAt": "2026-08-05T10:00:00Z",
+    "updatedAt": "2026-08-05T10:00:00Z"
+  },
+  {
+    "id": "service-excluded-synthetic",
+    "status": "active",
+    "message": null,
+    "name": "Synthetic excluded product",
+    "type": "future",
+    "alias": "meters",
+    "createdAt": "2026-08-05T10:00:00Z",
+    "updatedAt": "2026-08-05T10:00:00Z"
+  }
+]

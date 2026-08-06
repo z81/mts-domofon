@@ -15,6 +15,7 @@ use tokio::{fs, io::AsyncWriteExt};
 use zeroize::Zeroizing;
 
 use crate::{
+    domain::FlatId,
     domain::auth::{DeviceIdentity, PersistedSession, TokenBundle},
     error::{AppError, ErrorCode},
 };
@@ -26,9 +27,11 @@ const MAGIC: &[u8; 4] = b"VDM1";
 const NONCE_LEN: usize = 12;
 const SESSION_FILE: &str = "session.enc";
 const DEVICE_FILE: &str = "device.enc";
+const SELECTED_FLAT_FILE: &str = "selected-flat.enc";
 const MASTER_KEY_FILE: &str = "master.key";
 const SESSION_AAD: &[u8] = b"domru-mts/session/v1";
 const DEVICE_AAD: &[u8] = b"domru-mts/device/v1";
+const SELECTED_FLAT_AAD: &[u8] = b"domru-mts/selected-flat/v1";
 
 /// Encrypted durable storage for the currently supported Linux and macOS targets.
 #[derive(Clone)]
@@ -207,6 +210,33 @@ impl SecretStore {
 
     pub async fn clear_session(&self) -> Result<(), AppError> {
         let path = self.data_dir.join(SESSION_FILE);
+        match fs::remove_file(path).await {
+            Ok(()) => sync_parent(&self.data_dir).await,
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(storage_failure()),
+        }
+    }
+
+    pub async fn load_selected_flat(&self) -> Result<Option<FlatId>, AppError> {
+        let Some(plaintext) = self
+            .read_encrypted(SELECTED_FLAT_FILE, SELECTED_FLAT_AAD)
+            .await?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&plaintext)
+            .map(Some)
+            .map_err(|_| storage_failure())
+    }
+
+    pub async fn save_selected_flat(&self, flat_id: &FlatId) -> Result<(), AppError> {
+        let plaintext = Zeroizing::new(serde_json::to_vec(flat_id).map_err(|_| storage_failure())?);
+        let encrypted = self.encrypt(&plaintext, SELECTED_FLAT_AAD)?;
+        self.atomic_replace(SELECTED_FLAT_FILE, &encrypted).await
+    }
+
+    pub async fn clear_selected_flat(&self) -> Result<(), AppError> {
+        let path = self.data_dir.join(SELECTED_FLAT_FILE);
         match fs::remove_file(path).await {
             Ok(()) => sync_parent(&self.data_dir).await,
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -455,7 +485,7 @@ async fn recover_partial_master_key(data_dir: &Path, path: &Path) -> Result<(), 
 }
 
 async fn encrypted_data_exists(data_dir: &Path) -> Result<bool, AppError> {
-    for file_name in [SESSION_FILE, DEVICE_FILE] {
+    for file_name in [SESSION_FILE, DEVICE_FILE, SELECTED_FLAT_FILE] {
         match fs::symlink_metadata(data_dir.join(file_name)).await {
             Ok(_) => return Ok(true),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -466,7 +496,12 @@ async fn encrypted_data_exists(data_dir: &Path) -> Result<bool, AppError> {
 }
 
 async fn repair_existing_secret_permissions(data_dir: &Path) -> Result<(), AppError> {
-    for file_name in [MASTER_KEY_FILE, SESSION_FILE, DEVICE_FILE] {
+    for file_name in [
+        MASTER_KEY_FILE,
+        SESSION_FILE,
+        DEVICE_FILE,
+        SELECTED_FLAT_FILE,
+    ] {
         repair_secret_permissions_if_exists(&data_dir.join(file_name)).await?;
     }
     Ok(())
