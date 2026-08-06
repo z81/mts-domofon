@@ -276,11 +276,16 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
   const autoOpenedCallId = useRef<string | null>(null)
 
   useEffect(() => {
+    const requestEpoch = sessionEpoch.current
     const controller = new AbortController()
     authApi.getSession(controller.signal).then((session) => {
-      if (!controller.signal.aborted) setCallSessionAuthenticated(session.authenticated)
+      if (!controller.signal.aborted && requestEpoch === sessionEpoch.current) {
+        setCallSessionAuthenticated(session.authenticated)
+      }
     }).catch(() => {
-      if (!controller.signal.aborted) setCallSessionAuthenticated(false)
+      if (!controller.signal.aborted && requestEpoch === sessionEpoch.current) {
+        setCallSessionAuthenticated(false)
+      }
     })
     return () => controller.abort()
   }, [authApi])
@@ -298,7 +303,9 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
       setDevices(flatId ? { status: 'loading', flatId } : { status: 'idle' })
       setDeviceReload((value) => value + 1)
     }).catch((error: unknown) => {
-      if (!controller.signal.aborted && requestEpoch === sessionEpoch.current) setDashboard({ status: 'error', error })
+      if (controller.signal.aborted || requestEpoch !== sessionEpoch.current) return
+      setDashboard({ status: 'error', error })
+      if (isUnauthorized(error)) setCallSessionAuthenticated(false)
     })
     return () => controller.abort()
   }, [api, dashboardReload, dataSessionEnabled])

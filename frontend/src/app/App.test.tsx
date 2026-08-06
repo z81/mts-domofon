@@ -499,6 +499,39 @@ describe('live intercom dashboard', () => {
     expect(getCurrent).not.toHaveBeenCalled()
   })
 
+  it('does not let a stale session restore disable calls after authentication succeeds', async () => {
+    const user = userEvent.setup()
+    const initialSession = deferred<Awaited<ReturnType<AuthApi['getSession']>>>()
+    const getSession = vi.fn<AuthApi['getSession']>()
+      .mockImplementationOnce(() => initialSession.promise)
+      .mockResolvedValueOnce({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null })
+    const authApi = anonymousAuthApi()
+    authApi.getSession = getSession
+    authApi.startAuth = async () => ({
+      status: 'authenticated',
+      session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T12:00:00Z', expires_at: null },
+    })
+    let callSignal: AbortSignal | undefined
+    const getCurrent = vi.fn<CallApi['getCurrent']>((signal) => {
+      callSignal = signal
+      return new Promise<CurrentCall | null>(() => undefined)
+    })
+    render(<App api={createApi()} authApi={authApi} callsApi={createCallApi({ getCurrent })} />)
+    await waitFor(() => expect(getSession).toHaveBeenCalledTimes(1))
+
+    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
+    await waitFor(() => expect(callSignal).toBeDefined())
+    await act(async () => initialSession.resolve({
+      authenticated: false,
+      status: 'anonymous',
+      authenticated_at: null,
+      expires_at: null,
+    }))
+
+    expect(callSignal?.aborted).toBe(false)
+  })
+
   it('shows a ringing call before the dashboard request settles', async () => {
     const pendingDashboard = deferred<PropertyDashboard>()
     render(<App
