@@ -13,6 +13,13 @@ use secrecy::{ExposeSecret, SecretString};
 use std::str::FromStr;
 #[cfg(feature = "test-support")]
 use std::{sync::Arc, time::Duration};
+#[cfg(feature = "test-support")]
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use url::Url;
 #[cfg(feature = "test-support")]
 use wiremock::{
@@ -164,6 +171,122 @@ fn raw_callback(server: &MockServer, state: &str) -> SecretString {
 }
 
 #[cfg(feature = "test-support")]
+#[derive(Clone, Copy)]
+enum StallPoint {
+    ResponseHead,
+    ResponseBody,
+}
+
+#[cfg(feature = "test-support")]
+struct StalledCallbackServer {
+    target: Url,
+    reached: mpsc::Receiver<()>,
+    release: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+#[cfg(feature = "test-support")]
+async fn read_raw_request_headers(stream: &mut TcpStream) {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 512];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let count = stream.read(&mut buffer).await.expect("read request");
+        assert!(count > 0, "client closed before sending request headers");
+        request.extend_from_slice(&buffer[..count]);
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn handle_stalled_callback(
+    mut stream: TcpStream,
+    stall_point: StallPoint,
+    reached: mpsc::Sender<()>,
+    mut release: watch::Receiver<bool>,
+) {
+    read_raw_request_headers(&mut stream).await;
+    let body = include_bytes!("fixtures/sso/callback-success.json");
+    if matches!(stall_point, StallPoint::ResponseBody) {
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write response headers");
+        stream
+            .write_all(&body[..1])
+            .await
+            .expect("write first body byte");
+        stream.flush().await.expect("flush partial response");
+    }
+    reached.send(()).await.expect("report stalled callback");
+    while !*release.borrow() {
+        if release.changed().await.is_err() {
+            return;
+        }
+    }
+
+    match stall_point {
+        StallPoint::ResponseHead => {
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(headers.as_bytes()).await.is_ok() {
+                let _ = stream.write_all(body).await;
+            }
+        }
+        StallPoint::ResponseBody => {
+            let _ = stream.write_all(&body[1..]).await;
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn start_stalled_callback_server(
+    stall_point: StallPoint,
+    connections: usize,
+) -> StalledCallbackServer {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind callback listener");
+    let target = Url::parse(&format!(
+        "http://{}/user-service/api/auth/callback",
+        listener.local_addr().expect("callback listener address")
+    ))
+    .expect("callback target");
+    let (reached_tx, reached) = mpsc::channel(connections);
+    let (release, release_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut handlers = Vec::with_capacity(connections);
+        for _ in 0..connections {
+            let (stream, _) = listener.accept().await.expect("accept callback");
+            handlers.push(tokio::spawn(handle_stalled_callback(
+                stream,
+                stall_point,
+                reached_tx.clone(),
+                release_rx.clone(),
+            )));
+        }
+        for handler in handlers {
+            handler.await.expect("callback handler");
+        }
+    });
+    StalledCallbackServer {
+        target,
+        reached,
+        release,
+        task,
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn raw_callback_for_target(target: &Url, state: &str) -> SecretString {
+    SecretString::from(format!("{target}?code=opaque&state={state}"))
+}
+
+#[cfg(feature = "test-support")]
 async fn completion_error(
     transport: &MtsSsoTransport,
     flow_id: &AuthFlowId,
@@ -289,6 +412,132 @@ async fn callback_completion_is_one_use_under_concurrency() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+#[cfg(feature = "test-support")]
+async fn five_in_flight_callbacks_hold_capacity_until_network_work_finishes() {
+    let StalledCallbackServer {
+        target,
+        mut reached,
+        release,
+        task: server_task,
+    } = start_stalled_callback_server(StallPoint::ResponseHead, 5).await;
+    let transport = Arc::new(
+        MtsSsoTransport::new_for_test("synthetic-device", MtsSsoTestConfig::new(target.clone()))
+            .unwrap(),
+    );
+    let mut completions = Vec::new();
+    for _ in 0..5 {
+        let (flow_id, state) = begin_parts(&transport).await;
+        let transport = Arc::clone(&transport);
+        let callback = raw_callback_for_target(&target, &state);
+        completions.push(tokio::spawn(async move {
+            transport.complete_callback(&flow_id, callback).await
+        }));
+    }
+    for _ in 0..5 {
+        reached.recv().await.expect("callback reached server");
+    }
+
+    let error = transport.begin().await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::RateLimited);
+
+    release.send(true).expect("release callback responses");
+    for completion in completions {
+        match completion.await.expect("callback task") {
+            Ok(_) => {}
+            Err(error) => panic!("callback failed after release: {error:?}"),
+        }
+    }
+    server_task.await.expect("callback server");
+    assert!(transport.begin().await.is_ok());
+}
+
+#[tokio::test]
+#[cfg(feature = "test-support")]
+async fn cancelling_callback_work_releases_its_in_flight_capacity_marker() {
+    let StalledCallbackServer {
+        target,
+        mut reached,
+        release,
+        task: server_task,
+    } = start_stalled_callback_server(StallPoint::ResponseHead, 1).await;
+    let mut config = MtsSsoTestConfig::new(target.clone());
+    config.max_flows = 1;
+    let transport = Arc::new(MtsSsoTransport::new_for_test("synthetic-device", config).unwrap());
+    let (flow_id, state) = begin_parts(&transport).await;
+    let callback = raw_callback_for_target(&target, &state);
+    let transport_for_completion = Arc::clone(&transport);
+    let completion = tokio::spawn(async move {
+        transport_for_completion
+            .complete_callback(&flow_id, callback)
+            .await
+    });
+    reached.recv().await.expect("callback reached server");
+    assert_eq!(
+        transport.begin().await.unwrap_err().code,
+        ErrorCode::RateLimited
+    );
+
+    completion.abort();
+    let join_error = match completion.await {
+        Ok(_) => panic!("aborted callback task completed normally"),
+        Err(error) => error,
+    };
+    assert!(join_error.is_cancelled());
+    assert!(transport.begin().await.is_ok());
+
+    release.send(true).expect("release callback response");
+    server_task.await.expect("callback server");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "test-support")]
+async fn callback_deadline_covers_response_head_and_body_stream_stalls() {
+    for stall_point in [StallPoint::ResponseHead, StallPoint::ResponseBody] {
+        let StalledCallbackServer {
+            target,
+            mut reached,
+            release,
+            task: server_task,
+        } = start_stalled_callback_server(stall_point, 1).await;
+        let mut config = MtsSsoTestConfig::new(target.clone());
+        config.flow_lifetime = Duration::from_secs(60);
+        let transport =
+            Arc::new(MtsSsoTransport::new_for_test("synthetic-device", config).unwrap());
+        let (flow_id, state) = begin_parts(&transport).await;
+        let callback = raw_callback_for_target(&target, &state);
+        let transport_for_completion = Arc::clone(&transport);
+        let mut completion = tokio::spawn(async move {
+            transport_for_completion
+                .complete_callback(&flow_id, callback)
+                .await
+        });
+        reached.recv().await.expect("callback reached stall point");
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let completed = tokio::time::timeout(Duration::from_millis(1), &mut completion).await;
+        release.send(true).expect("release stalled callback");
+        tokio::time::resume();
+        let callback_result = match completed {
+            Ok(join_result) => join_result.expect("callback task"),
+            Err(_) => {
+                completion.abort();
+                let _ = completion.await;
+                server_task.await.expect("callback server");
+                panic!("callback exceeded its original flow expiry")
+            }
+        };
+        let error = match callback_result {
+            Ok(_) => panic!("expired stalled callback unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::SessionExpired);
+        server_task.await.expect("callback server");
+        assert!(transport.begin().await.is_ok());
+    }
 }
 
 #[tokio::test]

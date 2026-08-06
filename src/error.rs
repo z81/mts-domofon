@@ -87,6 +87,11 @@ impl AppError {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn retained_cause_for_test(&self) -> Option<&str> {
+        self.cause.as_deref()
+    }
+
     fn log_redacted(&self) {
         tracing::warn!(
             code = ?self.code,

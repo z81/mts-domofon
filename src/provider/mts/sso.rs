@@ -5,7 +5,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -15,6 +15,7 @@ use rand::RngCore;
 use reqwest::{Client, cookie::Jar, redirect::Policy};
 use secrecy::{ExposeSecret, SecretString};
 use subtle::ConstantTimeEq;
+use tokio::time::Instant;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -35,7 +36,7 @@ const DEFAULT_MAX_CALLBACK_BODY_LEN: usize = 64 * 1024;
 
 pub struct MtsSsoTransport {
     device_id: String,
-    flows: Mutex<HashMap<AuthFlowId, BrowserFlow>>,
+    flows: Mutex<HashMap<AuthFlowId, BrowserFlowState>>,
     max_flows: usize,
     flow_lifetime: Duration,
     max_callback_url_len: usize,
@@ -46,10 +47,51 @@ pub struct MtsSsoTransport {
 
 struct BrowserFlow {
     request: SsoRequest,
-    created_sequence: u64,
-    expires_at: Instant,
+    metadata: FlowMetadata,
     client: Client,
     _cookie_jar: Arc<Jar>,
+}
+
+enum BrowserFlowState {
+    Pending(BrowserFlow),
+    InFlight(FlowMetadata),
+}
+
+#[derive(Clone, Copy)]
+struct FlowMetadata {
+    created_sequence: u64,
+    expires_at: Instant,
+}
+
+impl BrowserFlowState {
+    fn metadata(&self) -> FlowMetadata {
+        match self {
+            Self::Pending(flow) => flow.metadata,
+            Self::InFlight(metadata) => *metadata,
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending(_))
+    }
+}
+
+struct InFlightGuard<'transport> {
+    flows: &'transport Mutex<HashMap<AuthFlowId, BrowserFlowState>>,
+    flow_id: AuthFlowId,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut flows) = self.flows.lock()
+            && matches!(
+                flows.get(&self.flow_id),
+                Some(BrowserFlowState::InFlight(_))
+            )
+        {
+            flows.remove(&self.flow_id);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -152,14 +194,18 @@ impl MtsSsoTransport {
             .map_err(internal_transport_error)?;
         let now = Instant::now();
         let mut flows = self.flows.lock().map_err(|_| internal_flow_error())?;
-        flows.retain(|_, flow| flow.expires_at > now);
+        flows.retain(|_, flow| !flow.is_pending() || flow.metadata().expires_at > now);
         if flows.len() >= self.max_flows
             && let Some(oldest) = flows
                 .iter()
-                .min_by_key(|(_, flow)| flow.created_sequence)
+                .filter(|(_, flow)| flow.is_pending())
+                .min_by_key(|(_, flow)| flow.metadata().created_sequence)
                 .map(|(flow_id, _)| flow_id.clone())
         {
             flows.remove(&oldest);
+        }
+        if flows.len() >= self.max_flows {
+            return Err(flow_capacity_error());
         }
 
         let flow_id = loop {
@@ -169,15 +215,18 @@ impl MtsSsoTransport {
             }
         };
         let created_sequence = self.next_flow_sequence.fetch_add(1, Ordering::Relaxed);
+        let metadata = FlowMetadata {
+            created_sequence,
+            expires_at: now + self.flow_lifetime,
+        };
         flows.insert(
             flow_id.clone(),
-            BrowserFlow {
+            BrowserFlowState::Pending(BrowserFlow {
                 request,
-                created_sequence,
-                expires_at: now + self.flow_lifetime,
+                metadata,
                 client,
                 _cookie_jar: cookie_jar,
-            },
+            }),
         );
 
         Ok(AuthProgress::BrowserRedirect {
@@ -199,57 +248,76 @@ impl MtsSsoTransport {
         let flow = {
             let now = Instant::now();
             let mut flows = self.flows.lock().map_err(|_| internal_flow_error())?;
-            let Some(flow) = flows.get(flow_id) else {
+            let Some(flow_state) = flows.get(flow_id) else {
                 return Err(inactive_flow_error());
             };
-            if flow.expires_at <= now {
+            let BrowserFlowState::Pending(flow) = flow_state else {
+                return Err(inactive_flow_error());
+            };
+            if flow.metadata.expires_at <= now {
                 flows.remove(flow_id);
                 return Err(inactive_flow_error());
             }
             flow.request
                 .validate_callback_target(callback, &self.callback_target.url)?;
-            flows
-                .remove(flow_id)
-                .expect("validated authentication flow remains present")
+            let flow_state = flows
+                .get_mut(flow_id)
+                .expect("validated authentication flow remains present");
+            let metadata = flow_state.metadata();
+            let BrowserFlowState::Pending(flow) =
+                std::mem::replace(flow_state, BrowserFlowState::InFlight(metadata))
+            else {
+                unreachable!("validated authentication flow changed while locked")
+            };
+            flow
         };
-
-        let response = flow
-            .client
-            .get(callback)
-            .send()
-            .await
-            .map_err(upstream_unavailable)?;
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(AppError::new(
-                ErrorCode::UpstreamAuthenticationFailed,
-                "MTS callback authentication failed.",
-                false,
-            ));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > self.max_callback_body_len as u64)
-        {
-            return Err(callback_schema_error());
-        }
-
-        let mut body = Zeroizing::new(Vec::new());
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(upstream_unavailable)?;
-            let next_len = body
-                .len()
-                .checked_add(chunk.len())
-                .ok_or_else(callback_schema_error)?;
-            if next_len > self.max_callback_body_len {
+        let _in_flight = InFlightGuard {
+            flows: &self.flows,
+            flow_id: flow_id.clone(),
+        };
+        let callback_work = async {
+            let response = flow
+                .client
+                .get(callback)
+                .send()
+                .await
+                .map_err(upstream_unavailable)?;
+            if response.status() != reqwest::StatusCode::OK {
+                return Err(AppError::new(
+                    ErrorCode::UpstreamAuthenticationFailed,
+                    "MTS callback authentication failed.",
+                    false,
+                ));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > self.max_callback_body_len as u64)
+            {
                 return Err(callback_schema_error());
             }
-            body.extend_from_slice(&chunk);
-        }
 
-        let callback_response: CallbackResponse =
-            serde_json::from_slice(&body).map_err(|_| callback_schema_error())?;
-        callback_response.into_tokens()
+            let mut body = Zeroizing::new(Vec::new());
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(upstream_unavailable)?;
+                let next_len = body
+                    .len()
+                    .checked_add(chunk.len())
+                    .ok_or_else(callback_schema_error)?;
+                if next_len > self.max_callback_body_len {
+                    return Err(callback_schema_error());
+                }
+                body.extend_from_slice(&chunk);
+            }
+
+            let callback_response: CallbackResponse =
+                serde_json::from_slice(&body).map_err(|_| callback_schema_error())?;
+            callback_response.into_tokens()
+        };
+        match tokio::time::timeout_at(flow.metadata.expires_at, callback_work).await {
+            Ok(result) => result,
+            Err(_) => Err(inactive_flow_error()),
+        }
     }
 
     pub async fn submit(
@@ -259,10 +327,13 @@ impl MtsSsoTransport {
     ) -> Result<AuthProgress, AppError> {
         let now = Instant::now();
         let mut flows = self.flows.lock().map_err(|_| internal_flow_error())?;
-        let Some(flow) = flows.get(flow_id) else {
+        let Some(flow_state) = flows.get(flow_id) else {
             return Err(inactive_flow_error());
         };
-        if flow.expires_at <= now {
+        let BrowserFlowState::Pending(flow) = flow_state else {
+            return Err(inactive_flow_error());
+        };
+        if flow.metadata.expires_at <= now {
             flows.remove(flow_id);
             return Err(inactive_flow_error());
         }
@@ -347,13 +418,20 @@ fn inactive_flow_error() -> AppError {
     )
 }
 
-fn upstream_unavailable(error: impl fmt::Display) -> AppError {
+fn flow_capacity_error() -> AppError {
+    AppError::new(
+        ErrorCode::RateLimited,
+        "Too many authentication flows are active.",
+        true,
+    )
+}
+
+fn upstream_unavailable(_error: reqwest::Error) -> AppError {
     AppError::new(
         ErrorCode::UpstreamUnavailable,
         "MTS authentication service is unavailable.",
         true,
     )
-    .with_cause(error)
 }
 
 fn callback_schema_error() -> AppError {
@@ -502,4 +580,165 @@ fn decode_state(state: &str) -> Option<[u8; 32]> {
     }
 
     URL_SAFE_NO_PAD.decode(state).ok()?.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        error::Error,
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::response::IntoResponse;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::*;
+    use crate::{error::ApiError, request_id::RequestId};
+
+    const CALLBACK_SENTINEL: &str = "callback-query-secret-sentinel";
+
+    #[derive(Clone)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufferWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            std::io::Write::write(&mut *self.0.lock().expect("log buffer lock"), bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for BufferWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    async fn read_request_headers(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).await.expect("read request");
+            assert!(count > 0, "client closed before request headers completed");
+            request.extend_from_slice(&buffer[..count]);
+        }
+    }
+
+    async fn transport_and_callback(
+        listener: &TcpListener,
+    ) -> (MtsSsoTransport, AuthFlowId, SecretString) {
+        let callback_target = Url::parse(&format!(
+            "http://{}/user-service/api/auth/callback",
+            listener.local_addr().expect("listener address")
+        ))
+        .expect("callback target");
+        let mut transport = MtsSsoTransport::new("synthetic-device");
+        transport.callback_target = CallbackTarget {
+            url: callback_target.clone(),
+        };
+        let AuthProgress::BrowserRedirect {
+            flow_id,
+            authorization_url,
+        } = transport.begin().await.expect("begin flow")
+        else {
+            panic!("begin must return browser redirect")
+        };
+        let state = authorization_url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .expect("authorization state");
+        let callback = SecretString::from(format!(
+            "{callback_target}?code=opaque&state={state}&sentinel={CALLBACK_SENTINEL}"
+        ));
+        (transport, flow_id, callback)
+    }
+
+    fn assert_callback_error_is_fully_redacted(error: AppError) {
+        assert!(
+            error.retained_cause_for_test().is_none(),
+            "callback Reqwest errors must not be retained"
+        );
+        assert!(!error.to_string().contains(CALLBACK_SENTINEL));
+        assert!(!format!("{error:?}").contains(CALLBACK_SENTINEL));
+        let mut source = Error::source(&error);
+        while let Some(cause) = source {
+            assert!(!cause.to_string().contains(CALLBACK_SENTINEL));
+            assert!(!format!("{cause:?}").contains(CALLBACK_SENTINEL));
+            source = cause.source();
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(BufferWriter(Arc::clone(&output)))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            let api_error = ApiError::new(
+                RequestId::parse("e7411f58-d5e9-4a43-b25d-88ddf2014713").expect("request ID"),
+                error,
+            );
+            let _response = api_error.into_response();
+        });
+        let formatted =
+            String::from_utf8(output.lock().expect("log buffer lock").clone()).expect("UTF-8 logs");
+        assert!(!formatted.contains(CALLBACK_SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn callback_send_failure_retains_no_url_or_query_secret() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind listener");
+        let (transport, flow_id, callback) = transport_and_callback(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept callback");
+            read_request_headers(&mut stream).await;
+        });
+
+        let error = match transport.complete_callback(&flow_id, callback).await {
+            Ok(_) => panic!("reset callback unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        server.await.expect("server task");
+
+        assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+        assert_callback_error_is_fully_redacted(error);
+    }
+
+    #[tokio::test]
+    async fn callback_body_stream_failure_retains_no_url_or_query_secret() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind listener");
+        let (transport, flow_id, callback) = transport_and_callback(&listener).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept callback");
+            read_request_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 128\r\nConnection: close\r\n\r\n{",
+                )
+                .await
+                .expect("write incomplete response");
+        });
+
+        let error = match transport.complete_callback(&flow_id, callback).await {
+            Ok(_) => panic!("incomplete callback body unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        server.await.expect("server task");
+
+        assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+        assert_callback_error_is_fully_redacted(error);
+    }
 }
