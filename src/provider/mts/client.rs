@@ -9,7 +9,9 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, pin_mut};
 use reqwest::{
     Client, Method, Request, RequestBuilder, Response, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER},
+    header::{
+        ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER,
+    },
     redirect::Policy,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -67,6 +69,21 @@ pub enum ProviderBase {
     Resident,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseAccept {
+    Json,
+    ImageWebp,
+}
+
+impl ResponseAccept {
+    const fn as_header_value(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::ImageWebp => "image/webp",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct PreparedRequest {
     owner: Uuid,
@@ -74,6 +91,7 @@ pub struct PreparedRequest {
     base: ProviderBase,
     target: PreparedTarget,
     authorization: Authorization,
+    response_accept: ResponseAccept,
     body: PreparedBody,
 }
 
@@ -91,6 +109,16 @@ impl PreparedRequest {
         self.body = PreparedBody::Json(body);
         Ok(self)
     }
+
+    pub fn response_accept(mut self, response_accept: ResponseAccept) -> Self {
+        self.response_accept = response_accept;
+        self
+    }
+
+    pub fn explicit_empty_body(mut self) -> Self {
+        self.body = PreparedBody::ExplicitEmpty;
+        self
+    }
 }
 
 impl fmt::Debug for PreparedRequest {
@@ -100,6 +128,7 @@ impl fmt::Debug for PreparedRequest {
             .field("method", &self.method)
             .field("base", &self.base)
             .field("authorization", &self.authorization)
+            .field("response_accept", &self.response_accept)
             .field("has_body", &!matches!(self.body, PreparedBody::Empty))
             .finish()
     }
@@ -114,6 +143,7 @@ enum Authorization {
 #[derive(Clone)]
 enum PreparedBody {
     Empty,
+    ExplicitEmpty,
     Json(Vec<u8>),
 }
 
@@ -247,6 +277,7 @@ impl MtsClient {
             base,
             target: PreparedTarget::ClientBuiltUrl(url),
             authorization: Authorization::Authorized,
+            response_accept: ResponseAccept::Json,
             body: PreparedBody::Empty,
         })
     }
@@ -327,6 +358,7 @@ impl MtsClient {
             base,
             target: PreparedTarget::ValidatedRawPath(path.to_owned()),
             authorization,
+            response_accept: ResponseAccept::Json,
             body: PreparedBody::Empty,
         })
     }
@@ -342,10 +374,18 @@ impl MtsClient {
             PreparedTarget::ClientBuiltUrl(url) => url.clone(),
         };
         let mut builder = self.inner.http.request(prepared.method.clone(), url);
-        if let PreparedBody::Json(body) = &prepared.body {
-            builder = builder
-                .header(CONTENT_TYPE, "application/json")
-                .body(body.clone());
+        match &prepared.body {
+            PreparedBody::Empty => {}
+            PreparedBody::ExplicitEmpty => {
+                builder = builder
+                    .header(CONTENT_LENGTH, HeaderValue::from_static("0"))
+                    .body(Vec::new());
+            }
+            PreparedBody::Json(body) => {
+                builder = builder
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body.clone());
+            }
         }
 
         let mut dispatched_authorization = None;
@@ -367,7 +407,9 @@ impl MtsClient {
             }
         }
 
-        let request = common_headers(builder).build().map_err(request_error)?;
+        let request = common_headers(builder, prepared.response_accept)
+            .build()
+            .map_err(request_error)?;
         self.validate_request(&request)?;
         let response = self
             .inner
@@ -431,11 +473,11 @@ fn provider_http_client() -> Result<Client, AppError> {
         .map_err(transport_error)
 }
 
-fn common_headers(request: RequestBuilder) -> RequestBuilder {
+fn common_headers(request: RequestBuilder, response_accept: ResponseAccept) -> RequestBuilder {
     request
         .header(DEVICE_TYPE, "ANDROID")
         .header(REQUEST_ID, Uuid::new_v4().to_string())
-        .header(ACCEPT, "application/json")
+        .header(ACCEPT, response_accept.as_header_value())
 }
 
 fn retry_compatibility_header(

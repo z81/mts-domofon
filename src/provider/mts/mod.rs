@@ -5,11 +5,12 @@ mod dashboard;
 pub mod device;
 pub mod dto;
 pub mod intercom;
+pub mod media;
 pub mod sso;
 
 pub use auth_api::{KeycloakRotation, MtsAuthApi, ProviderAuthApi};
 pub use bootstrap::{AuthType, BootstrapConfig, BootstrapProvider, ProviderBootstrap};
-pub use client::{MtsClient, NoTokens, PreparedRequest, ProviderBase, TokenSource};
+pub use client::{MtsClient, NoTokens, PreparedRequest, ProviderBase, ResponseAccept, TokenSource};
 pub use dashboard::{
     AvailabilitySnapshot, MtsDashboardProvider, PropertyProvider, ServiceSnapshot,
 };
