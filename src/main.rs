@@ -79,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::with_dependencies(secret_store, auth_coordinator, mts_client)
         .with_legacy_sms_auth(legacy_sms_auth)
         .with_call_service(call_service);
+    let live_sessions = state.live_session_manager().cloned();
 
     let listener = TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "server listening");
@@ -100,6 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     cancellation.cancel();
+    if let Some(manager) = live_sessions {
+        manager.stop_all().await;
+    }
     if tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, &mut supervisor_task)
         .await
         .is_err()
