@@ -96,6 +96,8 @@ function deferred<T>() {
 
 function createApi(overrides: Partial<IntercomApi> = {}): IntercomApi {
   return {
+    createDoorIntent: async () => ({ intentId: 'intent-1', expiresAt: '2026-08-06T12:00:30Z' }),
+    executeDoorIntent: async () => undefined,
     getDashboard: async () => dashboard,
     getDevices: async () => inventory,
     getSnapshot: async () => new Blob(['snapshot'], { type: 'image/webp' }),
@@ -150,7 +152,7 @@ describe('live intercom dashboard', () => {
     expect(await screen.findByText('Подъезд 1')).toBeVisible()
     expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у подъезда' })).toHaveAttribute('src', 'blob:snapshot-1')
     expect(screen.getByText('Москва, ул. Примерная, 7')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Открытие Подъезд 1 пока недоступно' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Открыть Подъезд 1' })).toBeEnabled()
     expect(document.body).not.toHaveTextContent(/preview|демо|синтетическ/i)
     expect(screen.queryByText('Поддержка')).not.toBeInTheDocument()
     expect(screen.queryByText('Документы')).not.toBeInTheDocument()
@@ -169,6 +171,29 @@ describe('live intercom dashboard', () => {
 
     expect(await screen.findByRole('dialog', { name: 'Вход в VDome' })).toBeVisible()
     expect(screen.getByText('Локальное подключение')).toBeVisible()
+  })
+
+  it('reloads devices after authentication even when the selected flat id stays the same', async () => {
+    const user = userEvent.setup()
+    const getDevices = vi.fn<IntercomApi['getDevices']>()
+      .mockResolvedValueOnce(inventory)
+      .mockResolvedValueOnce({
+        ...inventory,
+        accessPoints: inventory.accessPoints.map((point) => ({ ...point, name: 'Обновлённый подъезд' })),
+      })
+    const authApi = anonymousAuthApi()
+    authApi.startAuth = async () => ({
+      status: 'authenticated',
+      session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T11:00:00Z', expires_at: null },
+    })
+    render(<App api={createApi({ getDevices })} authApi={authApi} />)
+    expect(await screen.findByText('Подъезд 1')).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
+
+    expect(await screen.findByText('Обновлённый подъезд')).toBeVisible()
+    expect(getDevices).toHaveBeenCalledTimes(2)
   })
 
   it('shows an empty account without requesting devices', async () => {
@@ -260,7 +285,87 @@ describe('live intercom dashboard', () => {
     expect(getSnapshot).not.toHaveBeenCalled()
   })
 
-  it('does not invent incoming calls, events, or successful door commands', async () => {
+  it('requires lock selection, creates an intent, and executes only after explicit confirmation', async () => {
+    const user = userEvent.setup()
+    const createDoorIntent = vi.fn<IntercomApi['createDoorIntent']>(async () => ({ intentId: 'intent / 1', expiresAt: '2026-08-06T12:00:30Z' }))
+    const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>(async () => undefined)
+    const multipleLocks: DeviceInventory = {
+      ...inventory,
+      accessPoints: inventory.accessPoints.map((point) => ({
+        ...point,
+        locks: [
+          { number: '1', name: 'Основная дверь', permanentlyOpen: false },
+          { number: '2', name: 'Вторая дверь', permanentlyOpen: false },
+        ],
+      })),
+    }
+    render(<App api={createApi({ createDoorIntent, executeDoorIntent, getDevices: async () => multipleLocks })} />)
+    const lockSelect = await screen.findByRole('combobox', { name: 'Замок Подъезд 1' })
+    const prepare = screen.getByRole('button', { name: 'Открыть Подъезд 1' })
+    expect(prepare).toBeDisabled()
+
+    await user.selectOptions(lockSelect, '2')
+    await user.click(prepare)
+
+    expect(createDoorIntent).toHaveBeenCalledWith('flat-81', 'entrance-1', '2')
+    expect(executeDoorIntent).not.toHaveBeenCalled()
+    const dialog = await screen.findByRole('dialog', { name: 'Открыть дверь?' })
+    expect(within(dialog).getByText('Квартира 81')).toBeVisible()
+    expect(within(dialog).getByText('Подъезд 1')).toBeVisible()
+    expect(within(dialog).getByText('Вторая дверь')).toBeVisible()
+    expect(within(dialog).getByText(/Действует до/)).toBeVisible()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Подтвердить открытие' }))
+
+    expect(executeDoorIntent).toHaveBeenCalledWith('intent / 1')
+    expect(await screen.findByRole('status')).toHaveTextContent('Подъезд 1 открыт')
+    expect(screen.queryByRole('dialog', { name: 'Открыть дверь?' })).not.toBeInTheDocument()
+  })
+
+  it('cancels a prepared door intent without executing it', async () => {
+    const user = userEvent.setup()
+    const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>()
+    render(<App api={createApi({ executeDoorIntent })} />)
+    await user.click(await screen.findByRole('button', { name: 'Открыть Подъезд 1' }))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Открыть дверь?' })
+    await user.click(within(dialog).getByRole('button', { name: 'Отмена' }))
+
+    expect(executeDoorIntent).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog', { name: 'Открыть дверь?' })).not.toBeInTheDocument()
+  })
+
+  it('dispatches only one execute request when confirmation is double-clicked', async () => {
+    const user = userEvent.setup()
+    const pending = deferred<void>()
+    const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>(() => pending.promise)
+    render(<App api={createApi({ executeDoorIntent })} />)
+    await user.click(await screen.findByRole('button', { name: 'Открыть Подъезд 1' }))
+    const confirm = within(await screen.findByRole('dialog', { name: 'Открыть дверь?' })).getByRole('button', { name: 'Подтвердить открытие' })
+
+    await user.dblClick(confirm)
+    expect(executeDoorIntent).toHaveBeenCalledTimes(1)
+    expect(confirm).toBeDisabled()
+
+    await act(async () => pending.resolve())
+    expect(await screen.findByRole('status')).toHaveTextContent('Подъезд 1 открыт')
+  })
+
+  it('shows a stable expired-intent message and never reports success', async () => {
+    const user = userEvent.setup()
+    const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>(async () => {
+      throw new IntercomApiError(404, 'door_open_intent_not_found')
+    })
+    render(<App api={createApi({ executeDoorIntent })} />)
+    await user.click(await screen.findByRole('button', { name: 'Открыть Подъезд 1' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Открыть дверь?' })).getByRole('button', { name: 'Подтвердить открытие' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Подтверждение истекло или уже использовано')
+    expect(screen.queryByText(/открыт$/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: 'Открыть дверь?' })).not.toBeInTheDocument()
+  })
+
+  it('does not invent incoming calls or events', async () => {
     const user = userEvent.setup()
     render(<App api={createApi()} />)
     expect(await screen.findByText('Подъезд 1')).toBeVisible()

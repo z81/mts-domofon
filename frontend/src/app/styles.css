@@ -244,6 +244,16 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(37, 108, 82, .35
 .device-summary i { width: 7px; height: 7px; border-radius: 50%; background: #b7beb9; }
 .device-summary i.online { background: #68c798; box-shadow: 0 0 0 4px rgba(104,199,152,.12); }
 .open-button:disabled, .open-button:disabled:hover { color: #8b938d; border-color: #e2e6e2; background: #f3f5f3; cursor: not-allowed; }
+.access-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.lock-select { min-height: 40px; max-width: 150px; padding: 0 30px 0 10px; color: #4f5c54; border: 1px solid #d8e1da; border-radius: 10px; background: #fff; font-size: 10px; font-weight: 700; }
+.door-dialog { max-width: 480px; }
+.door-summary { margin: 20px 0 0; display: grid; gap: 1px; overflow: hidden; border: 1px solid #e2e8e3; border-radius: 12px; background: #e2e8e3; }
+.door-summary div { padding: 12px 13px; display: grid; grid-template-columns: 100px minmax(0,1fr); align-items: center; gap: 12px; background: #f9fbf9; }
+.door-summary dt { color: #7d8780; font-size: 10px; font-weight: 700; }
+.door-summary dd { min-width: 0; margin: 0; display: grid; gap: 2px; color: #303732; font-size: 11px; overflow-wrap: anywhere; }
+.door-summary dd small { color: #818a84; font-size: 9px; }
+.door-expiry { margin-top: 13px !important; color: #5e6e64 !important; font-weight: 700; }
+.door-feedback.error { background: #7d3030; }
 .empty-copy { min-height: 86px; margin: 16px 0 0; display: grid; place-items: center; color: #858d87 !important; border: 1px dashed #dce3dd; border-radius: 13px; text-align: center; }
 .loading-card, .state-card { min-height: min(520px, calc(100vh - 190px)); padding: 42px 24px; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #69736c; border: 1px solid rgba(215,222,215,.9); border-radius: 20px; background: #fff; box-shadow: 0 12px 32px rgba(40,58,47,.055); text-align: center; }
 .loading-card p { margin: 18px 0 0; font-size: 13px; font-weight: 700; }
@@ -279,4 +289,8 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(37, 108, 82, .35
   .device-summary { width: 44px; padding: 0; justify-content: center; font-size: 0; }
   .camera-snapshot, .camera-snapshot img, .camera-placeholder { min-height: 312px; }
   .loading-card, .state-card { min-height: calc(100vh - 170px); }
+  .access-actions { grid-column: 1 / -1; width: 100%; }
+  .access-actions .lock-select { max-width: none; flex: 1; }
+  .access-actions .open-button { width: auto; min-width: 110px; margin-bottom: 0; }
+  .door-summary div { grid-template-columns: 82px minmax(0,1fr); }
 }

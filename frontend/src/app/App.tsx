@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { AuthPage } from '../features/auth/AuthPage'
 import type { AuthApi } from '../features/auth/authApi'
 import {
@@ -9,8 +9,10 @@ import {
   type DeviceInventory,
   type Flat,
   type IntercomApi,
+  type Lock,
   type PropertyDashboard,
 } from '../features/intercom/intercomApi'
+import { Modal } from './Modal'
 
 type Page = 'home' | 'access' | 'cameras' | 'calls' | 'events'
 
@@ -29,6 +31,17 @@ interface AppProps {
   api?: IntercomApi
   authApi?: AuthApi
 }
+
+interface PreparedDoorIntent {
+  intentId: string
+  expiresAt: string
+  flatLabel: string
+  flatAddress: string
+  accessPointName: string
+  lockName: string
+}
+
+type DoorFeedback = { kind: 'success' | 'error'; message: string }
 
 const navigation: ReadonlyArray<{ page: Page; label: string; glyph: string }> = [
   { page: 'home', label: 'Главная', glyph: '⌂' },
@@ -61,6 +74,16 @@ function preferredFlat(dashboard: PropertyDashboard): string | null {
   return dashboard.flats[0]?.id ?? null
 }
 
+function formatDoorExpiry(value: string): string {
+  const expiresAt = new Date(value)
+  if (Number.isNaN(expiresAt.getTime())) return 'в течение короткого времени'
+  return new Intl.DateTimeFormat('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(expiresAt)
+}
+
 function StateCard({ eyebrow, title, children, action }: {
   eyebrow: string
   title: string
@@ -76,26 +99,51 @@ function StateCard({ eyebrow, title, children, action }: {
   </section>
 }
 
-function AccessList({ accessPoints }: { accessPoints: readonly AccessPoint[] }) {
+function AccessList({ accessPoints, interactionLocked, preparingAccessPointId, onPrepare }: {
+  accessPoints: readonly AccessPoint[]
+  interactionLocked: boolean
+  preparingAccessPointId: string | null
+  onPrepare: (point: AccessPoint, lock: Lock) => void
+}) {
+  const [selectedLocks, setSelectedLocks] = useState<Record<string, string>>({})
+
   if (accessPoints.length === 0) {
     return <p className="empty-copy">Точек доступа для этого объекта нет</p>
   }
 
   return <div className="access-list">
-    {accessPoints.map((point) => <div className="access-item" key={point.id}>
-      <span className="access-icon"><Glyph>{point.kind === 'barrier' ? '↔' : '⌑'}</Glyph></span>
-      <span className="access-copy">
-        <b>{point.name}</b>
-        <small><i className={point.available ? 'online' : ''} />{point.available ? 'Доступно' : 'Недоступно'} · {accessKindLabels[point.kind] ?? 'Точка входа'}</small>
-      </span>
-      <button
-        aria-label={`Открытие ${point.name} пока недоступно`}
-        className="open-button"
-        disabled
-        title="Команда открытия ещё не подключена"
-        type="button"
-      >Открытие скоро</button>
-    </div>)}
+    {accessPoints.map((point) => {
+      const selectedNumber = point.locks.length === 1 ? point.locks[0]?.number : selectedLocks[point.id]
+      const selectedLock = point.locks.find((lock) => lock.number === selectedNumber)
+      const unavailable = !point.available || point.locks.length === 0
+      const preparing = preparingAccessPointId === point.id
+      return <div className="access-item" key={point.id}>
+        <span className="access-icon"><Glyph>{point.kind === 'barrier' ? '↔' : '⌑'}</Glyph></span>
+        <span className="access-copy">
+          <b>{point.name}</b>
+          <small><i className={point.available ? 'online' : ''} />{point.available ? 'Доступно' : 'Недоступно'} · {accessKindLabels[point.kind] ?? 'Точка входа'}</small>
+        </span>
+        <span className="access-actions">
+          {point.locks.length > 1 && <select
+            aria-label={`Замок ${point.name}`}
+            className="lock-select"
+            disabled={interactionLocked}
+            onChange={(event) => setSelectedLocks((current) => ({ ...current, [point.id]: event.target.value }))}
+            value={selectedLocks[point.id] ?? ''}
+          >
+            <option value="">Выберите замок</option>
+            {point.locks.map((lock) => <option value={lock.number} key={lock.number}>{lock.name}</option>)}
+          </select>}
+          <button
+            aria-label={unavailable ? `Открытие ${point.name} недоступно` : `Открыть ${point.name}`}
+            className="open-button"
+            disabled={interactionLocked || unavailable || !selectedLock}
+            onClick={() => selectedLock && onPrepare(point, selectedLock)}
+            type="button"
+          >{preparing ? 'Подготовка…' : unavailable ? 'Недоступно' : 'Открыть'}</button>
+        </span>
+      </div>
+    })}
   </div>
 }
 
@@ -197,6 +245,12 @@ function App({ api = intercomApi, authApi }: AppProps) {
   const [selectedFlatId, setSelectedFlatId] = useState<string | null>(null)
   const [devices, setDevices] = useState<DeviceRemote>({ status: 'idle' })
   const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null)
+  const [preparingAccessPointId, setPreparingAccessPointId] = useState<string | null>(null)
+  const [doorIntent, setDoorIntent] = useState<PreparedDoorIntent | null>(null)
+  const [doorExecuting, setDoorExecuting] = useState(false)
+  const [doorFeedback, setDoorFeedback] = useState<DoorFeedback | null>(null)
+  const doorPreparationInFlight = useRef(false)
+  const doorExecutionInFlight = useRef(false)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -207,6 +261,7 @@ function App({ api = intercomApi, authApi }: AppProps) {
       setSelectedFlatId(flatId)
       setSelectedCameraId(null)
       setDevices(flatId ? { status: 'loading', flatId } : { status: 'idle' })
+      setDeviceReload((value) => value + 1)
     }).catch((error: unknown) => {
       if (!controller.signal.aborted) setDashboard({ status: 'error', error })
     })
@@ -235,6 +290,7 @@ function App({ api = intercomApi, authApi }: AppProps) {
 
   const inventory = devices.status === 'success' && devices.flatId === selectedFlatId ? devices.data : null
   const selectedCamera = inventory?.cameras.find((camera) => camera.id === selectedCameraId) ?? inventory?.cameras[0] ?? null
+  const doorInteractionLocked = preparingAccessPointId !== null || doorIntent !== null || doorExecuting
 
   function selectPage(next: Page) {
     setPage(next)
@@ -269,6 +325,59 @@ function App({ api = intercomApi, authApi }: AppProps) {
     setDeviceReload((value) => value + 1)
   }
 
+  async function prepareDoor(flat: Flat, point: AccessPoint, lock: Lock) {
+    if (doorPreparationInFlight.current || doorExecutionInFlight.current || doorIntent) return
+    doorPreparationInFlight.current = true
+    setPreparingAccessPointId(point.id)
+    setDoorFeedback(null)
+    try {
+      const intent = await api.createDoorIntent(flat.id, point.id, lock.number)
+      setDoorIntent({
+        intentId: intent.intentId,
+        expiresAt: intent.expiresAt,
+        flatLabel: flat.label,
+        flatAddress: flat.address,
+        accessPointName: point.name,
+        lockName: lock.name,
+      })
+    } catch {
+      setDoorFeedback({ kind: 'error', message: 'Не удалось подготовить открытие. Повторите попытку.' })
+    } finally {
+      doorPreparationInFlight.current = false
+      setPreparingAccessPointId(null)
+    }
+  }
+
+  const closeDoorIntent = useCallback(() => {
+    if (doorExecutionInFlight.current) return
+    setDoorIntent(null)
+  }, [])
+
+  async function executeDoor() {
+    if (!doorIntent || doorExecutionInFlight.current) return
+    const intent = doorIntent
+    doorExecutionInFlight.current = true
+    setDoorExecuting(true)
+    setDoorFeedback(null)
+    try {
+      await api.executeDoorIntent(intent.intentId)
+      setDoorIntent(null)
+      setDoorFeedback({ kind: 'success', message: `${intent.accessPointName} открыт` })
+    } catch (error) {
+      setDoorIntent(null)
+      if (error instanceof IntercomApiError && error.code === 'door_open_intent_not_found') {
+        setDoorFeedback({ kind: 'error', message: 'Подтверждение истекло или уже использовано. Подготовьте открытие заново.' })
+      } else if (error instanceof IntercomApiError && error.code === 'mutation_outcome_unknown') {
+        setDoorFeedback({ kind: 'error', message: 'Результат открытия неизвестен. Не повторяйте команду сразу — сначала проверьте дверь.' })
+      } else {
+        setDoorFeedback({ kind: 'error', message: 'Открытие не выполнено. Подготовьте новую команду и попробуйте снова.' })
+      }
+    } finally {
+      doorExecutionInFlight.current = false
+      setDoorExecuting(false)
+    }
+  }
+
   function renderDeviceContent() {
     if (!selectedFlat) return null
     if (devices.status === 'idle' || devices.status === 'loading' || devices.flatId !== selectedFlat.id) {
@@ -285,8 +394,8 @@ function App({ api = intercomApi, authApi }: AppProps) {
       return <>
         <section className="page-heading"><div><p className="eyebrow">{selectedFlat.address}</p><h1>Доступ</h1><p>Точки входа, найденные для выбранного объекта.</p></div></section>
         <section className="content-card">
-          <div className="section-title-row"><div><h2>Точки доступа</h2><p>Открытие двери появится после подключения защищённой команды.</p></div><span className="count-badge">{deviceInventory.accessPoints.length}</span></div>
-          <AccessList accessPoints={deviceInventory.accessPoints} />
+          <div className="section-title-row"><div><h2>Точки доступа</h2><p>Каждое открытие требует отдельного подтверждения.</p></div><span className="count-badge">{deviceInventory.accessPoints.length}</span></div>
+          <AccessList accessPoints={deviceInventory.accessPoints} interactionLocked={doorInteractionLocked} preparingAccessPointId={preparingAccessPointId} onPrepare={(point, lock) => void prepareDoor(selectedFlat, point, lock)} />
         </section>
       </>
     }
@@ -321,7 +430,7 @@ function App({ api = intercomApi, authApi }: AppProps) {
         <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} />
         <aside className="quick-panel">
           <div className="section-title-row"><div><p className="eyebrow">Выбранный объект</p><h2>Точки входа</h2></div><span className="count-badge">{deviceInventory.accessPoints.length}</span></div>
-          <AccessList accessPoints={deviceInventory.accessPoints} />
+          <AccessList accessPoints={deviceInventory.accessPoints} interactionLocked={doorInteractionLocked} preparingAccessPointId={preparingAccessPointId} onPrepare={(point, lock) => void prepareDoor(selectedFlat, point, lock)} />
         </aside>
       </section>
       <section className="lower-grid">
@@ -369,6 +478,23 @@ function App({ api = intercomApi, authApi }: AppProps) {
     </div>
     <nav className="mobile-nav" aria-label="Мобильная навигация">{navigation.slice(0, 4).map((item) => <button className={page === item.page ? 'active' : ''} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span></button>)}</nav>
     {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} />}
+    {doorIntent && <Modal className="door-dialog" labelledBy="door-confirm-title" onClose={closeDoorIntent} closeOnBackdrop>
+      <button aria-label="Закрыть" className="dialog-close" disabled={doorExecuting} onClick={closeDoorIntent} type="button">×</button>
+      <span className="dialog-icon"><Glyph>⌑</Glyph></span>
+      <h2 id="door-confirm-title">Открыть дверь?</h2>
+      <p>Проверьте объект и замок. Следующее нажатие отправит физическую команду домофону.</p>
+      <dl className="door-summary">
+        <div><dt>Объект</dt><dd><b>{doorIntent.flatLabel}</b><small>{doorIntent.flatAddress}</small></dd></div>
+        <div><dt>Точка входа</dt><dd>{doorIntent.accessPointName}</dd></div>
+        <div><dt>Замок</dt><dd>{doorIntent.lockName}</dd></div>
+      </dl>
+      <p className="door-expiry">Действует до {formatDoorExpiry(doorIntent.expiresAt)}</p>
+      <div className="dialog-actions">
+        <button className="secondary-button" data-dialog-initial disabled={doorExecuting} onClick={closeDoorIntent} type="button">Отмена</button>
+        <button className="primary-button danger" disabled={doorExecuting} onClick={() => void executeDoor()} type="button">{doorExecuting ? 'Открываем…' : 'Подтвердить открытие'}</button>
+      </div>
+    </Modal>}
+    {doorFeedback && <div className={`toast door-feedback ${doorFeedback.kind}`} role={doorFeedback.kind === 'success' ? 'status' : 'alert'}><span>{doorFeedback.kind === 'success' ? '✓' : '!'}</span>{doorFeedback.message}</div>}
   </div>
 }
 

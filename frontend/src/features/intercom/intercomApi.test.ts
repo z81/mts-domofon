@@ -95,4 +95,31 @@ describe('production intercom API boundary', () => {
       status: 502,
     })
   })
+
+  it('creates a door intent without executing the physical command', async () => {
+    const intent = { intentId: 'intent / 1', expiresAt: '2026-08-06T12:00:30Z' }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(intent, 201))
+    const api = createProductionIntercomApi(fetcher)
+
+    await expect(api.createDoorIntent('flat / 81', 'entry & 1', 'lock/2')).resolves.toEqual(intent)
+    expect(fetcher).toHaveBeenCalledWith('/api/v1/access/intents', {
+      body: JSON.stringify({ flatId: 'flat / 81', accessPointId: 'entry & 1', lockNumber: 'lock/2' }),
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal: undefined,
+    })
+  })
+
+  it('executes an encoded door intent with an explicitly empty request body', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(null, { status: 204 }))
+    const api = createProductionIntercomApi(fetcher)
+
+    await expect(api.executeDoorIntent('intent / 1')).resolves.toBeUndefined()
+    expect(fetcher).toHaveBeenCalledWith('/api/v1/access/intents/intent%20%2F%201/execute', {
+      credentials: 'same-origin',
+      method: 'POST',
+      signal: undefined,
+    })
+  })
 })

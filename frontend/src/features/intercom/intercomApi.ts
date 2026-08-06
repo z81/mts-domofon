@@ -61,10 +61,17 @@ export interface DeviceInventory {
   cameras: Camera[]
 }
 
+export interface DoorIntent {
+  intentId: string
+  expiresAt: string
+}
+
 export interface IntercomApi {
   getDashboard(signal?: AbortSignal): Promise<PropertyDashboard>
   getDevices(flatId: string, signal?: AbortSignal): Promise<DeviceInventory>
   getSnapshot(flatId: string, cameraId: string, signal?: AbortSignal): Promise<Blob>
+  createDoorIntent(flatId: string, accessPointId: string, lockNumber: string, signal?: AbortSignal): Promise<DoorIntent>
+  executeDoorIntent(intentId: string, signal?: AbortSignal): Promise<void>
 }
 
 interface ErrorBody {
@@ -130,6 +137,22 @@ export function createProductionIntercomApi(fetcher: typeof fetch = fetch): Inte
       const blob = await response.blob()
       if (blob.size === 0) throw new IntercomApiError(502, 'invalid_snapshot_response')
       return blob
+    },
+    createDoorIntent: async (flatId, accessPointId, lockNumber, signal) => readJson<DoorIntent>(await fetcher('/api/v1/access/intents', {
+      body: JSON.stringify({ flatId, accessPointId, lockNumber }),
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    })),
+    executeDoorIntent: async (intentId, signal) => {
+      const response = await fetcher(`/api/v1/access/intents/${encodeURIComponent(intentId)}/execute`, {
+        credentials: 'same-origin',
+        method: 'POST',
+        signal,
+      })
+      if (!response.ok) throw await errorFrom(response)
+      if (response.status !== 204) throw new IntercomApiError(502, 'invalid_local_response')
     },
   }
 }
