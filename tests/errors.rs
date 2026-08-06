@@ -7,12 +7,13 @@ use axum::{
     Router,
     body::Body,
     extract::Extension,
-    http::{Request, StatusCode, header::HeaderValue},
+    http::{Request, StatusCode, Uri, header, header::HeaderValue},
     response::IntoResponse,
     routing::get,
 };
 use domru_mts::{
     app,
+    app::RedactedUri,
     error::{ApiError, AppError},
     request_id::{self, RequestId},
 };
@@ -89,6 +90,92 @@ fn error_logging_redacts_the_cause_and_upstream_request_id() {
     assert!(!formatted.contains("mts-42"));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn request_tracing_redacts_sensitive_query_values() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(BufferWriter(Arc::clone(&output)))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    let uri = concat!(
+        "/health/live?camera=front-door",
+        "&token=token-secret",
+        "&access_token=access-secret",
+        "&key=key-secret",
+        "&signature=signature-secret",
+        "&sig=sig-secret",
+        "&expires=expires-secret",
+        "&media_token=media-token-secret",
+        "&media_key=media-key-secret",
+        "&media_lease=media-lease-secret",
+        "&quality=hd"
+    );
+
+    let response = app::test_router()
+        .await
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let formatted = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(formatted.contains("/health/live"));
+    assert!(formatted.contains("camera=front-door"));
+    assert!(formatted.contains("quality=hd"));
+    for key in [
+        "token",
+        "access_token",
+        "key",
+        "signature",
+        "sig",
+        "expires",
+        "media_token",
+        "media_key",
+        "media_lease",
+    ] {
+        assert!(
+            formatted.contains(&format!("{key}=%5BREDACTED%5D")),
+            "trace omitted the redacted {key} field"
+        );
+    }
+    for secret in [
+        "token-secret",
+        "access-secret",
+        "key-secret",
+        "signature-secret",
+        "sig-secret",
+        "expires-secret",
+        "media-token-secret",
+        "media-key-secret",
+        "media-lease-secret",
+    ] {
+        assert!(!formatted.contains(secret), "trace exposed {secret}");
+    }
+}
+
+#[tokio::test]
+async fn handler_receives_original_uri_and_redacted_uri_extension() {
+    async fn handler(uri: Uri, Extension(redacted_uri): Extension<RedactedUri>) -> String {
+        format!("{uri}\n{redacted_uri}")
+    }
+
+    let app = app::with_http_middleware(Router::new().route("/media/live", get(handler)));
+    let original = "/media/live?token=token-secret&camera=front-door";
+    let response = app
+        .oneshot(Request::get(original).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body[..],
+        b"/media/live?token=token-secret&camera=front-door\n/media/live?token=%5BREDACTED%5D&camera=front-door"
+    );
+}
+
 #[tokio::test]
 async fn valid_request_id_is_retained_in_the_response() {
     let app = app::test_router().await;
@@ -163,6 +250,8 @@ async fn sensitive_headers_remain_sensitive_at_the_handler_boundary() {
             "set-cookie",
             "x-device-token",
             "x-media-token",
+            "x-media-key",
+            "x-media-lease",
         ] {
             assert!(request.headers()[name].is_sensitive(), "{name} was exposed");
         }
@@ -186,6 +275,11 @@ async fn sensitive_headers_remain_sensitive_at_the_handler_boundary() {
                 )
                 .header("x-device-token", HeaderValue::from_static("device-secret"))
                 .header("x-media-token", HeaderValue::from_static("media-secret"))
+                .header("x-media-key", HeaderValue::from_static("media-key-secret"))
+                .header(
+                    "x-media-lease",
+                    HeaderValue::from_static("media-lease-secret"),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -193,4 +287,27 @@ async fn sensitive_headers_remain_sensitive_at_the_handler_boundary() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn set_cookie_response_header_is_marked_sensitive() {
+    async fn handler() -> axum::response::Response {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("session=secret-cookie"),
+        );
+        response
+    }
+
+    let app = Router::new()
+        .route("/cookie", get(handler))
+        .layer(app::sensitive_headers_layer());
+    let response = app
+        .oneshot(Request::get("/cookie").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(response.headers()[header::SET_COOKIE].is_sensitive());
 }

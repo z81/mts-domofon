@@ -1,7 +1,104 @@
-use axum::{Router, http::header};
-use tower_http::sensitive_headers::SetSensitiveHeadersLayer;
+use std::fmt;
 
-use crate::{api, request_id, state::AppState};
+use axum::{
+    Router,
+    extract::Request,
+    http::{Uri, header},
+    middleware::{self, Next},
+    response::Response,
+};
+use tower_http::{
+    sensitive_headers::SetSensitiveHeadersLayer,
+    trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
+};
+use tracing::{Level, Span};
+
+use crate::{
+    api,
+    request_id::{self, RequestId},
+    state::AppState,
+};
+
+const SENSITIVE_QUERY_KEYS: &[&str] = &[
+    "token",
+    "access_token",
+    "idt_token",
+    "web_sso_access_token",
+    "device_token",
+    "key",
+    "signature",
+    "sig",
+    "expires",
+    "media_token",
+    "media_key",
+    "media_lease",
+    "media_credential",
+    "stream_token",
+    "playback_token",
+    "x-media-token",
+    "x-media-key",
+    "x-media-lease",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedactedUri(String);
+
+impl RedactedUri {
+    fn from_uri(uri: &Uri) -> Self {
+        let mut output = uri.path().to_owned();
+        if let Some(query) = uri.query() {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                if is_sensitive_query_key(&key) {
+                    serializer.append_pair(&key, "[REDACTED]");
+                } else {
+                    serializer.append_pair(&key, &value);
+                }
+            }
+            output.push('?');
+            output.push_str(&serializer.finish());
+        }
+        Self(output)
+    }
+}
+
+impl fmt::Display for RedactedUri {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+fn is_sensitive_query_key(key: &str) -> bool {
+    SENSITIVE_QUERY_KEYS
+        .iter()
+        .any(|candidate| key.eq_ignore_ascii_case(candidate))
+}
+
+async fn attach_redacted_uri(mut request: Request, next: Next) -> Response {
+    let redacted_uri = RedactedUri::from_uri(request.uri());
+    request.extensions_mut().insert(redacted_uri);
+    next.run(request).await
+}
+
+fn make_request_span(request: &Request) -> Span {
+    let redacted_uri = request
+        .extensions()
+        .get::<RedactedUri>()
+        .cloned()
+        .unwrap_or_else(|| RedactedUri::from_uri(request.uri()));
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "[missing]".into());
+
+    tracing::info_span!(
+        "http_request",
+        method = %request.method(),
+        uri = %redacted_uri,
+        request_id = %request_id,
+    )
+}
 
 pub fn sensitive_headers_layer() -> SetSensitiveHeadersLayer {
     SetSensitiveHeadersLayer::new([
@@ -15,11 +112,21 @@ pub fn sensitive_headers_layer() -> SetSensitiveHeadersLayer {
     ])
 }
 
-pub fn build_router(state: AppState) -> Router {
-    api::router()
-        .with_state(state)
+pub fn with_http_middleware(router: Router) -> Router {
+    router
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(make_request_span)
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(middleware::from_fn(attach_redacted_uri))
         .layer(sensitive_headers_layer())
         .layer(request_id::layer())
+}
+
+pub fn build_router(state: AppState) -> Router {
+    with_http_middleware(api::router().with_state(state))
 }
 
 pub async fn test_router() -> Router {
