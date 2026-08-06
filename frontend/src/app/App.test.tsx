@@ -56,6 +56,8 @@ describe('core intercom shell', () => {
 
     await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
     await user.click(screen.getByRole('button', { name: 'Принять вызов' }))
+    expect(screen.getByRole('dialog', { name: 'Принять вызов?' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Подтвердить приём вызова' }))
     await user.click(screen.getByRole('button', { name: 'Открыть дверь во время звонка' }))
 
     expect(screen.getByRole('dialog', { name: 'Открыть дверь во время звонка?' })).toBeVisible()
@@ -67,9 +69,67 @@ describe('core intercom shell', () => {
 
     await user.click(screen.getByRole('button', { name: 'Настройки звонков' }))
     await user.click(screen.getByRole('button', { name: 'Запросить уведомления браузера' }))
+    expect(screen.getByRole('dialog', { name: 'Запросить уведомления браузера?' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Подтвердить запрос уведомлений' }))
     await user.click(screen.getByRole('button', { name: 'Заблокировать номер +7 999 111-22-33' }))
 
     expect(screen.getByText('Запрос уведомлений доступен только в браузере')).toBeVisible()
     expect(screen.getByRole('dialog', { name: 'Заблокировать номер?' })).toBeVisible()
+  })
+
+  it.each(['Игнорировать', 'Отклонить'])('confirms the %s call command before changing call state', async (command) => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
+    await user.click(screen.getByRole('button', { name: command }))
+
+    expect(screen.getByRole('dialog', { name: `${command} вызов?` })).toBeVisible()
+    expect(screen.getByText('Кто-то звонит в вашу квартиру')).toBeVisible()
+  })
+
+  it('confirms active-call media, output and hangup commands', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
+    await user.click(screen.getByRole('button', { name: 'Принять вызов' }))
+    await user.click(screen.getByRole('button', { name: 'Подтвердить приём вызова' }))
+
+    for (const [button, dialog] of [
+      ['Микрофон', 'Изменить микрофон?'],
+      ['Камера', 'Изменить камеру?'],
+      ['Звук', 'Изменить звук?'],
+      ['Аудиовыход', 'Изменить аудиовыход?'],
+    ] as const) {
+      await user.click(screen.getByRole('button', { name: button }))
+      expect(screen.getByRole('dialog', { name: dialog })).toBeVisible()
+      await user.click(screen.getByRole('button', { name: 'Отмена' }))
+    }
+
+    await user.click(screen.getByRole('button', { name: 'Завершить звонок' }))
+    expect(screen.getByRole('dialog', { name: 'Завершить звонок?' })).toBeVisible()
+  })
+
+  it('traps dialog focus, closes on Escape and restores focus to its trigger', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const trigger = screen.getByRole('button', { name: 'Открыть Подъезд' })
+
+    await user.click(trigger)
+    expect(screen.getByRole('button', { name: 'Отмена' })).toHaveFocus()
+    await user.keyboard('{Escape}')
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+  })
+
+  it('uses menuitem semantics for linked-flat options', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /Текущий объект/ }))
+
+    expect(screen.getAllByRole('menuitem')).toHaveLength(2)
   })
 })
