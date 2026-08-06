@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use domru_mts::{
     error::ErrorCode,
-    provider::mts::{
-        AuthType, BootstrapProvider, MtsClient, NoTokens, ProviderBase,
-    },
+    provider::mts::{AuthType, BootstrapProvider, MtsClient, NoTokens, ProviderBase},
 };
 use reqwest::Method;
 use url::Url;
@@ -27,7 +25,11 @@ fn client(server: &MockServer) -> MtsClient {
     )
 }
 
-async fn mount_bootstrap(server: &MockServer, config: impl Into<String>, features: impl Into<String>) {
+async fn mount_bootstrap(
+    server: &MockServer,
+    config: impl Into<String>,
+    features: impl Into<String>,
+) {
     Mock::given(method("GET"))
         .and(path("/config"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(config.into(), "application/json"))
@@ -45,11 +47,20 @@ async fn maps_direct_nullable_bootstrap_arrays_and_preserves_unknown_names() {
     let server = MockServer::start().await;
     mount_bootstrap(&server, CONFIG_FIXTURE, FEATURES_FIXTURE).await;
 
-    let bootstrap = BootstrapProvider::new(client(&server)).fetch().await.unwrap();
+    let bootstrap = BootstrapProvider::new(client(&server))
+        .fetch()
+        .await
+        .unwrap();
 
     assert_eq!(bootstrap.auth_type, AuthType::WebSso);
-    assert_eq!(bootstrap.android_config.as_ref().unwrap().config_name, "ANDROID_APP_VERSION");
-    assert_eq!(bootstrap.android_config.as_ref().unwrap().platform, "ANDROID");
+    assert_eq!(
+        bootstrap.android_config.as_ref().unwrap().config_name,
+        "ANDROID_APP_VERSION"
+    );
+    assert_eq!(
+        bootstrap.android_config.as_ref().unwrap().platform,
+        "ANDROID"
+    );
     assert_eq!(bootstrap.android_config.as_ref().unwrap().value, "3.0.1");
     assert_eq!(bootstrap.unknown_config_names, ["WEB_DIAGNOSTIC"]);
     assert_eq!(bootstrap.unknown_feature_names, ["FUTURE_CAPABILITY"]);
@@ -107,7 +118,10 @@ async fn duplicate_config_or_feature_names_are_schema_errors() {
         let server = MockServer::start().await;
         mount_bootstrap(&server, config, features).await;
 
-        let error = BootstrapProvider::new(client(&server)).fetch().await.unwrap_err();
+        let error = BootstrapProvider::new(client(&server))
+            .fetch()
+            .await
+            .unwrap_err();
         assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
     }
 }
@@ -123,7 +137,10 @@ async fn missing_or_legacy_auth_type_is_an_explicit_compatibility_error() {
         let server = MockServer::start().await;
         mount_bootstrap(&server, "null", features).await;
 
-        let error = BootstrapProvider::new(client(&server)).fetch().await.unwrap_err();
+        let error = BootstrapProvider::new(client(&server))
+            .fetch()
+            .await
+            .unwrap_err();
         assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
         assert!(!error.retryable);
         assert!(!format!("{error:?}").contains("SMS"));
@@ -139,13 +156,38 @@ async fn bootstrap_rejects_oversized_or_drifted_responses() {
     for config in [
         oversized,
         r#"[{"configName":"ANDROID_APP_VERSION","value":"3.0.1"}]"#.into(),
+        r#"[{"configName":"https://provider.invalid/?token=secret","platform":"ANDROID","value":"3.0.1"}]"#.into(),
     ] {
         let server = MockServer::start().await;
         mount_bootstrap(&server, config, FEATURES_FIXTURE).await;
 
-        let error = BootstrapProvider::new(client(&server)).fetch().await.unwrap_err();
+        let error = BootstrapProvider::new(client(&server))
+            .fetch()
+            .await
+            .unwrap_err();
         assert_eq!(error.code, ErrorCode::UpstreamSchemaChanged);
     }
+}
+
+#[tokio::test]
+async fn bootstrap_debug_output_redacts_provider_values() {
+    let server = MockServer::start().await;
+    mount_bootstrap(
+        &server,
+        r#"[{"configName":"ANDROID_UPDATE","platform":"ANDROID","value":"https://provider.invalid/update?token=secret"}]"#,
+        FEATURES_FIXTURE,
+    )
+    .await;
+
+    let bootstrap = BootstrapProvider::new(client(&server))
+        .fetch()
+        .await
+        .unwrap();
+    let formatted = format!("{bootstrap:?}");
+
+    assert!(formatted.contains("[REDACTED]"));
+    assert!(!formatted.contains("provider.invalid"));
+    assert!(!formatted.contains("secret"));
 }
 
 #[test]
@@ -160,16 +202,25 @@ fn endpoint_selects_the_base_and_rejects_unsafe_paths() {
     );
 
     assert_eq!(
-        client.endpoint(ProviderBase::Gateway, "/config").unwrap().as_str(),
+        client
+            .endpoint(ProviderBase::Gateway, "/config")
+            .unwrap()
+            .as_str(),
         "http://127.0.0.1:41001/config"
     );
     assert_eq!(
-        client.endpoint(ProviderBase::Resident, "/health").unwrap().as_str(),
+        client
+            .endpoint(ProviderBase::Resident, "/health")
+            .unwrap()
+            .as_str(),
         "http://127.0.0.1:41002/health"
     );
     for path in ["config", "/a/../config", "https://attacker.example/config"] {
         assert_eq!(
-            client.endpoint(ProviderBase::Gateway, path).unwrap_err().code,
+            client
+                .endpoint(ProviderBase::Gateway, path)
+                .unwrap_err()
+                .code,
             ErrorCode::InvalidRequest
         );
     }

@@ -216,7 +216,11 @@ async fn classifies_stable_http_errors_and_bounds_redacted_error_bodies() {
             .unwrap();
         let error = client.send_empty(request).await.unwrap_err();
         assert_eq!(error.code, code);
-        assert_eq!(error.upstream_request_id.as_deref(), Some(&format!("upstream-{name}")));
+        let expected_request_id = format!("upstream-{name}");
+        assert_eq!(
+            error.upstream_request_id.as_deref(),
+            Some(expected_request_id.as_str())
+        );
         let formatted = format!("{error:?}");
         assert!(!formatted.contains(&format!("secret-{name}")));
         assert!(formatted.len() < 1_000);
@@ -246,7 +250,10 @@ async fn rate_limit_carries_retry_after_and_provider_correlation() {
     assert_eq!(error.code, ErrorCode::RateLimited);
     assert!(error.retryable);
     assert_eq!(error.retry_after_seconds, Some(17));
-    assert_eq!(error.upstream_request_id.as_deref(), Some("provider-correlation"));
+    assert_eq!(
+        error.upstream_request_id.as_deref(),
+        Some("provider-correlation")
+    );
 }
 
 #[tokio::test]
