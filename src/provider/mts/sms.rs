@@ -41,6 +41,7 @@ struct SmsFlow {
     phone: SecretString,
     created_at: Instant,
     expires_at: Instant,
+    retry_not_before: Option<Instant>,
     attempts: u8,
     in_flight: bool,
 }
@@ -89,6 +90,7 @@ impl MtsLegacySmsAuth {
             ));
         }
         let http = Client::builder()
+            .retry(reqwest::retry::never())
             .redirect(Policy::none())
             .cookie_store(false)
             .timeout(Duration::from_secs(45))
@@ -113,7 +115,10 @@ impl MtsLegacySmsAuth {
                 .iter()
                 .find(|(_, flow)| secret_eq(&flow.phone, &phone))
             {
-                let retry_after = existing.created_at + RESEND_AFTER;
+                let retry_after = existing
+                    .retry_not_before
+                    .unwrap_or(existing.created_at + RESEND_AFTER)
+                    .max(existing.created_at + RESEND_AFTER);
                 if existing.in_flight || retry_after > now {
                     return Err(rate_limited(retry_after.saturating_duration_since(now)));
                 }
@@ -130,6 +135,7 @@ impl MtsLegacySmsAuth {
                     phone: phone.clone(),
                     created_at: now,
                     expires_at: now + FLOW_LIFETIME,
+                    retry_not_before: None,
                     attempts: 0,
                     in_flight: true,
                 },
@@ -141,6 +147,9 @@ impl MtsLegacySmsAuth {
         let mut flows = self.inner.flows.lock().map_err(|_| state_error())?;
         if let Some(flow) = flows.get_mut(&flow_id) {
             flow.in_flight = false;
+            if let Err(error) = &result {
+                keep_retry_after(flow, error);
+            }
         }
         result?;
         Ok(AuthProgress::Challenge {
@@ -163,10 +172,23 @@ impl MtsLegacySmsAuth {
             let Some(flow) = flows.get_mut(flow_id) else {
                 return Err(flow_error());
             };
-            if flow.expires_at <= now || flow.in_flight || flow.attempts >= MAX_OTP_ATTEMPTS {
+            if flow.expires_at <= now || flow.in_flight {
                 flows.remove(flow_id);
                 return Err(flow_error());
             }
+            if let Some(retry_not_before) = flow.retry_not_before {
+                if retry_not_before > now {
+                    return Err(rate_limited(
+                        retry_not_before.saturating_duration_since(now),
+                    ));
+                }
+                flow.retry_not_before = None;
+            }
+            if flow.attempts >= MAX_OTP_ATTEMPTS {
+                flows.remove(flow_id);
+                return Err(flow_error());
+            }
+            flow.attempts = flow.attempts.saturating_add(1);
             flow.in_flight = true;
             flow.phone.clone()
         };
@@ -179,14 +201,15 @@ impl MtsLegacySmsAuth {
                 Ok(tokens)
             }
             Err(error) => {
+                let mut remove_flow = false;
                 if let Some(flow) = flows.get_mut(flow_id) {
                     flow.in_flight = false;
-                    if error.code == ErrorCode::UpstreamAuthenticationFailed {
-                        flow.attempts = flow.attempts.saturating_add(1);
-                        if flow.attempts >= MAX_OTP_ATTEMPTS {
-                            flows.remove(flow_id);
-                        }
-                    }
+                    keep_retry_after(flow, &error);
+                    remove_flow =
+                        flow.attempts >= MAX_OTP_ATTEMPTS && error.code != ErrorCode::RateLimited;
+                }
+                if remove_flow {
+                    flows.remove(flow_id);
                 }
                 Err(error)
             }
@@ -354,7 +377,9 @@ async fn classify(response: Response) -> Result<Response, AppError> {
         StatusCode::TOO_MANY_REQUESTS => {
             rate_limited(Duration::from_secs(retry_after.unwrap_or(60)))
         }
-        status if status.is_client_error() => authentication_error(),
+        StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            authentication_error()
+        }
         _ => AppError::new(
             ErrorCode::UpstreamUnavailable,
             "MTS legacy authentication service is unavailable.",
@@ -425,8 +450,19 @@ fn rate_limited(after: Duration) -> AppError {
         "Legacy SMS authentication is rate limited.",
         false,
     );
-    error.retry_after_seconds = Some(after.as_secs().max(1));
+    let seconds = after
+        .as_secs()
+        .saturating_add(u64::from(after.subsec_nanos() != 0));
+    error.retry_after_seconds = Some(seconds.max(1));
     error
+}
+
+fn keep_retry_after(flow: &mut SmsFlow, error: &AppError) {
+    if error.code != ErrorCode::RateLimited {
+        return;
+    }
+    let delay = Duration::from_secs(error.retry_after_seconds.unwrap_or(60));
+    flow.retry_not_before = Instant::now().checked_add(delay).or(Some(flow.expires_at));
 }
 
 fn flow_error() -> AppError {

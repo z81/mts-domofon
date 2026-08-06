@@ -149,6 +149,58 @@ async fn json_response(response: axum::response::Response) -> (StatusCode, Value
     (status, serde_json::from_str(&raw).unwrap(), raw)
 }
 
+async fn mount_successful_init(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/user-service/api/v2/auth/init"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "result": {
+                "status": "SMS_SENT",
+                "canSkipSms": false,
+                "refreshToken": {"token": "init-secret", "expiredAt": 123, "timeZone": "Europe/Moscow"}
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn start_flow(fixture: &Fixture) -> String {
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(json_request(
+            "/api/v1/auth/legacy-sms/start",
+            json!({"phone": PHONE, "accept_legacy_sms": true}),
+        ))
+        .await
+        .unwrap();
+    let (status, body, _) = json_response(response).await;
+    assert_eq!(status, StatusCode::OK);
+    body["flow_id"].as_str().unwrap().to_owned()
+}
+
+async fn confirm_flow(fixture: &Fixture, flow_id: &str) -> (StatusCode, Value, String) {
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(json_request(
+            &format!("/api/v1/auth/legacy-sms/flows/{flow_id}/confirm"),
+            json!({"code": OTP}),
+        ))
+        .await
+        .unwrap();
+    json_response(response).await
+}
+
+async fn request_count(server: &MockServer, request_path: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == request_path)
+        .count()
+}
+
 #[tokio::test]
 async fn legacy_sms_is_explicit_and_init_uses_the_exact_packaged_contract() {
     let server = MockServer::start().await;
@@ -271,4 +323,166 @@ async fn six_digit_confirmation_installs_legacy_tokens_without_fabricating_web_s
     );
     assert!(persisted.tokens.web_sso_access_token.is_none());
     assert_eq!(fixture.provider.web_sso_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn otp_dispatch_is_limited_to_three_attempts_even_when_upstream_is_unavailable() {
+    let server = MockServer::start().await;
+    mount_successful_init(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/user-service/api/v2/auth/login"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let fixture = fixture(&server).await;
+    let flow_id = start_flow(&fixture).await;
+
+    for _ in 0..3 {
+        let (status, body, _) = confirm_flow(&fixture, &flow_id).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "upstream_unavailable");
+    }
+    let (status, body, _) = confirm_flow(&fixture, &flow_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "auth_flow_not_found");
+    assert_eq!(
+        request_count(&server, "/user-service/api/v2/auth/login").await,
+        3
+    );
+}
+
+#[tokio::test]
+async fn otp_retry_after_is_kept_in_the_flow_and_blocks_an_immediate_repeat() {
+    let server = MockServer::start().await;
+    mount_successful_init(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/user-service/api/v2/auth/login"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "17"))
+        .mount(&server)
+        .await;
+    let fixture = fixture(&server).await;
+    let flow_id = start_flow(&fixture).await;
+
+    let (first_status, first_body, _) = confirm_flow(&fixture, &flow_id).await;
+    assert_eq!(first_status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first_body["code"], "rate_limited");
+    assert_eq!(first_body["retryAfterSeconds"], 17);
+
+    let (second_status, second_body, _) = confirm_flow(&fixture, &flow_id).await;
+    assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second_body["code"], "rate_limited");
+    assert_eq!(second_body["retryAfterSeconds"], 17);
+    assert_eq!(
+        request_count(&server, "/user-service/api/v2/auth/login").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn legacy_sms_maps_only_auth_statuses_to_authentication_failure() {
+    let cases = [
+        (
+            400,
+            StatusCode::UNAUTHORIZED,
+            "upstream_authentication_failed",
+            None,
+        ),
+        (
+            401,
+            StatusCode::UNAUTHORIZED,
+            "upstream_authentication_failed",
+            None,
+        ),
+        (
+            403,
+            StatusCode::UNAUTHORIZED,
+            "upstream_authentication_failed",
+            None,
+        ),
+        (
+            404,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            None,
+        ),
+        (
+            405,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            None,
+        ),
+        (
+            410,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            None,
+        ),
+        (
+            422,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            None,
+        ),
+        (429, StatusCode::TOO_MANY_REQUESTS, "rate_limited", Some(23)),
+    ];
+
+    for (upstream_status, expected_status, expected_code, retry_after) in cases {
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(upstream_status);
+        if let Some(seconds) = retry_after {
+            response = response.insert_header("Retry-After", seconds.to_string());
+        }
+        Mock::given(method("POST"))
+            .and(path("/user-service/api/v2/auth/init"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let fixture = fixture(&server).await;
+
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(json_request(
+                "/api/v1/auth/legacy-sms/start",
+                json!({"phone": PHONE, "accept_legacy_sms": true}),
+            ))
+            .await
+            .unwrap();
+        let (status, body, _) = json_response(response).await;
+
+        assert_eq!(status, expected_status, "upstream status {upstream_status}");
+        assert_eq!(
+            body["code"], expected_code,
+            "upstream status {upstream_status}"
+        );
+        assert_eq!(
+            body.get("retryAfterSeconds").and_then(Value::as_u64),
+            retry_after,
+            "upstream status {upstream_status}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn failed_init_post_is_dispatched_exactly_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/user-service/api/v2/auth/init"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let fixture = fixture(&server).await;
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(json_request(
+            "/api/v1/auth/legacy-sms/start",
+            json!({"phone": PHONE, "accept_legacy_sms": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
