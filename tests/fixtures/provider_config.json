@@ -6,6 +6,11 @@
     "futureField": "ignored"
   },
   {
+    "configName": "ANDROID_UPDATE",
+    "platform": "ANDROID",
+    "value": "recommended"
+  },
+  {
     "configName": "WEB_DIAGNOSTIC",
     "platform": "WEB",
     "value": "opaque"

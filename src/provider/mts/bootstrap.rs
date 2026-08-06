@@ -12,6 +12,9 @@ use super::{
 const MAX_BOOTSTRAP_ITEMS: usize = 1_024;
 const MAX_NAME_LEN: usize = 256;
 const MAX_VALUE_LEN: usize = 64 * 1_024;
+const ANDROID_PLATFORM: &str = "ANDROID";
+const ANDROID_VERSION_CONFIG: &str = "ANDROID_APP_VERSION";
+const ANDROID_UPDATE_CONFIG: &str = "ANDROID_UPDATE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthType {
@@ -39,7 +42,8 @@ impl fmt::Debug for BootstrapConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderBootstrap {
     pub auth_type: AuthType,
-    pub android_config: Option<BootstrapConfig>,
+    pub android_version: Option<BootstrapConfig>,
+    pub android_update: Option<BootstrapConfig>,
     pub unknown_config_names: Vec<String>,
     pub unknown_feature_names: Vec<String>,
 }
@@ -77,25 +81,31 @@ fn normalize(
     }
 
     let mut config_names = HashSet::with_capacity(configs.len());
-    let mut android_config = None;
+    let mut android_version = None;
+    let mut android_update = None;
     let mut unknown_config_names = Vec::new();
     for config in configs {
         validate_identifier(&config.config_name)?;
         validate_identifier(&config.platform)?;
-        validate_value(&config.value)?;
         if !config_names.insert(config.config_name.clone()) {
             return Err(schema_error());
         }
 
-        if config.platform == "ANDROID" && android_config.is_none() {
-            android_config = Some(BootstrapConfig {
-                config_name: config.config_name,
-                platform: config.platform,
-                value: config.value,
-            });
-        } else {
-            unknown_config_names.push(config.config_name);
-        }
+        let destination = match (config.config_name.as_str(), config.platform.as_str()) {
+            (ANDROID_VERSION_CONFIG, ANDROID_PLATFORM) => &mut android_version,
+            (ANDROID_UPDATE_CONFIG, ANDROID_PLATFORM) => &mut android_update,
+            _ => {
+                validate_unknown_value(&config.value)?;
+                unknown_config_names.push(config.config_name);
+                continue;
+            }
+        };
+        validate_known_value(&config.value)?;
+        *destination = Some(BootstrapConfig {
+            config_name: config.config_name,
+            platform: config.platform,
+            value: config.value,
+        });
     }
 
     let mut feature_names = HashSet::with_capacity(features.len());
@@ -103,14 +113,15 @@ fn normalize(
     let mut unknown_feature_names = Vec::new();
     for feature in features {
         validate_identifier(&feature.feature_name)?;
-        validate_value(&feature.value)?;
         if !feature_names.insert(feature.feature_name.clone()) {
             return Err(schema_error());
         }
 
         if feature.feature_name == "AUTH_TYPE" {
+            validate_unknown_value(&feature.value)?;
             auth_value = Some(feature.value);
         } else {
+            validate_unknown_value(&feature.value)?;
             unknown_feature_names.push(feature.feature_name);
         }
     }
@@ -121,7 +132,8 @@ fn normalize(
 
     Ok(ProviderBootstrap {
         auth_type: AuthType::WebSso,
-        android_config,
+        android_version,
+        android_update,
         unknown_config_names,
         unknown_feature_names,
     })
@@ -139,8 +151,15 @@ fn validate_identifier(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_value(value: &str) -> Result<(), AppError> {
+fn validate_known_value(value: &str) -> Result<(), AppError> {
     if value.is_empty() || value.len() > MAX_VALUE_LEN {
+        return Err(schema_error());
+    }
+    Ok(())
+}
+
+fn validate_unknown_value(value: &str) -> Result<(), AppError> {
+    if value.len() > MAX_VALUE_LEN {
         return Err(schema_error());
     }
     Ok(())

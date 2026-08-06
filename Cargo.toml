@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 
+[features]
+default = []
+test-support = []
+
 [lib]
 name = "domru_mts"
 path = "src/lib.rs"
@@ -11,6 +15,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "domru-mts"
 path = "src/main.rs"
+
+[[test]]
+name = "mts_client"
+path = "tests/mts_client.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "provider_bootstrap"
+path = "tests/provider_bootstrap.rs"
+required-features = ["test-support"]
 
 [dependencies]
 aes-gcm = { version = "0.11.0", features = ["zeroize"] }
@@ -22,6 +36,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 futures-util = "0.3"
 fs2 = "0.4"
 http = "1"
+httpdate = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "gzip", "json", "multipart", "query", "rustls", "stream"] }
 rand = "0.9"
 secrecy = { version = "0.10.3", features = ["serde"] }

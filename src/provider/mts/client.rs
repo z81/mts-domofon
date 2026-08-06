@@ -1,15 +1,19 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt, pin_mut};
 use reqwest::{
     Client, Method, Request, RequestBuilder, Response, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
 use secrecy::{ExposeSecret, SecretString};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::Mutex;
 use url::Url;
 use uuid::Uuid;
@@ -20,9 +24,11 @@ use crate::{
 };
 
 const MAX_JSON_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_JSON_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_EMPTY_BODY_BYTES: usize = 16 * 1024;
 const MAX_CORRELATION_LEN: usize = 256;
+const MAX_RETRY_AFTER_SECONDS: u64 = 60 * 60;
 
 const DEVICE_TOKEN: &str = "x-device-token";
 const DEVICE_TYPE: &str = "x-device-type";
@@ -61,11 +67,62 @@ pub enum ProviderBase {
 }
 
 #[derive(Clone)]
+pub struct PreparedRequest {
+    owner: Uuid,
+    method: Method,
+    base: ProviderBase,
+    path: String,
+    authorization: Authorization,
+    body: PreparedBody,
+}
+
+impl PreparedRequest {
+    pub fn json<T>(mut self, value: &T) -> Result<Self, AppError>
+    where
+        T: Serialize + ?Sized,
+    {
+        let body = serde_json::to_vec(value).map_err(|_| invalid_body())?;
+        if body.len() > MAX_JSON_REQUEST_BYTES {
+            return Err(AppError::invalid_request(
+                "provider request body is too large",
+            ));
+        }
+        self.body = PreparedBody::Json(body);
+        Ok(self)
+    }
+}
+
+impl fmt::Debug for PreparedRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedRequest")
+            .field("method", &self.method)
+            .field("base", &self.base)
+            .field("authorization", &self.authorization)
+            .field("has_body", &!matches!(self.body, PreparedBody::Empty))
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Authorization {
+    AnonymousBootstrap,
+    Authorized,
+}
+
+#[derive(Clone)]
+enum PreparedBody {
+    Empty,
+    Json(Vec<u8>),
+}
+
+#[derive(Clone)]
 pub struct MtsClient {
     inner: Arc<Inner>,
 }
 
 struct Inner {
+    id: Uuid,
     http: Client,
     gateway: Url,
     resident: Url,
@@ -75,11 +132,7 @@ struct Inner {
 
 impl MtsClient {
     pub fn new(config: &AppConfig, tokens: Arc<dyn TokenSource>) -> Result<Self, AppError> {
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(transport_error)?;
+        let http = provider_http_client()?;
         Ok(Self::from_parts(
             http,
             config.gateway.clone(),
@@ -88,21 +141,24 @@ impl MtsClient {
         ))
     }
 
-    /// Explicit low-level constructor for local provider contract tests.
-    /// Production callers should use [`Self::new`] so [`AppConfig`] host validation applies.
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn new_for_test(
-        http: Client,
         gateway: Url,
         resident: Url,
         tokens: Arc<dyn TokenSource>,
-    ) -> Self {
-        Self::from_parts(http, gateway, resident, tokens)
+    ) -> Result<Self, AppError> {
+        Ok(Self::from_parts(
+            provider_http_client()?,
+            gateway,
+            resident,
+            tokens,
+        ))
     }
 
     fn from_parts(http: Client, gateway: Url, resident: Url, tokens: Arc<dyn TokenSource>) -> Self {
         Self {
             inner: Arc::new(Inner {
+                id: Uuid::new_v4(),
                 http,
                 gateway,
                 resident,
@@ -113,50 +169,49 @@ impl MtsClient {
     }
 
     pub fn endpoint(&self, base: ProviderBase, path: &str) -> Result<Url, AppError> {
-        if !path.starts_with('/') || path.contains("..") {
+        validate_provider_path(path)?;
+        let url = self
+            .base(base)
+            .join(path.trim_start_matches('/'))
+            .map_err(AppError::url)?;
+        if !same_origin(&url, self.base(base))
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
             return Err(AppError::invalid_request("invalid provider path"));
         }
-        self.base(base)
-            .join(path.trim_start_matches('/'))
-            .map_err(AppError::url)
+        Ok(url)
     }
 
-    pub async fn authorized(
+    pub fn authorized(
         &self,
         method: Method,
         base: ProviderBase,
         path: &str,
-    ) -> Result<RequestBuilder, AppError> {
-        let url = self.endpoint(base, path)?;
-        let mut request = self.inner.http.request(method, url);
-        let access = self
-            .inner
-            .tokens
-            .access_token()
-            .await
-            .ok_or_else(session_expired)?;
-        request = request.header(AUTHORIZATION, bearer_header(&access)?);
-        if let Some(device) = self.inner.tokens.device_token().await {
-            request = request.header(DEVICE_TOKEN, secret_header(&device)?);
-        }
-        Ok(common_headers(request))
+    ) -> Result<PreparedRequest, AppError> {
+        self.prepare(method, base, path, Authorization::Authorized)
     }
 
     pub fn anonymous_gateway(
         &self,
         method: Method,
         path: &str,
-    ) -> Result<RequestBuilder, AppError> {
+    ) -> Result<PreparedRequest, AppError> {
         if method != Method::GET || !matches!(path, "/config" | "/feature") {
             return Err(AppError::invalid_request(
                 "anonymous provider path is not allowed",
             ));
         }
-        let url = self.endpoint(ProviderBase::Gateway, path)?;
-        Ok(common_headers(self.inner.http.request(method, url)))
+        self.prepare(
+            method,
+            ProviderBase::Gateway,
+            path,
+            Authorization::AnonymousBootstrap,
+        )
     }
 
-    pub async fn send_json<T>(&self, request: RequestBuilder) -> Result<T, AppError>
+    pub async fn send_json<T>(&self, request: PreparedRequest) -> Result<T, AppError>
     where
         T: DeserializeOwned,
     {
@@ -165,41 +220,25 @@ impl MtsClient {
         serde_json::from_slice(&body).map_err(|_| schema_error())
     }
 
-    pub async fn send_empty(&self, request: RequestBuilder) -> Result<(), AppError> {
+    pub async fn send_empty(&self, request: PreparedRequest) -> Result<(), AppError> {
         let response = self.execute(request).await?;
         let _ = read_bounded(response, MAX_EMPTY_BODY_BYTES).await?;
         Ok(())
     }
 
-    pub async fn send_stream(&self, request: RequestBuilder) -> Result<Response, AppError> {
+    pub async fn send_stream(&self, request: PreparedRequest) -> Result<Response, AppError> {
         self.execute(request).await
     }
 
-    async fn execute(&self, builder: RequestBuilder) -> Result<Response, AppError> {
-        let request = builder.build().map_err(request_error)?;
-        self.validate_request(&request)?;
-        let safe_read = matches!(*request.method(), Method::GET | Method::HEAD);
-        let is_authorized = request.headers().contains_key(AUTHORIZATION);
-        let failed_authorization = request.headers().get(AUTHORIZATION).cloned();
-        let retry = request.try_clone();
-
-        let response = self
-            .inner
-            .http
-            .execute(request)
-            .await
-            .map_err(transport_error)?;
+    async fn execute(&self, prepared: PreparedRequest) -> Result<Response, AppError> {
+        self.validate_owner(&prepared)?;
+        let safe_read = matches!(prepared.method, Method::GET | Method::HEAD);
+        let is_authorized = prepared.authorization == Authorization::Authorized;
+        let (response, failed_authorization) = self.dispatch(&prepared).await?;
         if response.status() != StatusCode::UNAUTHORIZED || !safe_read || !is_authorized {
             return classify(response, false).await;
         }
 
-        let mut retry = retry.ok_or_else(|| {
-            AppError::new(
-                ErrorCode::Internal,
-                "Provider read could not be retried safely.",
-                false,
-            )
-        })?;
         drop(response);
         let refresh_guard = self.inner.refresh.lock().await;
         if self
@@ -208,15 +247,67 @@ impl MtsClient {
         {
             self.inner.tokens.refresh_after_unauthorized().await?;
         }
-        self.replace_credentials(&mut retry).await?;
         drop(refresh_guard);
+        let (response, _) = self.dispatch(&prepared).await?;
+        classify(response, true).await
+    }
+
+    fn prepare(
+        &self,
+        method: Method,
+        base: ProviderBase,
+        path: &str,
+        authorization: Authorization,
+    ) -> Result<PreparedRequest, AppError> {
+        let _ = self.endpoint(base, path)?;
+        Ok(PreparedRequest {
+            owner: self.inner.id,
+            method,
+            base,
+            path: path.to_owned(),
+            authorization,
+            body: PreparedBody::Empty,
+        })
+    }
+
+    async fn dispatch(
+        &self,
+        prepared: &PreparedRequest,
+    ) -> Result<(Response, Option<HeaderValue>), AppError> {
+        self.validate_owner(prepared)?;
+        let url = self.endpoint(prepared.base, &prepared.path)?;
+        let mut builder = self.inner.http.request(prepared.method.clone(), url);
+        if let PreparedBody::Json(body) = &prepared.body {
+            builder = builder
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.clone());
+        }
+
+        let mut dispatched_authorization = None;
+        if prepared.authorization == Authorization::Authorized {
+            let access = self
+                .inner
+                .tokens
+                .access_token()
+                .await
+                .ok_or_else(session_expired)?;
+            let authorization = bearer_header(&access)?;
+            builder = builder.header(AUTHORIZATION, authorization.clone());
+            dispatched_authorization = Some(authorization);
+            if let Some(device) = self.inner.tokens.device_token().await {
+                builder = builder.header(DEVICE_TOKEN, secret_header(&device)?);
+            }
+        }
+
+        let request = common_headers(builder).build().map_err(request_error)?;
+        self.validate_request(&request)?;
         let response = self
             .inner
             .http
-            .execute(retry)
+            .execute(request)
             .await
             .map_err(transport_error)?;
-        classify(response, true).await
+        Ok((response, dispatched_authorization))
     }
 
     async fn authorization_is_current(
@@ -232,28 +323,12 @@ impl MtsClient {
         Ok(failed == Some(&bearer_header(&current)?))
     }
 
-    async fn replace_credentials(&self, request: &mut Request) -> Result<(), AppError> {
-        let access = self
-            .inner
-            .tokens
-            .access_token()
-            .await
-            .ok_or_else(session_expired)?;
-        request
-            .headers_mut()
-            .insert(AUTHORIZATION, bearer_header(&access)?);
-        if let Some(device) = self.inner.tokens.device_token().await {
-            request.headers_mut().insert(
-                HeaderName::from_static(DEVICE_TOKEN),
-                secret_header(&device)?,
-            );
-        } else {
-            request.headers_mut().remove(DEVICE_TOKEN);
+    fn validate_owner(&self, prepared: &PreparedRequest) -> Result<(), AppError> {
+        if prepared.owner != self.inner.id {
+            return Err(AppError::invalid_request(
+                "provider request belongs to another client",
+            ));
         }
-        request.headers_mut().insert(
-            HeaderName::from_static(REQUEST_ID),
-            HeaderValue::from_str(&Uuid::new_v4().to_string()).expect("UUID is a valid header"),
-        );
         Ok(())
     }
 
@@ -279,11 +354,83 @@ impl MtsClient {
     }
 }
 
+fn provider_http_client() -> Result<Client, AppError> {
+    Client::builder()
+        .redirect(Policy::none())
+        .cookie_store(false)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(transport_error)
+}
+
 fn common_headers(request: RequestBuilder) -> RequestBuilder {
     request
         .header(DEVICE_TYPE, "ANDROID")
         .header(REQUEST_ID, Uuid::new_v4().to_string())
         .header(ACCEPT, "application/json")
+}
+
+fn validate_provider_path(path: &str) -> Result<(), AppError> {
+    if !path.starts_with('/') || path.starts_with("//") || path.contains(['\\', '#']) {
+        return Err(AppError::invalid_request("invalid provider path"));
+    }
+
+    let path_only = path.split_once('?').map_or(path, |(path, _)| path);
+    for segment in path_only.split('/').skip(1) {
+        let decoded = repeatedly_percent_decode(segment.as_bytes())?;
+        if decoded == b"."
+            || decoded == b".."
+            || decoded.contains(&b'/')
+            || decoded.contains(&b'\\')
+            || decoded.iter().any(|byte| byte.is_ascii_control())
+        {
+            return Err(AppError::invalid_request("invalid provider path"));
+        }
+    }
+    Ok(())
+}
+
+fn repeatedly_percent_decode(segment: &[u8]) -> Result<Vec<u8>, AppError> {
+    let mut decoded = segment.to_vec();
+    for _ in 0..4 {
+        if !decoded.contains(&b'%') {
+            return Ok(decoded);
+        }
+        decoded = percent_decode_once(&decoded)?;
+    }
+    if decoded.contains(&b'%') {
+        return Err(AppError::invalid_request("invalid provider path"));
+    }
+    Ok(decoded)
+}
+
+fn percent_decode_once(input: &[u8]) -> Result<Vec<u8>, AppError> {
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] != b'%' {
+            decoded.push(input[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= input.len() {
+            return Err(AppError::invalid_request("invalid provider path"));
+        }
+        let high = hex_value(input[index + 1])?;
+        let low = hex_value(input[index + 2])?;
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    Ok(decoded)
+}
+
+fn hex_value(value: u8) -> Result<u8, AppError> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(AppError::invalid_request("invalid provider path")),
+    }
 }
 
 fn same_origin(left: &Url, right: &Url) -> bool {
@@ -312,6 +459,10 @@ fn invalid_credential() -> AppError {
         "Provider credential cannot be encoded.",
         false,
     )
+}
+
+fn invalid_body() -> AppError {
+    AppError::invalid_request("provider request body could not be encoded")
 }
 
 async fn classify(
@@ -378,7 +529,17 @@ fn correlation_id(headers: &HeaderMap) -> Option<String> {
 }
 
 fn retry_after(headers: &HeaderMap) -> Option<u64> {
-    headers.get(RETRY_AFTER)?.to_str().ok()?.parse().ok()
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    let seconds = value.parse().ok().or_else(|| {
+        let deadline = httpdate::parse_http_date(value).ok()?;
+        Some(
+            deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::ZERO)
+                .as_secs(),
+        )
+    })?;
+    Some(seconds.min(MAX_RETRY_AFTER_SECONDS))
 }
 
 async fn read_bounded(response: Response, limit: usize) -> Result<Bytes, AppError> {
@@ -401,16 +562,28 @@ async fn read_bounded(response: Response, limit: usize) -> Result<Bytes, AppErro
 }
 
 async fn drain_bounded(response: Response, limit: usize) -> Result<(), AppError> {
-    let mut stream = response.bytes_stream();
-    let mut read = 0_usize;
-    while let Some(chunk) = stream.next().await {
+    let _ = drain_stream_bounded(response.bytes_stream(), limit).await?;
+    Ok(())
+}
+
+async fn drain_stream_bounded<S>(stream: S, limit: usize) -> Result<usize, AppError>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>>,
+{
+    pin_mut!(stream);
+    let mut consumed = 0_usize;
+    while consumed < limit {
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
         let chunk = chunk.map_err(transport_error)?;
-        read = read.saturating_add(chunk.len());
-        if read > limit {
+        let remaining = limit - consumed;
+        consumed += chunk.len().min(remaining);
+        if chunk.len() >= remaining {
             break;
         }
     }
-    Ok(())
+    Ok(consumed)
 }
 
 fn session_expired() -> AppError {
@@ -440,4 +613,41 @@ fn transport_error(cause: reqwest::Error) -> AppError {
         true,
     )
     .with_cause(cause)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Poll,
+    };
+
+    use bytes::Bytes;
+    use futures_util::stream;
+
+    use super::drain_stream_bounded;
+
+    #[tokio::test]
+    async fn bounded_error_reader_stops_polling_once_the_limit_is_reached() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&polls);
+        let mut chunks = VecDeque::from([
+            Bytes::from_static(b"1234"),
+            Bytes::from_static(b"5678"),
+            Bytes::from_static(b"must-not-be-polled"),
+        ]);
+        let body = stream::poll_fn(move |_| {
+            observed_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(chunks.pop_front().map(Ok::<_, reqwest::Error>))
+        });
+
+        let consumed = drain_stream_bounded(body, 5).await.unwrap();
+
+        assert_eq!(consumed, 5);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
 }

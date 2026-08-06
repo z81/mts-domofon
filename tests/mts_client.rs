@@ -22,32 +22,53 @@ use wiremock::{
 #[derive(Clone)]
 struct TestTokens {
     access: Arc<RwLock<String>>,
-    device: Option<String>,
+    device: Arc<RwLock<Option<String>>>,
+    access_reads: Arc<AtomicUsize>,
+    device_reads: Arc<AtomicUsize>,
     refreshes: Arc<AtomicUsize>,
+    refresh_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl TestTokens {
     fn new(device: Option<&str>) -> Self {
         Self {
             access: Arc::new(RwLock::new("access-test".into())),
-            device: device.map(str::to_owned),
+            device: Arc::new(RwLock::new(device.map(str::to_owned))),
+            access_reads: Arc::new(AtomicUsize::new(0)),
+            device_reads: Arc::new(AtomicUsize::new(0)),
             refreshes: Arc::new(AtomicUsize::new(0)),
+            refresh_barrier: None,
         }
+    }
+
+    fn with_refresh_barrier(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
+        self.refresh_barrier = Some(barrier);
+        self
+    }
+
+    async fn replace(&self, access: &str, device: Option<&str>) {
+        *self.access.write().await = access.into();
+        *self.device.write().await = device.map(str::to_owned);
     }
 }
 
 #[async_trait]
 impl TokenSource for TestTokens {
     async fn access_token(&self) -> Option<SecretString> {
+        self.access_reads.fetch_add(1, Ordering::SeqCst);
         Some(SecretString::from(self.access.read().await.clone()))
     }
 
     async fn device_token(&self) -> Option<SecretString> {
-        self.device.clone().map(SecretString::from)
+        self.device_reads.fetch_add(1, Ordering::SeqCst);
+        self.device.read().await.clone().map(SecretString::from)
     }
 
     async fn refresh_after_unauthorized(&self) -> Result<(), AppError> {
         self.refreshes.fetch_add(1, Ordering::SeqCst);
+        if let Some(barrier) = &self.refresh_barrier {
+            barrier.wait().await;
+        }
         *self.access.write().await = "access-fresh".into();
         Ok(())
     }
@@ -69,7 +90,7 @@ impl Respond for AuthResponder {
 
 fn client(server: &MockServer, tokens: Arc<dyn TokenSource>) -> MtsClient {
     let base = Url::parse(&format!("{}/", server.uri())).unwrap();
-    MtsClient::new_for_test(reqwest::Client::new(), base.clone(), base, tokens)
+    MtsClient::new_for_test(base.clone(), base, tokens).unwrap()
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +111,6 @@ async fn safe_read_has_exact_headers_and_retries_once_with_fresh_credentials() {
 
     let request = client
         .authorized(Method::GET, ProviderBase::Gateway, "/resource")
-        .await
         .unwrap();
     let response: OkResponse = client.send_json(request).await.unwrap();
 
@@ -120,7 +140,8 @@ async fn concurrent_unauthorized_reads_share_one_serialized_refresh() {
         .respond_with(AuthResponder)
         .mount(&server)
         .await;
-    let tokens = Arc::new(TestTokens::new(None));
+    let refresh_barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let tokens = Arc::new(TestTokens::new(None).with_refresh_barrier(refresh_barrier.clone()));
     let client = client(&server, tokens.clone());
 
     let mut tasks = Vec::new();
@@ -129,16 +150,140 @@ async fn concurrent_unauthorized_reads_share_one_serialized_refresh() {
         tasks.push(tokio::spawn(async move {
             let request = client
                 .authorized(Method::GET, ProviderBase::Gateway, "/resource")
-                .await
                 .unwrap();
             client.send_json::<OkResponse>(request).await.unwrap().ok
         }));
     }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let stale_attempts = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.headers["authorization"] == "Bearer access-test")
+                .count();
+            if stale_attempts == 20 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all reads must dispatch the stale credential before refresh");
+    refresh_barrier.wait().await;
     for task in tasks {
         assert!(task.await.unwrap());
     }
 
     assert_eq!(tokens.refreshes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn prepared_request_fetches_credentials_and_request_id_at_dispatch_time() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mutation"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let tokens = Arc::new(TestTokens::new(Some("device-old")));
+    let client = client(&server, tokens.clone());
+
+    let request = client
+        .authorized(Method::POST, ProviderBase::Gateway, "/mutation")
+        .unwrap();
+    assert_eq!(tokens.access_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(tokens.device_reads.load(Ordering::SeqCst), 0);
+    tokens.replace("access-fresh", Some("device-fresh")).await;
+    client.send_empty(request).await.unwrap();
+
+    assert_eq!(tokens.access_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(tokens.device_reads.load(Ordering::SeqCst), 1);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].headers["authorization"], "Bearer access-fresh");
+    assert_eq!(requests[0].headers["x-device-token"], "device-fresh");
+}
+
+#[tokio::test]
+async fn reused_prepared_request_gets_fresh_credentials_and_uuid_on_every_dispatch() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/resource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+    let tokens = Arc::new(TestTokens::new(Some("device-one")));
+    let client = client(&server, tokens.clone());
+    let prepared = client
+        .authorized(Method::GET, ProviderBase::Gateway, "/resource")
+        .unwrap();
+
+    assert!(
+        client
+            .send_json::<OkResponse>(prepared.clone())
+            .await
+            .unwrap()
+            .ok
+    );
+    tokens.replace("access-two", Some("device-two")).await;
+    assert!(client.send_json::<OkResponse>(prepared).await.unwrap().ok);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].headers["authorization"], "Bearer access-test");
+    assert_eq!(requests[0].headers["x-device-token"], "device-one");
+    assert_eq!(requests[1].headers["authorization"], "Bearer access-two");
+    assert_eq!(requests[1].headers["x-device-token"], "device-two");
+    assert_ne!(
+        requests[0].headers["request-id"],
+        requests[1].headers["request-id"]
+    );
+}
+
+#[tokio::test]
+async fn send_methods_reject_a_prepared_request_owned_by_another_client() {
+    let server = MockServer::start().await;
+    let other_server = MockServer::start().await;
+    let primary_client = client(&server, Arc::new(TestTokens::new(None)));
+    let other_client = client(&other_server, Arc::new(TestTokens::new(None)));
+    let request = other_client
+        .authorized(Method::GET, ProviderBase::Gateway, "/bypass")
+        .unwrap();
+
+    let error = primary_client.send_empty(request).await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(other_server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_support_client_does_not_follow_redirects() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/redirect"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/followed"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/followed"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let client = client(&server, Arc::new(TestTokens::new(None)));
+
+    let request = client
+        .authorized(Method::GET, ProviderBase::Gateway, "/redirect")
+        .unwrap();
+    let error = client.send_empty(request).await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/redirect");
 }
 
 #[tokio::test]
@@ -154,7 +299,6 @@ async fn a_second_unauthorized_response_is_not_retried_or_refreshed_again() {
 
     let request = client
         .authorized(Method::GET, ProviderBase::Gateway, "/resource")
-        .await
         .unwrap();
     let error = client.send_json::<OkResponse>(request).await.unwrap_err();
 
@@ -176,14 +320,17 @@ async fn mutation_is_never_refreshed_or_retried_after_unauthorized() {
 
     let request = client
         .authorized(Method::POST, ProviderBase::Gateway, "/door/open")
-        .await
         .unwrap()
-        .json(&serde_json::json!({"action": "open"}));
+        .json(&serde_json::json!({"action": "open"}))
+        .unwrap();
     let error = client.send_empty(request).await.unwrap_err();
 
     assert_eq!(error.code, ErrorCode::UpstreamAuthenticationFailed);
     assert_eq!(tokens.refreshes.load(Ordering::SeqCst), 0);
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, br#"{"action":"open"}"#);
+    assert_eq!(requests[0].headers["content-type"], "application/json");
 }
 
 #[tokio::test]
@@ -212,7 +359,6 @@ async fn classifies_stable_http_errors_and_bounds_redacted_error_bodies() {
     for (name, _, code) in cases {
         let request = client
             .authorized(Method::POST, ProviderBase::Gateway, &format!("/{name}"))
-            .await
             .unwrap();
         let error = client.send_empty(request).await.unwrap_err();
         assert_eq!(error.code, code);
@@ -243,7 +389,6 @@ async fn rate_limit_carries_retry_after_and_provider_correlation() {
 
     let request = client
         .authorized(Method::POST, ProviderBase::Gateway, "/limited")
-        .await
         .unwrap();
     let error = client.send_empty(request).await.unwrap_err();
 
@@ -254,6 +399,36 @@ async fn rate_limit_carries_retry_after_and_provider_correlation() {
         error.upstream_request_id.as_deref(),
         Some("provider-correlation")
     );
+}
+
+#[tokio::test]
+async fn retry_after_supports_http_dates_and_caps_untrusted_delays() {
+    let server = MockServer::start().await;
+    let cases = [
+        ("date-limited", "Wed, 21 Oct 2099 07:28:00 GMT", Some(3_600)),
+        ("huge-limited", "999999999", Some(3_600)),
+        ("past-limited", "Wed, 21 Oct 2015 07:28:00 GMT", Some(0)),
+    ];
+    for (path_name, value, _) in cases {
+        Mock::given(method("POST"))
+            .and(path(format!("/{path_name}")))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", value))
+            .mount(&server)
+            .await;
+    }
+    let client = client(&server, Arc::new(TestTokens::new(None)));
+
+    for (path_name, _, expected) in cases {
+        let request = client
+            .authorized(
+                Method::POST,
+                ProviderBase::Gateway,
+                &format!("/{path_name}"),
+            )
+            .unwrap();
+        let error = client.send_empty(request).await.unwrap_err();
+        assert_eq!(error.retry_after_seconds, expected);
+    }
 }
 
 #[tokio::test]
@@ -268,7 +443,6 @@ async fn stream_uses_the_authorized_contract_without_json_decoding() {
 
     let request = client
         .authorized(Method::GET, ProviderBase::Resident, "/stream")
-        .await
         .unwrap();
     let response = client.send_stream(request).await.unwrap();
 
