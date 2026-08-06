@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  createDefaultAuthApi,
   createProductionAuthApi,
   type AuthProgress,
   type SessionView,
@@ -73,6 +74,28 @@ describe('production auth API boundary', () => {
     })
   })
 
+  it('submits the opaque callback only in the canonical JSON request body', async () => {
+    const authenticated: AuthProgress = {
+      status: 'authenticated',
+      session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' },
+    }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(authenticated))
+    const api = createProductionAuthApi(fetcher)
+    const signal = new AbortController().signal
+    const callbackUrl = 'https://gateway.vdome.mts.ru/user-service/api/auth/callback?code=callback-secret&state=state-secret'
+
+    await expect(api.completeCallback('flow / opaque', callbackUrl, signal)).resolves.toEqual(authenticated)
+
+    expect(fetcher).toHaveBeenCalledWith('/api/v1/auth/flows/flow%20%2F%20opaque/callback', {
+      body: JSON.stringify({ callback_url: callbackUrl }),
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    })
+    expect(fetcher.mock.calls[0]?.[0]).not.toContain('callback-secret')
+  })
+
   it('reads and deletes the canonical Task 8 session resource', async () => {
     const session: SessionView = {
       authenticated: true,
@@ -97,5 +120,22 @@ describe('production auth API boundary', () => {
       credentials: 'same-origin',
       method: 'DELETE',
     })
+  })
+
+  it('uses the production API in normal development and synthetic preview only by explicit opt-in', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(redirectProgress))
+    const normalDevelopment = createDefaultAuthApi({ dev: true, syntheticPreviewEnabled: false, fetcher })
+
+    await expect(normalDevelopment.startAuth()).resolves.toEqual(redirectProgress)
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(normalDevelopment.isSyntheticPreview).toBe(false)
+
+    const explicitPreview = createDefaultAuthApi({ dev: true, syntheticPreviewEnabled: true, fetcher })
+    await expect(explicitPreview.startAuth()).resolves.toMatchObject({ status: 'challenge' })
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(explicitPreview.isSyntheticPreview).toBe(true)
+
+    const production = createDefaultAuthApi({ dev: false, syntheticPreviewEnabled: true, fetcher })
+    expect(production.isSyntheticPreview).toBe(false)
   })
 })

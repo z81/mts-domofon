@@ -24,18 +24,15 @@ describe('core intercom shell', () => {
     expect(screen.getByRole('button', { name: 'Подтвердить открытие' })).toBeVisible()
   })
 
-  it('opens the synthetic MTS ID SMS challenge without collecting a real secret', async () => {
+  it('presents the real MTS ID entry without a synthetic phone challenge', async () => {
     const user = userEvent.setup()
     render(<App />)
 
     await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
-    await user.click(screen.getByRole('button', { name: 'Войти по номеру телефона' }))
-    await user.type(screen.getByRole('textbox', { name: 'Номер телефона' }), '+7 999 000-00-00')
-    await user.click(screen.getByRole('button', { name: 'Получить код' }))
 
-    expect(screen.getByRole('heading', { name: 'Подтверждение номера' })).toBeVisible()
-    expect(screen.getByText('Демо-режим: SMS не отправляется')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Подтвердить код' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Войти с MTS ID' })).toBeVisible()
+    expect(screen.getByText('Локальное подключение')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Войти по номеру телефона' })).not.toBeInTheDocument()
   })
 
   it('switches to camera archive and presents a synthetic clip download', async () => {

@@ -32,6 +32,7 @@ export function AuthPage({ api = authApi, onClose, onAuthenticated }: {
   const [challenge, setChallenge] = useState<AuthChallenge | null>(null)
   const [session, setSession] = useState<SessionView | null>(null)
   const [authorizationUrl, setAuthorizationUrl] = useState<string | null>(null)
+  const [callbackUrl, setCallbackUrl] = useState('')
   const [secret, setSecret] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -70,6 +71,7 @@ export function AuthPage({ api = authApi, onClose, onAuthenticated }: {
   function applyProgress(progress: AuthProgress) {
     if (progress.status === 'browser_redirect') {
       setFlowId(progress.flow_id)
+      setCallbackUrl('')
       const approved = approvedMtsLoginUrl(progress.authorization_url)
       if (!approved) {
         setAuthorizationUrl(null)
@@ -83,11 +85,13 @@ export function AuthPage({ api = authApi, onClose, onAuthenticated }: {
     }
     if (progress.status === 'challenge') {
       setFlowId(progress.flow_id)
+      setCallbackUrl('')
       setChallenge(progress.challenge)
       setView('challenge')
       return
     }
     setFlowId(null)
+    setCallbackUrl('')
     setChallenge(null)
     setSession(progress.session)
     setView('session')
@@ -98,6 +102,7 @@ export function AuthPage({ api = authApi, onClose, onAuthenticated }: {
     setBusy(true)
     setError(null)
     setSecret('')
+    setCallbackUrl('')
     try {
       applyProgress(await api.startAuth())
     } catch (cause) {
@@ -127,22 +132,17 @@ export function AuthPage({ api = authApi, onClose, onAuthenticated }: {
     }
   }
 
-  async function checkRedirectSession() {
+  async function completeRedirect() {
+    if (!flowId || !callbackUrl) return
+    const submittedCallback = callbackUrl
+    setCallbackUrl('')
     setBusy(true)
     setError(null)
     try {
-      const restored = await api.getSession()
-      if (!restored.authenticated) {
-        setError('Вход в MTS ID ещё не завершён')
-      } else {
-        setSession(restored)
-        setFlowId(null)
-        setAuthorizationUrl(null)
-        setView('session')
-        onAuthenticated?.(restored)
-      }
+      applyProgress(await api.completeCallback(flowId, submittedCallback))
     } catch (cause) {
-      handleFailure(cause, 'Не удалось проверить сессию')
+      setCallbackUrl('')
+      handleFailure(cause, 'Не удалось завершить вход')
     } finally {
       setBusy(false)
     }
@@ -154,6 +154,7 @@ export function AuthPage({ api = authApi, onClose, onAuthenticated }: {
     setFlowId(null)
     setChallenge(null)
     setAuthorizationUrl(null)
+    setCallbackUrl('')
     setSecret('')
     setError(null)
     setView('choice')
@@ -171,9 +172,9 @@ export function AuthPage({ api = authApi, onClose, onAuthenticated }: {
   return <Modal className="auth-dialog" labelledBy="auth-title" onClose={onClose}>
     <button className="dialog-close" aria-label="Закрыть" onClick={onClose} type="button">×</button>
     {view === 'restoring' && <><span className="eyebrow">MTS ID</span><h2 id="auth-title">Восстанавливаем сессию</h2><p aria-live="polite">Проверяем локальную сессию…</p></>}
-    {view === 'choice' && <><span className="eyebrow">Безопасный preview</span><h2 id="auth-title">Вход в VDome</h2><p>Секреты существуют только до отправки текущего шага и не сохраняются.</p><div className="stack-actions"><button className="primary-button" data-dialog-initial disabled={busy} onClick={begin} type="button">Войти с MTS ID</button><button className="secondary-button" disabled={busy} onClick={begin} type="button">Войти по номеру телефона</button></div></>}
+    {view === 'choice' && <><span className="eyebrow">{api.isSyntheticPreview ? 'Режим предпросмотра' : 'Локальное подключение'}</span><h2 id="auth-title">Вход в VDome</h2><p>{api.isSyntheticPreview ? 'Используется синтетический сценарий без запросов к MTS.' : 'Авторизация проходит на официальной странице MTS ID; callback обрабатывает только локальный VDome API.'}</p><div className="stack-actions"><button className="primary-button" data-dialog-initial disabled={busy} onClick={begin} type="button">Войти с MTS ID</button></div></>}
     {view === 'challenge' && challengeForm}
-    {view === 'redirect' && authorizationUrl && <><span className="eyebrow">Защищённый вход</span><h2 id="auth-title">Продолжите в MTS ID</h2><p>Откроется официальный HTTPS-домен login.mts.ru. Токены не передаются в этот интерфейс.</p><div className="stack-actions"><a className="primary-button auth-link" href={authorizationUrl} target="_blank" rel="noopener noreferrer">Продолжить в MTS ID</a><button className="secondary-button" disabled={busy} onClick={checkRedirectSession} type="button">Я завершил вход</button></div></>}
+    {view === 'redirect' && authorizationUrl && <><span className="eyebrow">Защищённый вход</span><h2 id="auth-title">Продолжите в MTS ID</h2><p>Откройте официальный login.mts.ru. После входа скопируйте полный адрес открывшейся callback-страницы gateway.vdome.mts.ru и вставьте ниже.</p><div className="stack-actions"><a className="primary-button auth-link" href={authorizationUrl} target="_blank" rel="noopener noreferrer">Продолжить в MTS ID</a></div><label className="field-label">Адрес страницы после входа<input aria-label="Адрес страницы после входа" autoComplete="off" inputMode="url" maxLength={8192} spellCheck={false} value={callbackUrl} onChange={(event) => setCallbackUrl(event.target.value)} /></label><button className="secondary-button" disabled={busy || !callbackUrl} onClick={completeRedirect} type="button">Завершить вход</button></>}
     {view === 'session' && session && <><span className="eyebrow">MTS ID</span><h2 id="auth-title">Сессия восстановлена</h2><p>Статус: {session.status}. Секреты и токены не отображаются.</p><button className="secondary-button" onClick={endSession} type="button">Выйти</button></>}
     {view === 'consent_rejected' && <><span className="eyebrow">Вход остановлен</span><h2 id="auth-title">Согласие отклонено</h2><p>Без согласия подключение домофона не выполняется.</p><button className="secondary-button" onClick={() => { setFlowId(null); setView('choice') }} type="button">Назад к способам входа</button></>}
     {view === 'rate_limited' && <><span className="eyebrow">Слишком много попыток</span><h2 id="auth-title">Вход временно ограничен</h2><p aria-live="polite">Повторите через {countdown} сек.</p><button className="secondary-button" disabled={countdown > 0} onClick={begin} type="button">Попробовать снова</button></>}

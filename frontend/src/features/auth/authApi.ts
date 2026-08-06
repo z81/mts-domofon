@@ -54,7 +54,9 @@ export class AuthApiError extends Error {
 }
 
 export interface AuthApi {
+  readonly isSyntheticPreview?: boolean
   startAuth(signal?: AbortSignal): Promise<AuthProgress>
+  completeCallback(flowId: string, callbackUrl: string, signal?: AbortSignal): Promise<AuthProgress>
   submitChallenge(flowId: string, input: ChallengeInput, signal?: AbortSignal): Promise<AuthProgress>
   getSession(signal?: AbortSignal): Promise<SessionView>
   logout(): Promise<void>
@@ -81,8 +83,16 @@ async function readLocalResponse<T>(response: Response): Promise<T> {
 
 export function createProductionAuthApi(fetcher: typeof fetch = fetch): AuthApi {
   return {
+    isSyntheticPreview: false,
     startAuth: async (signal) => readLocalResponse<AuthProgress>(await fetcher('/api/v1/auth/start', {
       body: JSON.stringify({}),
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      signal,
+    })),
+    completeCallback: async (flowId, callbackUrl, signal) => readLocalResponse<AuthProgress>(await fetcher(`/api/v1/auth/flows/${encodeURIComponent(flowId)}/callback`, {
+      body: JSON.stringify({ callback_url: callbackUrl }),
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       method: 'POST',
@@ -117,13 +127,28 @@ function nextSyntheticProgress(flowId: string, input: ChallengeInput): AuthProgr
 }
 
 const syntheticAuthApi: AuthApi = {
+  isSyntheticPreview: true,
   startAuth: async () => ({ status: 'challenge', flow_id: `preview-${crypto.randomUUID()}`, challenge: { type: 'phone' } }),
+  completeCallback: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'preview', authenticated_at: new Date().toISOString(), expires_at: null } }),
   submitChallenge: async (flowId, input) => nextSyntheticProgress(flowId, input),
   getSession: async () => ({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }),
   logout: async () => undefined,
 }
 
-const defaultAuthApi = import.meta.env.DEV ? syntheticAuthApi : createProductionAuthApi()
+export interface DefaultAuthApiOptions {
+  dev: boolean
+  syntheticPreviewEnabled: boolean
+  fetcher?: typeof fetch
+}
+
+export function createDefaultAuthApi({ dev, syntheticPreviewEnabled, fetcher = fetch }: DefaultAuthApiOptions): AuthApi {
+  return dev && syntheticPreviewEnabled ? syntheticAuthApi : createProductionAuthApi(fetcher)
+}
+
+const defaultAuthApi = createDefaultAuthApi({
+  dev: import.meta.env.DEV,
+  syntheticPreviewEnabled: import.meta.env.VITE_ENABLE_SYNTHETIC_PREVIEW === 'true',
+})
 
 export function startAuth(signal?: AbortSignal): Promise<AuthProgress> {
   return defaultAuthApi.startAuth(signal)
@@ -131,6 +156,10 @@ export function startAuth(signal?: AbortSignal): Promise<AuthProgress> {
 
 export function submitChallenge(flowId: string, input: ChallengeInput, signal?: AbortSignal): Promise<AuthProgress> {
   return defaultAuthApi.submitChallenge(flowId, input, signal)
+}
+
+export function completeCallback(flowId: string, callbackUrl: string, signal?: AbortSignal): Promise<AuthProgress> {
+  return defaultAuthApi.completeCallback(flowId, callbackUrl, signal)
 }
 
 export function getSession(signal?: AbortSignal): Promise<SessionView> {
@@ -141,4 +170,11 @@ export function logout(): Promise<void> {
   return defaultAuthApi.logout()
 }
 
-export const authApi: AuthApi = { startAuth, submitChallenge, getSession, logout }
+export const authApi: AuthApi = {
+  isSyntheticPreview: defaultAuthApi.isSyntheticPreview,
+  startAuth,
+  completeCallback,
+  submitChallenge,
+  getSession,
+  logout,
+}

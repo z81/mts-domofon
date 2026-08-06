@@ -6,6 +6,7 @@ import { AuthApiError, type AuthApi, type AuthChallenge, type SessionView } from
 function sequenceApi(challenges: readonly AuthChallenge[], session: SessionView = { authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }): AuthApi {
   let index = 0
   return {
+    completeCallback: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } }),
     getSession: async () => session,
     startAuth: async () => ({ status: 'challenge', flow_id: 'memory-only-flow', challenge: challenges[0] }),
     submitChallenge: async () => {
@@ -24,7 +25,7 @@ describe('AuthPage', () => {
     const api = sequenceApi([{ type: 'phone' }, { type: 'sms_otp', resend_after_seconds: 30 }])
     render(<AuthPage api={api} onClose={() => undefined} />)
 
-    await user.click(await screen.findByRole('button', { name: 'Войти по номеру телефона' }))
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
     await user.type(screen.getByRole('textbox', { name: 'Номер телефона' }), '+7 999 000-00-00')
     await user.click(screen.getByRole('button', { name: 'Получить код' }))
 
@@ -65,7 +66,7 @@ describe('AuthPage', () => {
 
     expect(await screen.findByRole('heading', { name: 'Сессия восстановлена' })).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Выйти' }))
-    await user.click(await screen.findByRole('button', { name: 'Войти по номеру телефона' }))
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
 
     expect(await screen.findByText(/Повторите через 2 сек/)).toBeVisible()
   })
@@ -94,6 +95,29 @@ describe('AuthPage', () => {
     await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
 
     expect(await screen.findByRole('link', { name: 'Продолжить в MTS ID' })).toHaveAttribute('href', 'https://login.mts.ru/amserver/UI/Login?realm=users')
+    expect(screen.getByRole('textbox', { name: 'Адрес страницы после входа' })).toHaveAttribute('autocomplete', 'off')
+    expect(screen.getByRole('textbox', { name: 'Адрес страницы после входа' })).toHaveAttribute('spellcheck', 'false')
+  })
+
+  it('clears the callback before the request settles and never renders callback secrets on failure', async () => {
+    const user = userEvent.setup()
+    const api = sequenceApi([{ type: 'phone' }])
+    api.startAuth = async () => ({ status: 'browser_redirect', flow_id: 'browser-flow', authorization_url: 'https://login.mts.ru/amserver/UI/Login?realm=users' })
+    let rejectCallback: ((cause: unknown) => void) | undefined
+    api.completeCallback = async () => new Promise((_, reject) => { rejectCallback = reject })
+    const callbackSecret = 'https://gateway.vdome.mts.ru/user-service/api/auth/callback?code=never-render-this&state=state-secret'
+    render(<AuthPage api={api} onClose={() => undefined} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
+    const input = screen.getByRole('textbox', { name: 'Адрес страницы после входа' })
+    await user.type(input, callbackSecret)
+    await user.click(screen.getByRole('button', { name: 'Завершить вход' }))
+
+    expect(input).toHaveValue('')
+    rejectCallback?.(new Error(callbackSecret))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось завершить вход')
+    expect(document.body).not.toHaveTextContent('never-render-this')
+    expect(input).toHaveValue('')
   })
 
   it('rejects an untrusted browser redirect URL', async () => {
