@@ -101,6 +101,23 @@ impl PropertyService {
         })
     }
 
+    pub async fn ensure_linked_flat(&self, flat_id: &FlatId) -> Result<(), AppError> {
+        if self
+            .provider
+            .flats()
+            .await?
+            .iter()
+            .any(|flat| &flat.id == flat_id)
+        {
+            return Ok(());
+        }
+        Err(AppError::new(
+            ErrorCode::NotFound,
+            "Linked flat was not found.",
+            false,
+        ))
+    }
+
     pub async fn select_flat(&self, flat_id: FlatId) -> Result<(), AppError> {
         let mut state = self.state.lock().await;
         let flats = self.provider.flats().await?;

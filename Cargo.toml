@@ -42,6 +42,11 @@ path = "tests/auth_api.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "runtime_api"
+path = "tests/runtime_api.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "intercom_provider"
 path = "tests/contract/intercom_provider.rs"
 required-features = ["test-support"]

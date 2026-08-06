@@ -1,12 +1,22 @@
 use std::sync::Arc;
 
-use crate::{auth::AuthCoordinator, provider::mts::MtsClient, storage::SecretStore};
+use crate::{
+    auth::AuthCoordinator,
+    provider::mts::{
+        MtsClient, MtsDashboardProvider, intercom::MtsDeviceProvider, media::MtsMediaProvider,
+    },
+    service::{devices::DeviceService, media::MediaService, property::PropertyService},
+    storage::SecretStore,
+};
 
 #[derive(Clone, Default)]
 pub struct AppState {
     secret_store: Option<Arc<SecretStore>>,
     auth_coordinator: Option<Arc<AuthCoordinator>>,
     mts_client: Option<Arc<MtsClient>>,
+    property_service: Option<Arc<PropertyService>>,
+    device_service: Option<Arc<DeviceService>>,
+    media_service: Option<Arc<MediaService>>,
 }
 
 impl AppState {
@@ -15,6 +25,9 @@ impl AppState {
             secret_store: Some(Arc::new(secret_store)),
             auth_coordinator: None,
             mts_client: None,
+            property_service: None,
+            device_service: None,
+            media_service: None,
         }
     }
 
@@ -23,10 +36,37 @@ impl AppState {
         auth_coordinator: Arc<AuthCoordinator>,
         mts_client: Arc<MtsClient>,
     ) -> Self {
+        let property_service = Arc::new(PropertyService::new(
+            Arc::new(MtsDashboardProvider::new((*mts_client).clone())),
+            secret_store.clone(),
+        ));
+        let device_service = Arc::new(DeviceService::new(Arc::new(MtsDeviceProvider::new(
+            (*mts_client).clone(),
+        ))));
+        let media_service = Arc::new(MediaService::new(
+            Arc::clone(&device_service),
+            Arc::new(MtsMediaProvider::new((*mts_client).clone())),
+        ));
         Self {
             secret_store: Some(Arc::new(secret_store)),
             auth_coordinator: Some(auth_coordinator),
             mts_client: Some(mts_client),
+            property_service: Some(property_service),
+            device_service: Some(device_service),
+            media_service: Some(media_service),
+        }
+    }
+
+    pub fn with_core_services(
+        property_service: Arc<PropertyService>,
+        device_service: Arc<DeviceService>,
+        media_service: Arc<MediaService>,
+    ) -> Self {
+        Self {
+            property_service: Some(property_service),
+            device_service: Some(device_service),
+            media_service: Some(media_service),
+            ..Self::default()
         }
     }
 
@@ -40,5 +80,17 @@ impl AppState {
 
     pub fn mts_client(&self) -> Option<&Arc<MtsClient>> {
         self.mts_client.as_ref()
+    }
+
+    pub fn property_service(&self) -> Option<&Arc<PropertyService>> {
+        self.property_service.as_ref()
+    }
+
+    pub fn device_service(&self) -> Option<&Arc<DeviceService>> {
+        self.device_service.as_ref()
+    }
+
+    pub fn media_service(&self) -> Option<&Arc<MediaService>> {
+        self.media_service.as_ref()
     }
 }
