@@ -37,6 +37,17 @@ pub trait SsoTransport: Send + Sync {
         raw_callback: SecretString,
     ) -> Result<TokenBundle, AppError>;
 
+    fn import_callback_response(
+        &self,
+        _raw_response: SecretString,
+    ) -> Result<TokenBundle, AppError> {
+        Err(AppError::new(
+            ErrorCode::UpstreamSchemaChanged,
+            "MTS callback response was invalid.",
+            false,
+        ))
+    }
+
     async fn submit(
         &self,
         flow_id: &AuthFlowId,
@@ -58,6 +69,13 @@ impl SsoTransport for MtsSsoTransport {
         raw_callback: SecretString,
     ) -> Result<TokenBundle, AppError> {
         self.complete_callback(flow_id, raw_callback).await
+    }
+
+    fn import_callback_response(
+        &self,
+        raw_response: SecretString,
+    ) -> Result<TokenBundle, AppError> {
+        self.import_callback_response(raw_response)
     }
 
     async fn submit(
@@ -194,17 +212,18 @@ impl AuthCoordinator {
             .transport
             .complete_callback(flow_id, raw_callback)
             .await?;
-        let session = PersistedSession {
-            tokens,
-            auth_flavor: AuthFlavor::WebSso,
-            authenticated_at: self.clock.now(),
-        };
-        self.store.save_session(&session).await?;
-        let view = active_view(&session);
-        let mut state = self.state.write().await;
-        state.generation = next_generation(state.generation)?;
-        state.session = SessionState::Active(session);
-        state.last_refresh = None;
+        let view = self.install_web_sso_session(tokens).await?;
+        Ok(AuthProgress::Authenticated { session: view })
+    }
+
+    pub async fn import_web_sso_response(
+        &self,
+        raw_response: SecretString,
+    ) -> Result<AuthProgress, AppError> {
+        let _operation = self.operation.lock().await;
+        let tokens = self.transport.import_callback_response(raw_response)?;
+        let view = self.install_web_sso_session(tokens).await?;
+        self.transport.clear();
         Ok(AuthProgress::Authenticated { session: view })
     }
 
@@ -392,6 +411,21 @@ impl AuthCoordinator {
             observed_generation: material.generation,
             result: Err(error),
         });
+    }
+
+    async fn install_web_sso_session(&self, tokens: TokenBundle) -> Result<SessionView, AppError> {
+        let session = PersistedSession {
+            tokens,
+            auth_flavor: AuthFlavor::WebSso,
+            authenticated_at: self.clock.now(),
+        };
+        self.store.save_session(&session).await?;
+        let view = active_view(&session);
+        let mut state = self.state.write().await;
+        state.generation = next_generation(state.generation)?;
+        state.session = SessionState::Active(session);
+        state.last_refresh = None;
+        Ok(view)
     }
 }
 

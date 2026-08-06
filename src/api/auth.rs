@@ -21,6 +21,7 @@ use crate::{
 
 const JSON_BODY_LIMIT: usize = 16 * 1024;
 const CALLBACK_STRING_LIMIT: usize = 8 * 1024;
+const WEB_SSO_IMPORT_BODY_LIMIT: usize = 64 * 1024;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -33,6 +34,7 @@ pub fn router() -> Router<AppState> {
             "/api/v1/auth/flows/{flow_id}/challenge",
             post(submit_challenge),
         )
+        .route("/api/v1/auth/web-sso/import", post(import_web_sso_response))
         .route("/api/v1/auth/legacy-sms/start", post(start_legacy_sms))
         .route(
             "/api/v1/auth/legacy-sms/flows/{flow_id}/confirm",
@@ -55,6 +57,12 @@ struct StartRequest {}
 #[serde(deny_unknown_fields)]
 struct CallbackRequest {
     callback_url: SecretString,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebSsoImportRequest {
+    response: SecretString,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +96,8 @@ struct LegacyConfirmRequest {
 
 struct AuthJson<T>(T);
 
+struct WebSsoImportJson(WebSsoImportRequest);
+
 impl<T, S> FromRequest<S> for AuthJson<T>
 where
     T: DeserializeOwned,
@@ -96,43 +106,61 @@ where
     type Rejection = ApiError;
 
     async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
-        let request_id = request
-            .extensions()
-            .get::<RequestId>()
-            .copied()
-            .unwrap_or_else(RequestId::generate);
-        if !is_application_json(request.headers()) {
-            return Err(ApiError::new(
-                request_id,
-                AppError::new(
-                    ErrorCode::UnsupportedMediaType,
-                    "Content-Type must be application/json.",
-                    false,
-                ),
-            ));
-        }
-
-        let bytes = to_bytes(request.into_body(), JSON_BODY_LIMIT)
-            .await
-            .map_err(|_| {
-                ApiError::new(
-                    request_id,
-                    AppError::new(
-                        ErrorCode::PayloadTooLarge,
-                        "JSON request body is too large.",
-                        false,
-                    ),
-                )
-            })?;
-        let bytes = Zeroizing::new(bytes.to_vec());
-        let value = serde_json::from_slice(&bytes).map_err(|_| {
-            ApiError::new(
-                request_id,
-                AppError::invalid_request("JSON request body is invalid."),
-            )
-        })?;
-        Ok(Self(value))
+        parse_json(request, JSON_BODY_LIMIT).await.map(Self)
     }
+}
+
+impl<S> FromRequest<S> for WebSsoImportJson
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        parse_json(request, WEB_SSO_IMPORT_BODY_LIMIT)
+            .await
+            .map(Self)
+    }
+}
+
+async fn parse_json<T>(request: Request, limit: usize) -> Result<T, ApiError>
+where
+    T: DeserializeOwned,
+{
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .copied()
+        .unwrap_or_else(RequestId::generate);
+    if !is_application_json(request.headers()) {
+        return Err(ApiError::new(
+            request_id,
+            AppError::new(
+                ErrorCode::UnsupportedMediaType,
+                "Content-Type must be application/json.",
+                false,
+            ),
+        ));
+    }
+
+    let bytes = to_bytes(request.into_body(), limit).await.map_err(|_| {
+        ApiError::new(
+            request_id,
+            AppError::new(
+                ErrorCode::PayloadTooLarge,
+                "JSON request body is too large.",
+                false,
+            ),
+        )
+    })?;
+    let bytes = Zeroizing::new(bytes.to_vec());
+    let value = serde_json::from_slice(&bytes).map_err(|_| {
+        ApiError::new(
+            request_id,
+            AppError::invalid_request("JSON request body is invalid."),
+        )
+    })?;
+    Ok(value)
 }
 
 fn is_application_json(headers: &HeaderMap) -> bool {
@@ -175,6 +203,27 @@ async fn complete_callback(
         .await
         .map(Json)
         .map_err(|error| ApiError::new(request_id, map_flow_error(error)))
+}
+
+async fn import_web_sso_response(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    WebSsoImportJson(request): WebSsoImportJson,
+) -> Result<Json<AuthProgress>, ApiError> {
+    if request.response.expose_secret().is_empty()
+        || request.response.expose_secret().len() > WEB_SSO_IMPORT_BODY_LIMIT
+    {
+        return Err(ApiError::new(
+            request_id,
+            AppError::invalid_request("MTS callback response is invalid."),
+        ));
+    }
+    let coordinator = coordinator(&state, request_id)?;
+    coordinator
+        .import_web_sso_response(request.response)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::new(request_id, error))
 }
 
 async fn submit_challenge(

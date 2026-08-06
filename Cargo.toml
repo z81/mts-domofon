@@ -42,6 +42,11 @@ path = "tests/auth_api.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "mts_sso_import"
+path = "tests/mts_sso_import.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "legacy_sms_auth"
 path = "tests/legacy_sms_auth.rs"
 required-features = ["test-support"]

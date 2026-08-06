@@ -245,7 +245,7 @@ impl MtsSsoTransport {
             return Err(AppError::invalid_request("MTS callback URL is too long"));
         }
 
-        let flow = {
+        let (flow, callback_url) = {
             let now = Instant::now();
             let mut flows = self.flows.lock().map_err(|_| internal_flow_error())?;
             let Some(flow_state) = flows.get(flow_id) else {
@@ -260,6 +260,7 @@ impl MtsSsoTransport {
             }
             flow.request
                 .validate_callback_target(callback, &self.callback_target.url)?;
+            let callback_url = callback_exchange_url(callback)?;
             let flow_state = flows
                 .get_mut(flow_id)
                 .expect("validated authentication flow remains present");
@@ -269,7 +270,7 @@ impl MtsSsoTransport {
             else {
                 unreachable!("validated authentication flow changed while locked")
             };
-            flow
+            (flow, callback_url)
         };
         let _in_flight = InFlightGuard {
             flows: &self.flows,
@@ -278,7 +279,7 @@ impl MtsSsoTransport {
         let callback_work = async {
             let response = flow
                 .client
-                .get(callback)
+                .get(callback_url)
                 .send()
                 .await
                 .map_err(upstream_unavailable)?;
@@ -318,6 +319,15 @@ impl MtsSsoTransport {
             Ok(result) => result,
             Err(_) => Err(inactive_flow_error()),
         }
+    }
+
+    pub fn import_callback_response(
+        &self,
+        raw_response: SecretString,
+    ) -> Result<TokenBundle, AppError> {
+        let response: CallbackResponse = serde_json::from_str(raw_response.expose_secret())
+            .map_err(|_| callback_schema_error())?;
+        response.into_tokens()
     }
 
     pub async fn submit(
@@ -449,6 +459,18 @@ fn callback_schema_error() -> AppError {
     )
 }
 
+fn callback_exchange_url(callback_raw: &str) -> Result<Url, AppError> {
+    let mut callback = Url::parse(callback_raw)
+        .map_err(|_| AppError::invalid_request("invalid MTS callback URL"))?;
+    let retained = callback
+        .query_pairs()
+        .filter(|(name, _)| name != "idt_token")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    callback.query_pairs_mut().clear().extend_pairs(retained);
+    Ok(callback)
+}
+
 #[cfg(feature = "test-support")]
 fn validate_test_callback_target(target: &Url) -> Result<(), AppError> {
     if !target.username().is_empty()
@@ -538,13 +560,32 @@ impl SsoRequest {
 
         let mut state_count = 0_u8;
         let mut received_state = None;
+        let mut code_count = 0_u8;
+        let mut has_code = false;
+        let mut identity_token_count = 0_u8;
+        let mut has_identity_token = false;
         for (name, value) in callback.query_pairs() {
-            if name == "state" {
-                state_count = state_count.saturating_add(1);
-                if received_state.is_none() {
-                    received_state = Some(value);
+            match name.as_ref() {
+                "state" => {
+                    state_count = state_count.saturating_add(1);
+                    if received_state.is_none() {
+                        received_state = Some(value);
+                    }
                 }
+                "code" => {
+                    code_count = code_count.saturating_add(1);
+                    has_code |= !value.is_empty();
+                }
+                "idt_token" => {
+                    identity_token_count = identity_token_count.saturating_add(1);
+                    has_identity_token |= !value.is_empty();
+                }
+                _ => {}
             }
+        }
+
+        if code_count != 1 || !has_code || identity_token_count != 1 || !has_identity_token {
+            return Err(AppError::invalid_request("invalid MTS callback parameters"));
         }
 
         let mut received_bytes = [0_u8; 32];
@@ -664,7 +705,7 @@ mod tests {
             .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
             .expect("authorization state");
         let callback = SecretString::from(format!(
-            "{callback_target}?code=opaque&state={state}&sentinel={CALLBACK_SENTINEL}"
+            "{callback_target}?code=opaque&idt_token=synthetic-identity&state={state}&sentinel={CALLBACK_SENTINEL}"
         ));
         (transport, flow_id, callback)
     }
