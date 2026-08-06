@@ -1,4 +1,7 @@
-use domru_mts::provider::mts::fcm::parse_incoming_call_bootstrap;
+use domru_mts::{
+    calls::sip::{SipLimits, WssTransportConfig},
+    provider::mts::fcm::parse_incoming_call_bootstrap,
+};
 use secrecy::ExposeSecret;
 use serde_json::json;
 
@@ -55,7 +58,14 @@ fn parses_exact_wake_up_data_and_uses_call_session_as_authoritative() {
     );
     assert_eq!(
         bootstrap.websocket_url().expose_secret(),
-        "https://webrtc.example.invalid/ws"
+        "wss://webrtc.example.invalid/ws"
+    );
+    assert!(
+        WssTransportConfig::new(
+            url::Url::parse(bootstrap.websocket_url().expose_secret()).unwrap(),
+            SipLimits::default(),
+        )
+        .is_ok()
     );
     assert_eq!(bootstrap.sip().registrar(), "sip.example.invalid");
     assert_eq!(bootstrap.sip().username(), "resident-1001");
@@ -76,14 +86,65 @@ fn non_wake_up_data_is_ignored_without_requiring_call_fields() {
 }
 
 #[test]
-fn rejects_malformed_nested_json_and_unknown_wake_up_fields() {
+fn rejects_malformed_nested_json() {
     let mut malformed: serde_json::Value = serde_json::from_slice(&wake_up_payload()).unwrap();
     malformed["data"]["sipServer"] = json!("{");
     assert!(parse_incoming_call_bootstrap(&serde_json::to_vec(&malformed).unwrap()).is_err());
+}
 
-    let mut unknown: serde_json::Value = serde_json::from_slice(&wake_up_payload()).unwrap();
-    unknown["data"]["unexpected"] = json!("value");
-    assert!(parse_incoming_call_bootstrap(&serde_json::to_vec(&unknown).unwrap()).is_err());
+#[test]
+fn ignores_additive_envelope_data_and_nested_fields() {
+    let mut additive: serde_json::Value = serde_json::from_slice(&wake_up_payload()).unwrap();
+    additive["futureEnvelopeField"] = json!({"version": 2});
+    additive["data"]["futureDataField"] = json!("compatible");
+
+    for nested_key in ["caller", "call", "camera", "webRTC", "sipServer"] {
+        let nested = additive["data"][nested_key].as_str().unwrap();
+        let mut nested: serde_json::Value = serde_json::from_str(nested).unwrap();
+        nested["futureNestedField"] = json!({"enabled": true});
+        additive["data"][nested_key] = json!(nested.to_string());
+    }
+    let camera = additive["data"]["camera"].as_str().unwrap();
+    let mut camera: serde_json::Value = serde_json::from_str(camera).unwrap();
+    camera["streams"][0]["futureStreamField"] = json!(17);
+    additive["data"]["camera"] = json!(camera.to_string());
+
+    let bootstrap = parse_incoming_call_bootstrap(&serde_json::to_vec(&additive).unwrap())
+        .unwrap()
+        .expect("additive fields must remain backward-compatible");
+    assert_eq!(bootstrap.intercom_id(), "intercom-42");
+}
+
+#[test]
+fn caller_label_falls_back_to_number_then_neutral_name() {
+    let mut numbered: serde_json::Value = serde_json::from_slice(&wake_up_payload()).unwrap();
+    let mut caller: serde_json::Value =
+        serde_json::from_str(numbered["data"]["caller"].as_str().unwrap()).unwrap();
+    caller["name"] = json!("  ");
+    numbered["data"]["caller"] = json!(caller.to_string());
+    let bootstrap = parse_incoming_call_bootstrap(&serde_json::to_vec(&numbered).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(bootstrap.caller_name(), "1001");
+
+    caller["name"] = serde_json::Value::Null;
+    caller["number"] = serde_json::Value::Null;
+    numbered["data"]["caller"] = json!(caller.to_string());
+    let bootstrap = parse_incoming_call_bootstrap(&serde_json::to_vec(&numbered).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(bootstrap.caller_name(), "Домофон");
+}
+
+#[test]
+fn optional_caller_labels_remain_bounded_when_present() {
+    let mut payload: serde_json::Value = serde_json::from_slice(&wake_up_payload()).unwrap();
+    let mut caller: serde_json::Value =
+        serde_json::from_str(payload["data"]["caller"].as_str().unwrap()).unwrap();
+    caller["name"] = json!("x".repeat(513));
+    payload["data"]["caller"] = json!(caller.to_string());
+
+    assert!(parse_incoming_call_bootstrap(&serde_json::to_vec(&payload).unwrap()).is_err());
 }
 
 #[test]

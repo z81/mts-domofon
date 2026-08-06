@@ -75,6 +75,11 @@ impl FcmSecretStore for MemoryStore {
         self.saves.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn clear(&self) -> Result<(), FcmServiceError> {
+        *self.state.lock().await = None;
+        Ok(())
+    }
 }
 
 struct ReconnectingTransport {
@@ -116,6 +121,13 @@ impl FcmTransport for ReconnectingTransport {
         if attempt == 0 {
             return Err(FcmServiceError::Transport);
         }
+        events
+            .send(FcmTransportEvent::data(
+                self.body.clone(),
+                Some("persistent-1".into()),
+            ))
+            .await
+            .map_err(|_| FcmServiceError::ChannelClosed)?;
         events
             .send(FcmTransportEvent::data(
                 self.body.clone(),
@@ -173,6 +185,12 @@ async fn service_reconnects_persists_message_id_emits_bootstrap_and_cancels() {
         .unwrap()
         .unwrap();
     assert_eq!(bootstrap.intercom_id(), "intercom-service");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), rx.recv())
+            .await
+            .is_err(),
+        "a duplicate persistent ID must not emit a second bootstrap"
+    );
     cancellation.cancel();
     tokio::time::timeout(Duration::from_secs(1), task)
         .await

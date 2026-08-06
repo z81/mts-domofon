@@ -22,6 +22,7 @@ const MAX_SELF_USERS: usize = 16;
 const MAX_SECRET_STATE_BYTES: usize = 256 * 1024;
 const MAX_PERSISTENT_IDS: usize = 128;
 const MAX_PERSISTENT_ID_BYTES: usize = 512;
+const MAX_CONSECUTIVE_STARTUP_FAILURES: u8 = 3;
 
 const CURRENT_USER_PATH: &str = "/domofon/api/security/v1/users/self";
 const USERS_PATH: &str = "/domofon/api/security/v1/users";
@@ -136,7 +137,6 @@ struct Envelope {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WakeUpData {
     action: String,
     caller: String,
@@ -150,42 +150,38 @@ struct WakeUpData {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 struct CallerData {
     id: String,
-    number: String,
-    name: String,
+    number: Option<String>,
+    name: Option<String>,
     r#type: String,
     #[serde(default)]
     session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 struct CallData {
     session_id: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CameraData {
     streams: Vec<CameraStreamData>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CameraStreamData {
     url: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WebRtcData {
     ws: String,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SipServerData {
     ip: String,
     sip: String,
@@ -221,15 +217,15 @@ pub fn parse_incoming_call_bootstrap(
     let sip_server: SipServerData = parse_nested(&data.sip_server)?;
 
     validate_text(&caller.id, MAX_ID_BYTES)?;
-    validate_text(&caller.number, MAX_LABEL_BYTES)?;
-    validate_text(&caller.name, MAX_LABEL_BYTES)?;
+    validate_optional_text(caller.number.as_deref(), MAX_LABEL_BYTES)?;
+    validate_optional_text(caller.name.as_deref(), MAX_LABEL_BYTES)?;
     validate_text(&caller.r#type, MAX_LABEL_BYTES)?;
     if let Some(session_id) = &caller.session_id {
         validate_text(session_id, MAX_ID_BYTES)?;
     }
     validate_text(&call.session_id, MAX_ID_BYTES)?;
     validate_text(&web_rtc.ws, MAX_URL_BYTES)?;
-    validate_websocket_url(&web_rtc.ws)?;
+    let websocket_url = normalize_websocket_url(&web_rtc.ws)?;
     validate_text(&sip_server.ip, MAX_LABEL_BYTES)?;
     validate_text(&sip_server.sip, MAX_LABEL_BYTES)?;
     validate_text(&sip_server.secret, MAX_SECRET_BYTES)?;
@@ -250,13 +246,14 @@ pub fn parse_incoming_call_bootstrap(
         .ok()
         .filter(|timestamp| *timestamp > 0)
         .ok_or(FcmPayloadError::InvalidSchema)?;
+    let caller_name = caller_display_name(caller.name.as_deref(), caller.number.as_deref());
 
     Ok(Some(IncomingCallBootstrap {
         intercom_id: caller.id,
-        caller_name: caller.name,
+        caller_name,
         call_session_id: SecretString::from(call.session_id),
         camera_streams,
-        websocket_url: SecretString::from(web_rtc.ws),
+        websocket_url: SecretString::from(websocket_url),
         sip: SipBootstrapCredentials {
             registrar: sip_server.ip,
             username: sip_server.sip,
@@ -287,8 +284,32 @@ fn validate_text(value: &str, max_bytes: usize) -> Result<(), FcmPayloadError> {
     Ok(())
 }
 
-fn validate_websocket_url(value: &str) -> Result<(), FcmPayloadError> {
-    let url = url::Url::parse(value).map_err(|_| FcmPayloadError::InvalidSchema)?;
+fn validate_optional_text(value: Option<&str>, max_bytes: usize) -> Result<(), FcmPayloadError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.len() > max_bytes || value.chars().any(char::is_control) {
+        return Err(if value.len() > max_bytes {
+            FcmPayloadError::TooLarge
+        } else {
+            FcmPayloadError::InvalidSchema
+        });
+    }
+    Ok(())
+}
+
+fn caller_display_name(name: Option<&str>, number: Option<&str>) -> String {
+    [name, number]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("Домофон")
+        .to_owned()
+}
+
+fn normalize_websocket_url(value: &str) -> Result<String, FcmPayloadError> {
+    let mut url = url::Url::parse(value).map_err(|_| FcmPayloadError::InvalidSchema)?;
     if !matches!(url.scheme(), "https" | "wss")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -297,7 +318,11 @@ fn validate_websocket_url(value: &str) -> Result<(), FcmPayloadError> {
     {
         return Err(FcmPayloadError::InvalidSchema);
     }
-    Ok(())
+    if url.scheme() == "https" {
+        url.set_scheme("wss")
+            .map_err(|_| FcmPayloadError::InvalidSchema)?;
+    }
+    Ok(url.into())
 }
 
 #[derive(Deserialize)]
@@ -551,6 +576,8 @@ pub enum FcmServiceError {
     Configuration,
     #[error("FCM service channel closed")]
     ChannelClosed,
+    #[error("FCM registration may be stale")]
+    RegistrationStale,
 }
 
 pub enum FcmTransportEvent {
@@ -591,6 +618,7 @@ impl fmt::Debug for FcmTransportEvent {
 pub trait FcmSecretStore: Send + Sync {
     async fn load(&self) -> Result<Option<FcmSecretState>, FcmServiceError>;
     async fn save(&self, state: &FcmSecretState) -> Result<(), FcmServiceError>;
+    async fn clear(&self) -> Result<(), FcmServiceError>;
 }
 
 #[async_trait]
@@ -635,20 +663,11 @@ impl FcmBootstrapService {
         output: mpsc::Sender<IncomingCallBootstrap>,
         cancellation: CancellationToken,
     ) -> Result<(), FcmServiceError> {
-        let initialize = async {
-            match self.store.load().await? {
-                Some(state) => Ok(state),
-                None => {
-                    let state = self.transport.register(&self.config).await?;
-                    self.store.save(&state).await?;
-                    Ok(state)
-                }
-            }
-        };
         let mut state = tokio::select! {
             () = cancellation.cancelled() => return Ok(()),
-            result = initialize => result?,
+            result = self.ensure_registration() => result?,
         };
+        let mut consecutive_startup_failures = 0_u8;
 
         loop {
             if cancellation.is_cancelled() || output.is_closed() {
@@ -661,6 +680,7 @@ impl FcmBootstrapService {
                 self.transport
                     .listen(&connection_state, event_tx, connection_cancel.clone());
             tokio::pin!(listen);
+            let mut observed_event = false;
             let connection_result = loop {
                 tokio::select! {
                     biased;
@@ -676,17 +696,37 @@ impl FcmBootstrapService {
                         let Some(event) = event else {
                             break listen.await;
                         };
+                        observed_event = true;
                         self.handle_event(&mut state, event, &output, &cancellation).await?;
                     }
                     result = &mut listen => break result,
                 }
             };
             connection_cancel.cancel();
-            let _ = connection_result;
+            if matches!(connection_result, Err(FcmServiceError::Transport)) && !observed_event {
+                consecutive_startup_failures = consecutive_startup_failures.saturating_add(1);
+                if consecutive_startup_failures >= MAX_CONSECUTIVE_STARTUP_FAILURES {
+                    return Err(FcmServiceError::RegistrationStale);
+                }
+            } else {
+                consecutive_startup_failures = 0;
+            }
             tokio::select! {
                 () = cancellation.cancelled() => return Ok(()),
                 () = output.closed() => return Ok(()),
                 () = tokio::time::sleep(self.reconnect_delay) => {}
+            }
+        }
+    }
+
+    /// Loads a persisted registration or creates and persists one through the async transport.
+    pub async fn ensure_registration(&self) -> Result<FcmSecretState, FcmServiceError> {
+        match self.store.load().await? {
+            Some(state) => Ok(state),
+            None => {
+                let state = self.transport.register(&self.config).await?;
+                self.store.save(&state).await?;
+                Ok(state)
             }
         }
     }
@@ -707,9 +747,10 @@ impl FcmBootstrapService {
                 body,
                 persistent_id,
             } => {
-                if let Some(id) = persistent_id
-                    && state.remember_persistent_id(id)?
-                {
+                if let Some(id) = persistent_id {
+                    if !state.remember_persistent_id(id)? {
+                        return Ok(());
+                    }
                     self.store.save(state).await?;
                 }
                 let Ok(Some(bootstrap)) = parse_incoming_call_bootstrap(&body) else {
