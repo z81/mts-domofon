@@ -18,7 +18,9 @@ use domru_mts::{
     app::build_router_with_config,
     auth::{AuthClock, AuthCoordinator, SsoTransport},
     config::AppConfig,
-    domain::auth::{AuthFlowId, AuthProgress, ChallengeInput, PersistedSession, TokenBundle},
+    domain::auth::{
+        AuthFlavor, AuthFlowId, AuthProgress, ChallengeInput, PersistedSession, TokenBundle,
+    },
     error::{AppError, ErrorCode},
     provider::mts::{KeycloakRotation, MtsClient, ProviderAuthApi, TokenSource},
     state::AppState,
@@ -186,6 +188,7 @@ impl ProviderAuthApi for FakeProviderAuthApi {
         &self,
         refresh_token: &SecretString,
         device_token: Option<&SecretString>,
+        auth_flavor: AuthFlavor,
     ) -> Result<(), AppError> {
         assert!(
             [REFRESH_SECRET, "rotated-api-refresh-secret"].contains(&refresh_token.expose_secret())
@@ -194,6 +197,7 @@ impl ProviderAuthApi for FakeProviderAuthApi {
             device_token.map(ExposeSecret::expose_secret),
             Some(DEVICE_SECRET)
         );
+        assert_eq!(auth_flavor, AuthFlavor::WebSso);
         self.logout_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -223,6 +227,7 @@ async fn fixture(active_session: bool) -> TestFixture {
         store
             .save_session(&PersistedSession {
                 tokens: token_bundle(),
+                auth_flavor: AuthFlavor::WebSso,
                 authenticated_at: instant(9),
             })
             .await

@@ -179,6 +179,14 @@ pub struct TokenBundle {
     pub device_token: Option<SecretString>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthFlavor {
+    #[default]
+    WebSso,
+    LegacySms,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceIdentity {
     pub uuid: Uuid,
@@ -187,6 +195,7 @@ pub struct DeviceIdentity {
 #[derive(Clone)]
 pub struct PersistedSession {
     pub tokens: TokenBundle,
+    pub auth_flavor: AuthFlavor,
     pub authenticated_at: DateTime<Utc>,
 }
 
@@ -201,6 +210,7 @@ impl fmt::Debug for PersistedSession {
                 &self.tokens.web_sso_access_token.is_some(),
             )
             .field("has_device_token", &self.tokens.device_token.is_some())
+            .field("auth_flavor", &self.auth_flavor)
             .field("authenticated_at", &self.authenticated_at)
             .finish()
     }
@@ -233,6 +243,7 @@ impl PersistedSession {
                 web_sso_access_token: Some(SecretString::from("sso-test")),
                 device_token: Some(SecretString::from("device-token-test")),
             },
+            auth_flavor: AuthFlavor::WebSso,
             authenticated_at: Utc::now(),
         }
     }

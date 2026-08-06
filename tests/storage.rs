@@ -13,7 +13,7 @@ use aes_gcm::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use domru_mts::{
-    domain::auth::{PersistedSession, TokenBundle},
+    domain::auth::{AuthFlavor, PersistedSession, TokenBundle},
     error::ErrorCode,
     state::AppState,
     storage::SecretStore,
@@ -29,6 +29,7 @@ fn synthetic_session() -> PersistedSession {
             web_sso_access_token: Some(SecretString::from("sso-test")),
             device_token: Some(SecretString::from("device-token-test")),
         },
+        auth_flavor: AuthFlavor::WebSso,
         authenticated_at: Utc::now(),
     }
 }

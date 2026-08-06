@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use domru_mts::auth::{AuthClock, AuthCoordinator, LogoutWarning, SsoTransport};
 use domru_mts::domain::auth::{
-    AuthFlowId, AuthProgress, ChallengeInput, PersistedSession, SessionStatus, SessionView,
-    TokenBundle,
+    AuthFlavor, AuthFlowId, AuthProgress, ChallengeInput, PersistedSession, SessionStatus,
+    SessionView, TokenBundle,
 };
 use domru_mts::{
     error::{AppError, ErrorCode},
@@ -51,6 +51,7 @@ fn bundle(access: &str, refresh: &str, web_sso: &str) -> TokenBundle {
 fn persisted_session() -> PersistedSession {
     PersistedSession {
         tokens: bundle(ACCESS_OLD, REFRESH_OLD, WEB_SSO_OLD),
+        auth_flavor: AuthFlavor::WebSso,
         authenticated_at: instant(9),
     }
 }
@@ -160,6 +161,7 @@ struct FakeProviderAuthApi {
     seen_web_device_tokens: Mutex<Vec<Option<String>>>,
     seen_logout_refresh_tokens: Mutex<Vec<String>>,
     seen_logout_device_tokens: Mutex<Vec<Option<String>>>,
+    seen_logout_flavors: Mutex<Vec<AuthFlavor>>,
     first_keycloak_entered: Option<Arc<tokio::sync::Barrier>>,
     release_first_keycloak: Option<Arc<tokio::sync::Barrier>>,
     first_logout_entered: Option<Arc<tokio::sync::Barrier>>,
@@ -184,6 +186,7 @@ impl FakeProviderAuthApi {
             seen_web_device_tokens: Mutex::new(Vec::new()),
             seen_logout_refresh_tokens: Mutex::new(Vec::new()),
             seen_logout_device_tokens: Mutex::new(Vec::new()),
+            seen_logout_flavors: Mutex::new(Vec::new()),
             first_keycloak_entered: None,
             release_first_keycloak: None,
             first_logout_entered: None,
@@ -278,6 +281,7 @@ impl ProviderAuthApi for FakeProviderAuthApi {
         &self,
         refresh_token: &SecretString,
         device_token: Option<&SecretString>,
+        auth_flavor: AuthFlavor,
     ) -> Result<(), AppError> {
         self.seen_logout_refresh_tokens
             .lock()
@@ -287,6 +291,7 @@ impl ProviderAuthApi for FakeProviderAuthApi {
             .lock()
             .unwrap()
             .push(device_token.map(|token| token.expose_secret().to_owned()));
+        self.seen_logout_flavors.lock().unwrap().push(auth_flavor);
         let call = self.logout_calls.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
             if let Some(entered) = &self.first_logout_entered {
@@ -889,6 +894,10 @@ async fn logout_clears_memory_storage_and_browser_state_even_when_upstream_fails
             .as_slice(),
         [Some(DEVICE_OLD.to_owned())]
     );
+    assert_eq!(
+        provider.seen_logout_flavors.lock().unwrap().as_slice(),
+        [AuthFlavor::WebSso]
+    );
     let output = format!("{coordinator:?} {result:?}");
     for secret in [
         ACCESS_OLD,
@@ -901,6 +910,51 @@ async fn logout_clears_memory_storage_and_browser_state_even_when_upstream_fails
     ] {
         assert!(!output.contains(secret));
     }
+}
+
+#[tokio::test]
+async fn restored_legacy_session_selects_legacy_logout_flavor() {
+    let data_dir = TempDir::new().unwrap();
+    let store = open_store(&data_dir).await;
+    let mut session = persisted_session();
+    session.auth_flavor = AuthFlavor::LegacySms;
+    session.tokens.web_sso_access_token = None;
+    session.tokens.device_token = None;
+    store.save_session(&session).await.unwrap();
+    let provider = Arc::new(FakeProviderAuthApi::idle());
+    let coordinator = restore_with(
+        store,
+        Arc::new(FakeSsoTransport::with_callback(bundle(
+            "unused-access",
+            "unused-refresh",
+            "unused-websso",
+        ))),
+        Arc::clone(&provider),
+    )
+    .await;
+
+    coordinator.logout().await.unwrap();
+
+    assert_eq!(
+        provider.seen_logout_flavors.lock().unwrap().as_slice(),
+        [AuthFlavor::LegacySms]
+    );
+    assert_eq!(
+        provider
+            .seen_logout_refresh_tokens
+            .lock()
+            .unwrap()
+            .as_slice(),
+        [REFRESH_OLD]
+    );
+    assert_eq!(
+        provider
+            .seen_logout_device_tokens
+            .lock()
+            .unwrap()
+            .as_slice(),
+        [None]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1042,6 +1096,7 @@ async fn mts_auth_api_uses_exact_rotation_and_logout_contracts() {
     api.logout(
         &keycloak.refresh_token,
         Some(&SecretString::from("device-secret")),
+        AuthFlavor::WebSso,
     )
     .await
     .unwrap();
@@ -1075,6 +1130,80 @@ async fn mts_auth_api_uses_exact_rotation_and_logout_contracts() {
         .collect::<Vec<_>>();
     assert_ne!(request_ids[0], request_ids[1]);
     assert_ne!(request_ids[1], request_ids[2]);
+}
+
+#[tokio::test]
+async fn mts_auth_api_routes_logout_to_the_origin_selected_by_the_session_flavor() {
+    let gateway = MockServer::start().await;
+    let resident = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/user-service/api/v2/auth/logout"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&gateway)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/user-service/api/v2/auth/logout"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&resident)
+        .await;
+    let api = MtsAuthApi::new_for_test_with_origins(
+        Url::parse(&format!("{}/", gateway.uri())).unwrap(),
+        Url::parse(&format!("{}/", resident.uri())).unwrap(),
+    )
+    .unwrap();
+
+    api.logout(
+        &SecretString::from("gateway-refresh-secret"),
+        Some(&SecretString::from("gateway-device-secret")),
+        AuthFlavor::WebSso,
+    )
+    .await
+    .unwrap();
+    api.logout(
+        &SecretString::from("legacy-refresh-secret"),
+        Some(&SecretString::from("legacy-device-must-not-be-sent")),
+        AuthFlavor::LegacySms,
+    )
+    .await
+    .unwrap();
+
+    let gateway_requests = gateway.received_requests().await.unwrap();
+    assert_eq!(gateway_requests.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&gateway_requests[0].body).unwrap(),
+        serde_json::json!({"refreshToken": "gateway-refresh-secret"})
+    );
+    assert_eq!(
+        gateway_requests[0].headers["x-device-token"],
+        "gateway-device-secret"
+    );
+    assert_eq!(gateway_requests[0].headers["x-device-type"], "ANDROID");
+    Uuid::parse_str(gateway_requests[0].headers["request-id"].to_str().unwrap()).unwrap();
+
+    let resident_requests = resident.received_requests().await.unwrap();
+    assert_eq!(resident_requests.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&resident_requests[0].body).unwrap(),
+        serde_json::json!({"refreshToken": "legacy-refresh-secret"})
+    );
+    assert_eq!(
+        resident_requests[0].headers["content-type"],
+        "application/json"
+    );
+    for forbidden in [
+        "authorization",
+        "x-auth-token",
+        "x-device-token",
+        "x-device-type",
+        "request-id",
+    ] {
+        assert!(
+            !resident_requests[0].headers.contains_key(forbidden),
+            "legacy logout must not send {forbidden}"
+        );
+    }
 }
 
 #[tokio::test]

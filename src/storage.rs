@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     domain::FlatId,
-    domain::auth::{DeviceIdentity, PersistedSession, TokenBundle},
+    domain::auth::{AuthFlavor, DeviceIdentity, PersistedSession, TokenBundle},
     error::{AppError, ErrorCode},
 };
 
@@ -101,6 +101,8 @@ struct StoredSession {
     #[serde(default)]
     web_sso_access_token: Option<Zeroizing<String>>,
     device_token: Option<Zeroizing<String>>,
+    #[serde(default)]
+    auth_flavor: Option<AuthFlavor>,
     authenticated_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -119,6 +121,7 @@ impl From<&PersistedSession> for StoredSession {
                 .device_token
                 .as_ref()
                 .map(|token| Zeroizing::new(token.expose_secret().to_owned())),
+            auth_flavor: Some(session.auth_flavor),
             authenticated_at: session.authenticated_at,
         }
     }
@@ -126,6 +129,13 @@ impl From<&PersistedSession> for StoredSession {
 
 impl From<StoredSession> for PersistedSession {
     fn from(session: StoredSession) -> Self {
+        let auth_flavor = session.auth_flavor.unwrap_or_else(|| {
+            if session.web_sso_access_token.is_some() {
+                AuthFlavor::WebSso
+            } else {
+                AuthFlavor::LegacySms
+            }
+        });
         Self {
             tokens: TokenBundle {
                 access_token: secrecy::SecretString::from(session.access_token.to_string()),
@@ -137,6 +147,7 @@ impl From<StoredSession> for PersistedSession {
                     .device_token
                     .map(|token| secrecy::SecretString::from(token.to_string())),
             },
+            auth_flavor,
             authenticated_at: session.authenticated_at,
         }
     }
@@ -575,6 +586,30 @@ fn invalid_external_key() -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_written_before_the_flavor_field_infer_the_original_auth_path() {
+        for (web_sso_access_token, expected) in [
+            (serde_json::Value::Null, AuthFlavor::LegacySms),
+            (
+                serde_json::Value::String("old-websso-secret".into()),
+                AuthFlavor::WebSso,
+            ),
+        ] {
+            let stored: StoredSession = serde_json::from_value(serde_json::json!({
+                "access_token": "old-access-secret",
+                "refresh_token": "old-refresh-secret",
+                "web_sso_access_token": web_sso_access_token,
+                "device_token": null,
+                "authenticated_at": "2026-08-06T12:00:00Z"
+            }))
+            .unwrap();
+
+            let session = PersistedSession::from(stored);
+
+            assert_eq!(session.auth_flavor, expected);
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

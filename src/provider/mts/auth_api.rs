@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::AppConfig,
+    domain::auth::AuthFlavor,
     error::{AppError, ErrorCode},
 };
 
@@ -48,6 +49,7 @@ pub trait ProviderAuthApi: Send + Sync {
         &self,
         refresh_token: &SecretString,
         device_token: Option<&SecretString>,
+        auth_flavor: AuthFlavor,
     ) -> Result<(), AppError>;
 }
 
@@ -59,53 +61,45 @@ pub struct MtsAuthApi {
 struct Inner {
     http: Client,
     gateway: Url,
+    resident: Url,
 }
 
 impl MtsAuthApi {
     pub fn new(config: &AppConfig) -> Result<Self, AppError> {
-        Self::from_gateway(config.gateway.clone())
+        Self::from_origins(config.gateway.clone(), config.resident.clone())
     }
 
     #[cfg(feature = "test-support")]
     pub fn new_for_test(gateway: Url) -> Result<Self, AppError> {
-        if gateway.host_str().is_none()
-            || !gateway.username().is_empty()
-            || gateway.password().is_some()
-            || gateway.path() != "/"
-            || gateway.query().is_some()
-            || gateway.fragment().is_some()
-        {
-            return Err(AppError::invalid_request("invalid MTS test gateway"));
-        }
-        Self::from_gateway(gateway)
+        Self::new_for_test_with_origins(gateway.clone(), gateway)
     }
 
-    fn from_gateway(gateway: Url) -> Result<Self, AppError> {
+    #[cfg(feature = "test-support")]
+    pub fn new_for_test_with_origins(gateway: Url, resident: Url) -> Result<Self, AppError> {
+        validate_origin(&gateway, "invalid MTS test gateway")?;
+        validate_origin(&resident, "invalid MTS test resident origin")?;
+        Self::from_origins(gateway, resident)
+    }
+
+    fn from_origins(gateway: Url, resident: Url) -> Result<Self, AppError> {
         let http = Client::builder()
             .redirect(Policy::none())
+            .retry(reqwest::retry::never())
             .cookie_store(false)
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(transport_error)?;
         Ok(Self {
-            inner: Arc::new(Inner { http, gateway }),
+            inner: Arc::new(Inner {
+                http,
+                gateway,
+                resident,
+            }),
         })
     }
 
-    fn request(&self, method: Method, path: &str) -> Result<RequestBuilder, AppError> {
-        let endpoint = self
-            .inner
-            .gateway
-            .join(path.trim_start_matches('/'))
-            .map_err(AppError::url)?;
-        if !same_origin(&endpoint, &self.inner.gateway)
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(AppError::invalid_request("invalid MTS auth endpoint"));
-        }
+    fn gateway_request(&self, method: Method, path: &str) -> Result<RequestBuilder, AppError> {
+        let endpoint = endpoint(&self.inner.gateway, path)?;
         Ok(self
             .inner
             .http
@@ -113,6 +107,13 @@ impl MtsAuthApi {
             .header(DEVICE_TYPE_HEADER, "ANDROID")
             .header(REQUEST_ID_HEADER, Uuid::new_v4().to_string())
             .header(ACCEPT, "application/json"))
+    }
+
+    fn legacy_request(&self, method: Method, path: &str) -> Result<RequestBuilder, AppError> {
+        Ok(self
+            .inner
+            .http
+            .request(method, endpoint(&self.inner.resident, path)?))
     }
 }
 
@@ -127,7 +128,7 @@ impl ProviderAuthApi for MtsAuthApi {
             refresh_token: refresh_token.expose_secret(),
         };
         let mut request = self
-            .request(Method::PUT, KEYCLOAK_REFRESH_PATH)?
+            .gateway_request(Method::PUT, KEYCLOAK_REFRESH_PATH)?
             .header(CONTENT_TYPE, "application/json")
             .json(&body);
         if let Some(device_token) = device_token {
@@ -143,7 +144,7 @@ impl ProviderAuthApi for MtsAuthApi {
         device_token: Option<&SecretString>,
     ) -> Result<SecretString, AppError> {
         let mut request = self
-            .request(Method::PUT, WEB_SSO_REFRESH_PATH)?
+            .gateway_request(Method::PUT, WEB_SSO_REFRESH_PATH)?
             .header(AUTHORIZATION, bearer_header(access_token)?)
             .body(Vec::new());
         if let Some(device_token) = device_token {
@@ -157,22 +158,65 @@ impl ProviderAuthApi for MtsAuthApi {
         &self,
         refresh_token: &SecretString,
         device_token: Option<&SecretString>,
+        auth_flavor: AuthFlavor,
     ) -> Result<(), AppError> {
         let body = RefreshRequest {
             refresh_token: refresh_token.expose_secret(),
         };
-        let mut request = self
-            .request(Method::POST, LOGOUT_PATH)?
-            .header(CONTENT_TYPE, "application/json")
-            .json(&body);
-        if let Some(device_token) = device_token {
-            request = request.header(DEVICE_TOKEN_HEADER, secret_header(device_token)?);
+        let response = match auth_flavor {
+            AuthFlavor::WebSso => {
+                let mut request = self
+                    .gateway_request(Method::POST, LOGOUT_PATH)?
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&body);
+                if let Some(device_token) = device_token {
+                    request = request.header(DEVICE_TOKEN_HEADER, secret_header(device_token)?);
+                }
+                request.send().await
+            }
+            AuthFlavor::LegacySms => {
+                self.legacy_request(Method::POST, LOGOUT_PATH)?
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+            }
         }
-        let response = request.send().await.map_err(transport_error)?;
+        .map_err(transport_error)?;
         let response = classify(response).await?;
         let _ = read_bounded(response).await?;
         Ok(())
     }
+}
+
+#[cfg(feature = "test-support")]
+fn validate_origin(origin: &Url, message: &'static str) -> Result<(), AppError> {
+    if origin.host_str().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        Err(AppError::invalid_request(message))
+    } else {
+        Ok(())
+    }
+}
+
+fn endpoint(origin: &Url, path: &str) -> Result<Url, AppError> {
+    let endpoint = origin
+        .join(path.trim_start_matches('/'))
+        .map_err(AppError::url)?;
+    if !same_origin(&endpoint, origin)
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(AppError::invalid_request("invalid MTS auth endpoint"));
+    }
+    Ok(endpoint)
 }
 
 #[derive(serde::Serialize)]

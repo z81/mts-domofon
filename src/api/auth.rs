@@ -237,13 +237,10 @@ async fn confirm_legacy_sms(
             ),
         )
     })?;
-    let tokens = legacy
-        .confirm(&flow_id, request.code)
-        .await
-        .map_err(|error| ApiError::new(request_id, error))?;
     let coordinator = coordinator(&state, request_id)?;
+    let confirmation = coordinator.prepare_legacy_confirmation().await;
     coordinator
-        .install_legacy_tokens(tokens.access_token, tokens.refresh_token)
+        .complete_legacy_sms(confirmation, &legacy, &flow_id, request.code)
         .await
         .map(Json)
         .map_err(|error| ApiError::new(request_id, error))

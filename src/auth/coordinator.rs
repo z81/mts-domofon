@@ -7,11 +7,11 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     domain::auth::{
-        AuthFlowId, AuthProgress, ChallengeInput, PersistedSession, SessionStatus, SessionView,
-        TokenBundle,
+        AuthFlavor, AuthFlowId, AuthProgress, ChallengeInput, PersistedSession, SessionStatus,
+        SessionView, TokenBundle,
     },
     error::{AppError, ErrorCode},
-    provider::mts::{ProviderAuthApi, TokenSource, sso::MtsSsoTransport},
+    provider::mts::{ProviderAuthApi, TokenSource, sms::MtsLegacySmsAuth, sso::MtsSsoTransport},
     storage::SecretStore,
 };
 
@@ -93,6 +93,11 @@ pub struct AuthCoordinator {
     clock: Arc<dyn AuthClock>,
 }
 
+#[derive(Clone, Copy)]
+pub struct LegacyConfirmation {
+    observed_generation: u64,
+}
+
 struct CoordinatorState {
     generation: u64,
     session: SessionState,
@@ -108,7 +113,7 @@ enum SessionState {
 struct ExpiredSession {
     refresh_token: SecretString,
     device_token: Option<SecretString>,
-    uses_web_sso: bool,
+    auth_flavor: AuthFlavor,
     authenticated_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 }
@@ -117,7 +122,7 @@ struct RefreshMaterial {
     generation: u64,
     refresh_token: SecretString,
     device_token: Option<SecretString>,
-    uses_web_sso: bool,
+    auth_flavor: AuthFlavor,
     authenticated_at: DateTime<Utc>,
 }
 
@@ -172,7 +177,11 @@ impl AuthCoordinator {
 
     pub async fn start(&self) -> Result<AuthProgress, AppError> {
         let _operation = self.operation.lock().await;
-        self.transport.start().await
+        let progress = self.transport.start().await?;
+        let mut state = self.state.write().await;
+        state.generation = next_generation(state.generation)?;
+        state.last_refresh = None;
+        Ok(progress)
     }
 
     pub async fn complete_callback(
@@ -187,6 +196,7 @@ impl AuthCoordinator {
             .await?;
         let session = PersistedSession {
             tokens,
+            auth_flavor: AuthFlavor::WebSso,
             authenticated_at: self.clock.now(),
         };
         self.store.save_session(&session).await?;
@@ -198,19 +208,32 @@ impl AuthCoordinator {
         Ok(AuthProgress::Authenticated { session: view })
     }
 
-    pub async fn install_legacy_tokens(
+    pub async fn prepare_legacy_confirmation(&self) -> LegacyConfirmation {
+        LegacyConfirmation {
+            observed_generation: self.state.read().await.generation,
+        }
+    }
+
+    pub async fn complete_legacy_sms(
         &self,
-        access_token: SecretString,
-        refresh_token: SecretString,
+        confirmation: LegacyConfirmation,
+        legacy: &MtsLegacySmsAuth,
+        flow_id: &AuthFlowId,
+        code: SecretString,
     ) -> Result<AuthProgress, AppError> {
         let _operation = self.operation.lock().await;
+        if self.state.read().await.generation != confirmation.observed_generation {
+            return Err(stale_legacy_confirmation_error());
+        }
+        let tokens = legacy.confirm(flow_id, code).await?;
         let session = PersistedSession {
             tokens: TokenBundle {
-                access_token,
-                refresh_token,
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
                 web_sso_access_token: None,
                 device_token: None,
             },
+            auth_flavor: AuthFlavor::LegacySms,
             authenticated_at: self.clock.now(),
         };
         self.store.save_session(&session).await?;
@@ -260,7 +283,7 @@ impl AuthCoordinator {
                 return Err(error);
             }
         };
-        let web_sso_access_token = if material.uses_web_sso {
+        let web_sso_access_token = if material.auth_flavor == AuthFlavor::WebSso {
             match self
                 .provider
                 .rotate_web_sso(&keycloak.access_token, material.device_token.as_ref())
@@ -290,6 +313,7 @@ impl AuthCoordinator {
                 web_sso_access_token,
                 device_token: material.device_token.clone(),
             },
+            auth_flavor: material.auth_flavor,
             authenticated_at: material.authenticated_at,
         };
         if let Err(error) = self.store.save_session(&replacement).await {
@@ -324,10 +348,13 @@ impl AuthCoordinator {
                 SessionState::Active(session) => Some((
                     session.tokens.refresh_token.clone(),
                     session.tokens.device_token.clone(),
+                    session.auth_flavor,
                 )),
-                SessionState::Expired(session) => {
-                    Some((session.refresh_token.clone(), session.device_token.clone()))
-                }
+                SessionState::Expired(session) => Some((
+                    session.refresh_token.clone(),
+                    session.device_token.clone(),
+                    session.auth_flavor,
+                )),
                 SessionState::Anonymous => None,
             };
             state.generation = next_generation(state.generation)?;
@@ -338,9 +365,9 @@ impl AuthCoordinator {
         self.transport.clear();
 
         let storage_result = self.store.clear_session().await;
-        let warning = if let Some((refresh_token, device_token)) = logout_material {
+        let warning = if let Some((refresh_token, device_token, auth_flavor)) = logout_material {
             self.provider
-                .logout(&refresh_token, device_token.as_ref())
+                .logout(&refresh_token, device_token.as_ref(), auth_flavor)
                 .await
                 .err()
                 .map(|_| LogoutWarning::UpstreamLogoutFailed)
@@ -357,7 +384,7 @@ impl AuthCoordinator {
         state.session = SessionState::Expired(ExpiredSession {
             refresh_token: material.refresh_token,
             device_token: material.device_token,
-            uses_web_sso: material.uses_web_sso,
+            auth_flavor: material.auth_flavor,
             authenticated_at: material.authenticated_at,
             expires_at: self.clock.now(),
         });
@@ -419,14 +446,14 @@ fn refresh_material(state: &CoordinatorState) -> Result<RefreshMaterial, AppErro
             generation: state.generation,
             refresh_token: session.tokens.refresh_token.clone(),
             device_token: session.tokens.device_token.clone(),
-            uses_web_sso: session.tokens.web_sso_access_token.is_some(),
+            auth_flavor: session.auth_flavor,
             authenticated_at: session.authenticated_at,
         }),
         SessionState::Expired(session) => Ok(RefreshMaterial {
             generation: state.generation,
             refresh_token: session.refresh_token.clone(),
             device_token: session.device_token.clone(),
-            uses_web_sso: session.uses_web_sso,
+            auth_flavor: session.auth_flavor,
             authenticated_at: session.authenticated_at,
         }),
         SessionState::Anonymous => Err(session_expired_error()),
@@ -471,6 +498,14 @@ fn session_expired_error() -> AppError {
     AppError::new(
         ErrorCode::SessionExpired,
         "Provider session expired.",
+        false,
+    )
+}
+
+fn stale_legacy_confirmation_error() -> AppError {
+    AppError::new(
+        ErrorCode::AuthFlowNotFound,
+        "Legacy SMS authentication flow is no longer current.",
         false,
     )
 }
