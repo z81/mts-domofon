@@ -74,18 +74,23 @@ base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4.45", features = ["serde"] }
 futures-util = "0.3"
+fcm-push-listener = { path = "vendor/fcm-push-listener" }
 fs2 = "0.4"
 http = "1"
 httpdate = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["cookies", "gzip", "json", "multipart", "query", "rustls", "stream"] }
 rand = "0.9"
 percent-encoding = "2"
+md-5 = { version = "0.11.0", features = ["zeroize"] }
 rustix = { version = "1", features = ["fs"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots", "url"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["catch-panic", "compression-gzip", "cors", "fs", "limit", "request-id", "sensitive-headers", "set-header", "trace"] }
 tracing = "0.1"
