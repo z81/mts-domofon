@@ -20,8 +20,11 @@ use domru_mts::{
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
+use tracing::instrument::WithSubscriber;
 use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
+
+static TRACING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 struct BufferWriter(Arc<Mutex<Vec<u8>>>);
@@ -51,6 +54,7 @@ async fn body_json(response: axum::response::Response) -> Value {
 
 #[tokio::test]
 async fn error_response_is_stable_and_hides_cause() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     let err = ApiError::new(
         RequestId::parse("e7411f58-d5e9-4a43-b25d-88ddf2014713").unwrap(),
         AppError::upstream_auth("Bearer secret-token", Some("mts-42".into())),
@@ -67,8 +71,9 @@ async fn error_response_is_stable_and_hides_cause() {
     assert!(!json.to_string().contains("mts-42"));
 }
 
-#[test]
-fn error_logging_redacts_the_cause_and_upstream_request_id() {
+#[tokio::test(flavor = "current_thread")]
+async fn error_logging_redacts_the_cause_and_upstream_request_id() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     let output = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .json()
@@ -92,13 +97,13 @@ fn error_logging_redacts_the_cause_and_upstream_request_id() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn request_tracing_redacts_sensitive_query_values() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     let output = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .json()
         .with_writer(BufferWriter(Arc::clone(&output)))
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
-    let _guard = tracing::dispatcher::set_default(&dispatch);
     let uri = concat!(
         "/health/live?camera=front-door",
         "&token=token-secret",
@@ -116,6 +121,7 @@ async fn request_tracing_redacts_sensitive_query_values() {
     let response = app::test_router()
         .await
         .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .with_subscriber(dispatch)
         .await
         .unwrap();
 
@@ -157,6 +163,7 @@ async fn request_tracing_redacts_sensitive_query_values() {
 
 #[tokio::test]
 async fn handler_receives_original_uri_and_redacted_uri_extension() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     async fn handler(uri: Uri, Extension(redacted_uri): Extension<RedactedUri>) -> String {
         format!("{uri}\n{redacted_uri}")
     }
@@ -178,6 +185,7 @@ async fn handler_receives_original_uri_and_redacted_uri_extension() {
 
 #[tokio::test]
 async fn valid_request_id_is_retained_in_the_response() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     let app = app::test_router().await;
     let request_id = "e7411f58-d5e9-4a43-b25d-88ddf2014713";
 
@@ -197,6 +205,7 @@ async fn valid_request_id_is_retained_in_the_response() {
 
 #[tokio::test]
 async fn malformed_or_oversized_request_ids_are_replaced() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     for inbound in ["not-a-uuid", &"a".repeat(8_192)] {
         let app = app::test_router().await;
         let response = app
@@ -217,6 +226,7 @@ async fn malformed_or_oversized_request_ids_are_replaced() {
 
 #[tokio::test]
 async fn error_json_request_id_matches_the_response_header() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     async fn handler(Extension(request_id): Extension<RequestId>) -> ApiError {
         ApiError::new(
             request_id,
@@ -243,6 +253,7 @@ async fn error_json_request_id_matches_the_response_header() {
 
 #[tokio::test]
 async fn sensitive_headers_remain_sensitive_at_the_handler_boundary() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     async fn handler(request: Request<Body>) -> StatusCode {
         for name in [
             "authorization",
@@ -291,6 +302,7 @@ async fn sensitive_headers_remain_sensitive_at_the_handler_boundary() {
 
 #[tokio::test]
 async fn set_cookie_response_header_is_marked_sensitive() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     async fn handler() -> axum::response::Response {
         let mut response = StatusCode::NO_CONTENT.into_response();
         response.headers_mut().insert(
