@@ -29,7 +29,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
-use tracing::instrument::WithSubscriber;
 use tracing_subscriber::fmt::MakeWriter;
 use url::Url;
 
@@ -665,6 +664,8 @@ async fn errors_match_request_ids_and_never_log_or_echo_callback_material() {
         .with_ansi(false)
         .with_writer(BufferWriter(log_buffer.clone()))
         .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("auth API test installs one process-wide tracing subscriber");
     let request_id = "e7411f58-d5e9-4a43-b25d-88ddf2014713";
     let callback_body = serde_json::to_string(&json!({
         "callback_url": CALLBACK_SECRET
@@ -678,23 +679,39 @@ async fn errors_match_request_ids_and_never_log_or_echo_callback_material() {
             Request::builder()
                 .method(Method::POST)
                 .uri(format!(
-                    "/api/v1/auth/flows/{FLOW_ID_HYPHENATED}/callback?code=query-code-secret&state=query-state-secret&callback_url=query-callback-secret"
+                    "/api/v1/auth/flows/{FLOW_ID_HYPHENATED}/callback?code=query-code-secret&state=query-state-secret&callback_url=query-callback-secret&phone=query-phone-secret&password=query-password-secret&answer=query-answer-secret&future=query-future-secret"
                 ))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-request-id", request_id)
                 .body(Body::from(callback_body))
                 .unwrap(),
         )
-        .with_subscriber(subscriber)
         .await
         .unwrap();
     let (status, headers, error, raw) = response_json(response).await;
+
+    let compatibility = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/login?phone=compat-phone-secret&password=compat-password-secret&answer=compat-answer-secret&future=compat-future-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let logs = String::from_utf8(log_buffer.lock().unwrap().clone()).unwrap();
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(headers["x-request-id"], request_id);
     assert_eq!(error["requestId"], request_id);
     assert_eq!(error["code"], "auth_flow_not_found");
+    assert_eq!(compatibility.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(logs.contains("/api/v1/auth/flows/"));
+    assert!(logs.contains("/api/login"));
+    assert!(logs.contains("[REDACTED]") || logs.contains("%5BREDACTED%5D"));
     for output in [&raw, &logs] {
         assert!(!output.contains("callback-code-secret"));
         assert!(!output.contains("callback-state-secret"));
@@ -702,6 +719,14 @@ async fn errors_match_request_ids_and_never_log_or_echo_callback_material() {
         assert!(!output.contains("query-code-secret"));
         assert!(!output.contains("query-state-secret"));
         assert!(!output.contains("query-callback-secret"));
+        assert!(!output.contains("query-phone-secret"));
+        assert!(!output.contains("query-password-secret"));
+        assert!(!output.contains("query-answer-secret"));
+        assert!(!output.contains("query-future-secret"));
+        assert!(!output.contains("compat-phone-secret"));
+        assert!(!output.contains("compat-password-secret"));
+        assert!(!output.contains("compat-answer-secret"));
+        assert!(!output.contains("compat-future-secret"));
     }
 }
 

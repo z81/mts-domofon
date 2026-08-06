@@ -54,6 +54,10 @@ impl RedactedUri {
     fn from_uri(uri: &Uri) -> Self {
         let mut output = uri.path().to_owned();
         if let Some(query) = uri.query() {
+            if is_auth_route_path(uri.path()) {
+                output.push_str("?[REDACTED]");
+                return Self(output);
+            }
             let mut serializer = url::form_urlencoded::Serializer::new(String::new());
             for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
                 if is_sensitive_query_key(&key) {
@@ -67,6 +71,21 @@ impl RedactedUri {
         }
         Self(output)
     }
+}
+
+fn is_auth_route_path(path: &str) -> bool {
+    path == "/api/v1/auth"
+        || path.starts_with("/api/v1/auth/")
+        || matches!(
+            path,
+            "/api/v1/session"
+                | "/api/v1/session/refresh"
+                | "/api/login"
+                | "/api/confirm"
+                | "/api/session"
+                | "/api/refresh"
+                | "/api/logout"
+        )
 }
 
 impl fmt::Display for RedactedUri {
