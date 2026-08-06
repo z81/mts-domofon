@@ -56,21 +56,21 @@ impl AppConfig {
             "VDOME_WEB_DIST_DIR",
             DEFAULT_WEB_DIST_DIR,
         ));
-        let gateway = parse_base_url(value_or_default(
-            &values,
+        let gateway = parse_base_url(
+            value_or_default(&values, "VDOME_GATEWAY_URL", DEFAULT_GATEWAY_URL),
             "VDOME_GATEWAY_URL",
             DEFAULT_GATEWAY_URL,
-        ))?;
-        let resident = parse_base_url(value_or_default(
-            &values,
+        )?;
+        let resident = parse_base_url(
+            value_or_default(&values, "VDOME_RESIDENT_URL", DEFAULT_RESIDENT_URL),
             "VDOME_RESIDENT_URL",
             DEFAULT_RESIDENT_URL,
-        ))?;
-        let call_endpoint = parse_call_endpoint(value_or_default(
-            &values,
+        )?;
+        let call_endpoint = parse_call_endpoint(
+            value_or_default(&values, "VDOME_CALL_ENDPOINT", DEFAULT_CALL_ENDPOINT),
             "VDOME_CALL_ENDPOINT",
             DEFAULT_CALL_ENDPOINT,
-        ))?;
+        )?;
 
         Ok(Self {
             bind,
@@ -91,6 +91,11 @@ pub enum ConfigError {
     InvalidUrl(#[from] url::ParseError),
     #[error("provider URL must use https")]
     ProviderUrlMustUseHttps,
+    #[error("{setting} must be exactly {expected}")]
+    UnapprovedProviderUrl {
+        setting: &'static str,
+        expected: &'static str,
+    },
     #[error("call endpoint must have exact /ws path and no query or fragment")]
     InvalidCallEndpoint,
 }
@@ -103,28 +108,47 @@ fn value_or_default<'a>(
     values.get(key).map_or(default, String::as_str)
 }
 
-fn parse_base_url(value: &str) -> Result<Url, ConfigError> {
+fn parse_base_url(
+    value: &str,
+    setting: &'static str,
+    expected: &'static str,
+) -> Result<Url, ConfigError> {
     let mut url = parse_https_url(value)?;
     if !url.path().ends_with('/') {
         let mut path = url.path().to_owned();
         path.push('/');
         url.set_path(&path);
     }
-    Ok(url)
+    require_exact_url(url, setting, expected)
 }
 
-fn parse_call_endpoint(value: &str) -> Result<Url, ConfigError> {
+fn parse_call_endpoint(
+    value: &str,
+    setting: &'static str,
+    expected: &'static str,
+) -> Result<Url, ConfigError> {
     let url = parse_https_url(value)?;
     if url.path() != "/ws" || url.query().is_some() || url.fragment().is_some() {
         return Err(ConfigError::InvalidCallEndpoint);
     }
-    Ok(url)
+    require_exact_url(url, setting, expected)
 }
 
 fn parse_https_url(value: &str) -> Result<Url, ConfigError> {
     let url = Url::parse(value)?;
     if url.scheme() != "https" {
         return Err(ConfigError::ProviderUrlMustUseHttps);
+    }
+    Ok(url)
+}
+
+fn require_exact_url(
+    url: Url,
+    setting: &'static str,
+    expected: &'static str,
+) -> Result<Url, ConfigError> {
+    if url.as_str() != expected {
+        return Err(ConfigError::UnapprovedProviderUrl { setting, expected });
     }
     Ok(url)
 }
