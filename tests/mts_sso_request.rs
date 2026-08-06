@@ -140,6 +140,30 @@ fn validates_only_the_expected_raw_https_gateway_callback_and_state() {
 }
 
 #[test]
+fn rejects_raw_callback_path_ambiguities_without_disclosing_input() {
+    let request = SsoRequest::new(FIXED_DEVICE_ID, FIXED_STATE).unwrap();
+
+    for path in [
+        "/user-service/api/auth/%2e/callback",
+        "/user-service/api/auth/segment/%2e%2e/callback",
+        "/user-service/api/auth%2fcallback",
+        "/user-service/api/auth%5ccallback",
+        "/user-service/api/./auth/callback",
+        "/user-service//api/auth/callback",
+        "/user-service/api/auth/callback;params",
+        "/user-service/api/auth/callback/extra",
+        "/",
+    ] {
+        let callback = format!("https://gateway.vdome.mts.ru{path}?state={FIXED_STATE}");
+        let error = request.validate_callback(&callback).unwrap_err();
+
+        assert!(!error.to_string().contains(&callback));
+        assert!(!format!("{error:?}").contains(&callback));
+        assert!(!error.to_string().contains(FIXED_STATE));
+    }
+}
+
+#[test]
 fn rejects_malformed_short_and_long_states_at_each_boundary() {
     let malformed = "!AECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
     let short = &FIXED_STATE[..42];

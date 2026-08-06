@@ -9,6 +9,7 @@ use crate::error::AppError;
 const AUTHORIZE_URL: &str = "https://login.mts.ru/amserver/oauth2/authorize";
 const CALLBACK_URL: &str = "https://gateway.vdome.mts.ru/user-service/api/auth/callback";
 const CALLBACK_HOST: &str = "gateway.vdome.mts.ru";
+const CALLBACK_PATH: &str = "/user-service/api/auth/callback";
 const SCOPE: &str = "account address sso profile ssom openid phone";
 
 /// A server-side MTS ID authorization flow request.
@@ -62,7 +63,7 @@ impl SsoRequest {
     }
 
     pub fn validate_callback(&self, callback_raw: &str) -> Result<(), AppError> {
-        if raw_callback_authority(callback_raw) != Some(CALLBACK_HOST) {
+        if !has_exact_raw_callback_target(callback_raw) {
             return Err(AppError::invalid_request("invalid MTS callback URL"));
         }
 
@@ -73,7 +74,7 @@ impl SsoRequest {
             && callback.password().is_none()
             && callback.host_str() == Some(CALLBACK_HOST)
             && callback.port().is_none()
-            && callback.path() == "/user-service/api/auth/callback"
+            && callback.path() == CALLBACK_PATH
             && callback.fragment().is_none();
         if !is_expected_callback {
             return Err(AppError::invalid_request("invalid MTS callback URL"));
@@ -111,16 +112,26 @@ pub fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn raw_callback_authority(callback: &str) -> Option<&str> {
-    let (scheme, remainder) = callback.split_once("://")?;
-    if scheme != "https" {
-        return None;
-    }
-    let authority = remainder
+fn has_exact_raw_callback_target(callback: &str) -> bool {
+    let Some(remainder) = callback.strip_prefix("https://") else {
+        return false;
+    };
+    let authority_end = remainder
         .split(['/', '?', '#'])
         .next()
-        .expect("split always returns at least one segment");
-    (authority == CALLBACK_HOST).then_some(authority)
+        .expect("split always returns at least one segment")
+        .len();
+    if &remainder[..authority_end] != CALLBACK_HOST {
+        return false;
+    }
+
+    let path_and_suffix = &remainder[authority_end..];
+    let path_end = path_and_suffix
+        .split(['?', '#'])
+        .next()
+        .expect("split always returns at least one segment")
+        .len();
+    path_and_suffix[..path_end] == *CALLBACK_PATH
 }
 
 fn decode_state(state: &str) -> Option<[u8; 32]> {
