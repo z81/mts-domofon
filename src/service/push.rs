@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use secrecy::SecretString;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -22,6 +22,7 @@ use crate::{
 
 const MAX_PENDING_BOOTSTRAPS: usize = 8;
 const MAX_SUPERVISOR_DELAY: Duration = Duration::from_secs(5 * 60);
+const HANDLER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[async_trait]
 pub trait PushAuthState: Send + Sync {
@@ -63,7 +64,7 @@ impl PushRegistrationClient for MtsClient {
 
 #[async_trait]
 pub trait IncomingCallHandler: Send + Sync {
-    async fn handle(&self, bootstrap: IncomingCallBootstrap);
+    async fn handle(&self, bootstrap: IncomingCallBootstrap, cancellation: CancellationToken);
 }
 
 #[async_trait]
@@ -290,31 +291,49 @@ impl PushSupervisor {
         }
 
         let (output, mut incoming) = mpsc::channel(MAX_PENDING_BOOTSTRAPS);
-        let service = self.bootstrap_service.run(output, cancellation.clone());
+        let service_cancellation = cancellation.child_token();
+        let service = self
+            .bootstrap_service
+            .run(output, service_cancellation.clone());
         tokio::pin!(service);
-        loop {
+        let mut handlers = JoinSet::new();
+        let mut handler_cancellation = None;
+        let outcome = loop {
             tokio::select! {
                 biased;
-                () = cancellation.cancelled() => return Ok(()),
+                () = cancellation.cancelled() => break Ok(()),
                 bootstrap = incoming.recv() => {
                     let Some(bootstrap) = bootstrap else {
-                        return service.await.map_err(ActiveError::Fcm);
+                        break service.await.map_err(ActiveError::Fcm);
                     };
                     let authenticated = tokio::select! {
-                        () = cancellation.cancelled() => return Ok(()),
+                        () = cancellation.cancelled() => break Ok(()),
                         authenticated = self.auth.is_authenticated() => authenticated,
                     };
                     if !authenticated {
-                        return Ok(());
+                        break Ok(());
                     }
-                    tokio::select! {
-                        () = cancellation.cancelled() => return Ok(()),
-                        () = self.handler.handle(bootstrap) => {}
+                    if handlers.is_empty() {
+                        let call_cancellation = cancellation.child_token();
+                        let handler = self.handler.clone();
+                        handler_cancellation = Some(call_cancellation.clone());
+                        handlers.spawn(async move {
+                            handler.handle(bootstrap, call_cancellation).await;
+                        });
                     }
                 }
-                result = &mut service => return result.map_err(ActiveError::Fcm),
+                result = handlers.join_next(), if !handlers.is_empty() => {
+                    handler_cancellation = None;
+                    if result.is_some_and(|result| result.is_err()) {
+                        break Err(ActiveError::Handler);
+                    }
+                }
+                result = &mut service => break result.map_err(ActiveError::Fcm),
             }
-        }
+        };
+        service_cancellation.cancel();
+        shutdown_handlers(&mut handlers, handler_cancellation).await;
+        outcome
     }
 
     async fn wait_retry_while_authenticated(
@@ -352,6 +371,7 @@ enum ActiveOutcome {
 
 enum ActiveError {
     Provider,
+    Handler,
     Fcm(FcmServiceError),
 }
 
@@ -359,5 +379,19 @@ async fn wait_or_cancel(delay: Duration, cancellation: &CancellationToken) -> bo
     tokio::select! {
         () = cancellation.cancelled() => false,
         () = tokio::time::sleep(delay) => true,
+    }
+}
+
+async fn shutdown_handlers(handlers: &mut JoinSet<()>, cancellation: Option<CancellationToken>) {
+    if let Some(cancellation) = cancellation {
+        cancellation.cancel();
+    }
+    let graceful = async { while handlers.join_next().await.is_some() {} };
+    if tokio::time::timeout(HANDLER_SHUTDOWN_TIMEOUT, graceful)
+        .await
+        .is_err()
+    {
+        handlers.abort_all();
+        while handlers.join_next().await.is_some() {}
     }
 }

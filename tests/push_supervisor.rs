@@ -75,6 +75,7 @@ struct MemoryStore {
     state: Mutex<Option<FcmSecretState>>,
     saves: AtomicUsize,
     clears: AtomicUsize,
+    persistent_count: AtomicUsize,
 }
 
 #[async_trait]
@@ -84,6 +85,8 @@ impl FcmSecretStore for MemoryStore {
     }
 
     async fn save(&self, state: &FcmSecretState) -> Result<(), FcmServiceError> {
+        self.persistent_count
+            .store(state.persistent_ids().len(), Ordering::SeqCst);
         *self.state.lock().await = Some(state.clone());
         self.saves.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -142,7 +145,7 @@ struct RecordingHandler {
 
 #[async_trait]
 impl IncomingCallHandler for RecordingHandler {
-    async fn handle(&self, bootstrap: IncomingCallBootstrap) {
+    async fn handle(&self, bootstrap: IncomingCallBootstrap, _cancellation: CancellationToken) {
         self.valid_bootstrap.store(
             bootstrap.caller_name() == "Private caller label"
                 && bootstrap.websocket_url().expose_secret() == "wss://webrtc.invalid/ws",
@@ -160,10 +163,45 @@ struct LogoutOnFirstHandler {
 
 #[async_trait]
 impl IncomingCallHandler for LogoutOnFirstHandler {
-    async fn handle(&self, _bootstrap: IncomingCallBootstrap) {
+    async fn handle(&self, _bootstrap: IncomingCallBootstrap, _cancellation: CancellationToken) {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             self.auth.0.store(false, Ordering::SeqCst);
         }
+    }
+}
+
+#[derive(Default)]
+struct BlockingHandler {
+    calls: AtomicUsize,
+    cancellation_seen: AtomicBool,
+    completed: AtomicBool,
+    started_gate: Option<Arc<Notify>>,
+}
+
+#[async_trait]
+impl IncomingCallHandler for BlockingHandler {
+    async fn handle(&self, _bootstrap: IncomingCallBootstrap, cancellation: CancellationToken) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.started_gate {
+            gate.notify_waiters();
+        }
+        cancellation.cancelled().await;
+        self.cancellation_seen.store(true, Ordering::SeqCst);
+        tokio::task::yield_now().await;
+        self.completed.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Default)]
+struct UncooperativeHandler {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl IncomingCallHandler for UncooperativeHandler {
+    async fn handle(&self, _bootstrap: IncomingCallBootstrap, _cancellation: CancellationToken) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::future::pending().await
     }
 }
 
@@ -172,6 +210,7 @@ struct ControlledTransport {
     listens: AtomicUsize,
     cancellations: AtomicUsize,
     emit_count: usize,
+    between_events: Option<Arc<Notify>>,
     reject_old: bool,
 }
 
@@ -202,6 +241,11 @@ impl FcmTransport for ControlledTransport {
             return Err(FcmServiceError::Transport);
         }
         for index in 0..self.emit_count {
+            if index > 0
+                && let Some(gate) = &self.between_events
+            {
+                gate.notified().await;
+            }
             events
                 .send(FcmTransportEvent::data(
                     wake_up_body(),
@@ -291,6 +335,7 @@ async fn anonymous_supervisor_clears_stale_state_once_without_network_work_or_bu
         listens: AtomicUsize::new(0),
         cancellations: AtomicUsize::new(0),
         emit_count: 0,
+        between_events: None,
         reject_old: false,
     });
     let store = Arc::new(MemoryStore::default());
@@ -333,6 +378,7 @@ async fn active_supervisor_registers_token_persists_state_and_forwards_bootstrap
         listens: AtomicUsize::new(0),
         cancellations: AtomicUsize::new(0),
         emit_count: 1,
+        between_events: None,
         reject_old: false,
     });
     let store = Arc::new(MemoryStore::default());
@@ -374,6 +420,7 @@ async fn logout_cancels_listener_clears_state_and_waits_without_restarting_netwo
         listens: AtomicUsize::new(0),
         cancellations: AtomicUsize::new(0),
         emit_count: 0,
+        between_events: None,
         reject_old: false,
     });
     let store = Arc::new(MemoryStore::default());
@@ -411,6 +458,158 @@ async fn logout_cancels_listener_clears_state_and_waits_without_restarting_netwo
 }
 
 #[tokio::test]
+async fn blocking_handler_does_not_stop_fcm_event_processing() {
+    let auth = Arc::new(ToggleAuth(AtomicBool::new(true)));
+    let provider = Arc::new(RecordingProvider::default());
+    let started_gate = Arc::new(Notify::new());
+    let handler = Arc::new(BlockingHandler {
+        started_gate: Some(started_gate.clone()),
+        ..BlockingHandler::default()
+    });
+    let transport = Arc::new(ControlledTransport {
+        registrations: AtomicUsize::new(0),
+        listens: AtomicUsize::new(0),
+        cancellations: AtomicUsize::new(0),
+        emit_count: 2,
+        between_events: Some(started_gate),
+        reject_old: false,
+    });
+    let store = Arc::new(MemoryStore::default());
+    let supervisor = PushSupervisor::new(
+        auth,
+        provider,
+        handler.clone(),
+        transport,
+        store.clone(),
+        FirebaseConfig::new(
+            "test-app-id",
+            "test-project-id",
+            SecretString::from("private-api-key"),
+        )
+        .unwrap(),
+        config(),
+    );
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move { supervisor.run(cancellation).await }
+    });
+
+    wait_until(|| handler.calls.load(Ordering::SeqCst) == 1).await;
+    wait_until(|| store.persistent_count.load(Ordering::SeqCst) == 2).await;
+    assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(handler.cancellation_seen.load(Ordering::SeqCst));
+    assert!(handler.completed.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn logout_cancels_and_awaits_handler_before_clearing_push_state() {
+    let auth = Arc::new(ToggleAuth(AtomicBool::new(true)));
+    let provider = Arc::new(RecordingProvider::default());
+    let handler = Arc::new(BlockingHandler::default());
+    let transport = Arc::new(ControlledTransport {
+        registrations: AtomicUsize::new(0),
+        listens: AtomicUsize::new(0),
+        cancellations: AtomicUsize::new(0),
+        emit_count: 1,
+        between_events: None,
+        reject_old: false,
+    });
+    let store = Arc::new(MemoryStore::default());
+    let supervisor = PushSupervisor::new(
+        auth.clone(),
+        provider,
+        handler.clone(),
+        transport,
+        store.clone(),
+        FirebaseConfig::new(
+            "test-app-id",
+            "test-project-id",
+            SecretString::from("private-api-key"),
+        )
+        .unwrap(),
+        config(),
+    );
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move { supervisor.run(cancellation).await }
+    });
+
+    wait_until(|| handler.calls.load(Ordering::SeqCst) == 1).await;
+    auth.0.store(false, Ordering::SeqCst);
+    wait_until(|| store.clears.load(Ordering::SeqCst) == 1).await;
+    assert!(handler.cancellation_seen.load(Ordering::SeqCst));
+    assert!(handler.completed.load(Ordering::SeqCst));
+
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncooperative_handler_gets_fifteen_seconds_before_bounded_abort() {
+    let auth = Arc::new(ToggleAuth(AtomicBool::new(true)));
+    let provider = Arc::new(RecordingProvider::default());
+    let handler = Arc::new(UncooperativeHandler::default());
+    let transport = Arc::new(ControlledTransport {
+        registrations: AtomicUsize::new(0),
+        listens: AtomicUsize::new(0),
+        cancellations: AtomicUsize::new(0),
+        emit_count: 1,
+        between_events: None,
+        reject_old: false,
+    });
+    let store = Arc::new(MemoryStore::default());
+    let supervisor = PushSupervisor::new(
+        auth,
+        provider,
+        handler.clone(),
+        transport,
+        store,
+        FirebaseConfig::new(
+            "test-app-id",
+            "test-project-id",
+            SecretString::from("private-api-key"),
+        )
+        .unwrap(),
+        config(),
+    );
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move { supervisor.run(cancellation).await }
+    });
+
+    while handler.calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    cancellation.cancel();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(14)).await;
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn queued_bootstraps_are_not_dispatched_after_logout() {
     let auth = Arc::new(ToggleAuth(AtomicBool::new(true)));
     let provider = Arc::new(RecordingProvider::default());
@@ -423,6 +622,7 @@ async fn queued_bootstraps_are_not_dispatched_after_logout() {
         listens: AtomicUsize::new(0),
         cancellations: AtomicUsize::new(0),
         emit_count: 2,
+        between_events: None,
         reject_old: false,
     });
     let store = Arc::new(MemoryStore::default());
@@ -468,6 +668,7 @@ async fn stale_saved_registration_is_cleared_once_then_replaced_with_fresh_regis
         listens: AtomicUsize::new(0),
         cancellations: AtomicUsize::new(0),
         emit_count: 1,
+        between_events: None,
         reject_old: true,
     });
     let store = Arc::new(MemoryStore::default());
