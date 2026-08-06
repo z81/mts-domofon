@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use async_trait::async_trait;
 use reqwest::Method;
+use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use url::form_urlencoded;
 
@@ -37,6 +38,11 @@ pub trait DeviceProvider: Send + Sync {
     ) -> Result<Vec<AccessPoint>, AppError>;
 
     async fn cameras(&self, flat: &FlatId) -> Result<Vec<Camera>, AppError>;
+}
+
+#[async_trait]
+pub trait LiveSourceProvider: Send + Sync {
+    async fn live_source(&self, flat: &FlatId, camera_id: &str) -> Result<SecretString, AppError>;
 }
 
 #[derive(Clone)]
@@ -130,6 +136,48 @@ impl DeviceProvider for MtsDeviceProvider {
             })
             .await?;
         Ok(merged.into_values().collect())
+    }
+}
+
+#[async_trait]
+impl LiveSourceProvider for MtsDeviceProvider {
+    async fn live_source(&self, flat: &FlatId, camera_id: &str) -> Result<SecretString, AppError> {
+        validate_optional_id(camera_id)?;
+        let source = self
+            .fold_pages(
+                CAMERAS_PATH,
+                flat,
+                None,
+                None::<SecretString>,
+                |selected, dto: CameraDto| {
+                    if dto.id != camera_id {
+                        return Ok(());
+                    }
+                    let candidate = dto
+                        .streams_to_watch
+                        .as_ref()
+                        .and_then(|streams| streams.selected())
+                        .or_else(|| dto.streams.as_ref().and_then(|streams| streams.selected()));
+                    if let (Some(existing), Some(candidate)) =
+                        (selected.as_ref(), candidate.as_ref())
+                        && existing.expose_secret() != candidate.expose_secret()
+                    {
+                        return Err(schema_error());
+                    }
+                    if selected.is_none() {
+                        *selected = candidate;
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+        source.ok_or_else(|| {
+            AppError::new(
+                ErrorCode::NotFound,
+                "Live camera source was not found.",
+                false,
+            )
+        })
     }
 }
 

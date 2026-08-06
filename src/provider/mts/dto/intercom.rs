@@ -1,9 +1,11 @@
 use std::{fmt, marker::PhantomData};
 
+use secrecy::SecretString;
 use serde::{
     Deserialize, Deserializer,
     de::{Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
+use url::Url;
 
 const MAX_STREAMS_PER_MAP: usize = 32;
 const MAX_STREAM_KEY_BYTES: usize = 128;
@@ -109,12 +111,16 @@ where
 }
 
 pub(crate) struct StreamMapEvidence {
-    has_nonblank_value: bool,
+    preferred: Option<SecretString>,
 }
 
 impl StreamMapEvidence {
     pub(crate) fn available(&self) -> bool {
-        self.has_nonblank_value
+        self.preferred.is_some()
+    }
+
+    pub(crate) fn selected(&self) -> Option<SecretString> {
+        self.preferred.clone()
     }
 }
 
@@ -141,7 +147,8 @@ impl<'de> Visitor<'de> for StreamMapVisitor {
         A: MapAccess<'de>,
     {
         let mut count = 0_usize;
-        let mut has_nonblank_value = false;
+        let mut first = None;
+        let mut rtsp = None;
         while let Some(key) = map.next_key::<String>()? {
             count += 1;
             if count > MAX_STREAMS_PER_MAP || key.len() > MAX_STREAM_KEY_BYTES {
@@ -151,10 +158,31 @@ impl<'de> Visitor<'de> for StreamMapVisitor {
             if value.len() > MAX_STREAM_VALUE_BYTES {
                 return Err(A::Error::custom("stream value exceeds its bound"));
             }
-            has_nonblank_value |= !value.trim().is_empty();
+            if let Some(source) = live_source(&value) {
+                if first.is_none() {
+                    first = Some(source.clone());
+                }
+                if key == "rtsp" {
+                    rtsp = Some(source);
+                }
+            }
         }
-        Ok(StreamMapEvidence { has_nonblank_value })
+        Ok(StreamMapEvidence {
+            preferred: rtsp.or(first),
+        })
     }
+}
+
+fn live_source(value: &str) -> Option<SecretString> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "rtsp" | "rtsps") || url.host().is_none() || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(SecretString::from(value.to_owned()))
 }
 
 #[derive(Deserialize)]

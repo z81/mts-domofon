@@ -6,11 +6,11 @@ use domru_mts::{
     error::{AppError, ErrorCode},
     provider::mts::{
         MtsClient, TokenSource,
-        intercom::{DeviceProvider, MtsDeviceProvider},
+        intercom::{DeviceProvider, LiveSourceProvider, MtsDeviceProvider},
     },
     service::devices::DeviceService,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::Mutex;
 use url::Url;
 use wiremock::{
@@ -200,6 +200,42 @@ async fn cameras_map_independent_capabilities_without_disclosing_private_media_d
         requests[0].url.query(),
         Some("flatId=flat-synthetic&page=0&size=100&sort=name%2Casc")
     );
+}
+
+#[tokio::test]
+async fn live_source_prefers_rtsp_to_watch_without_exposing_it_in_inventory() {
+    let server = MockServer::start().await;
+    let mut page = single_camera_page(
+        "camera-live-source",
+        serde_json::json!({
+            "rtsp": "rtsp://fallback.invalid/private",
+            "other": "rtsp://fallback-first.invalid/private"
+        }),
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+    );
+    page["content"][0]["streamsToWatch"] = serde_json::json!({
+        "other": "rtsp://watch-first.invalid/private",
+        "rtsp": "rtsp://watch.invalid/private"
+    });
+    Mock::given(method("GET"))
+        .and(path(CAMERA_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page))
+        .mount(&server)
+        .await;
+    let provider = MtsDeviceProvider::new(client(&server));
+    let flat = FlatId("flat-live-source".to_owned());
+
+    let source = provider
+        .live_source(&flat, "camera-live-source")
+        .await
+        .unwrap();
+    let cameras = provider.cameras(&flat).await.unwrap();
+
+    assert_eq!(source.expose_secret(), "rtsp://watch.invalid/private");
+    let public = serde_json::to_string(&cameras).unwrap();
+    assert!(!public.contains("watch.invalid"));
+    assert!(!public.contains("fallback.invalid"));
 }
 
 #[tokio::test]
