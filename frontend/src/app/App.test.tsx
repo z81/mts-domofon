@@ -194,6 +194,44 @@ describe('live intercom dashboard', () => {
     await waitFor(() => expect(stopLive).toHaveBeenCalledWith('5d7a5769-adf9-4a41-9bd8-12427e0ae921'))
   })
 
+  it('requires a new user gesture after switching cameras away and back', async () => {
+    const user = userEvent.setup()
+    const startLive = vi.fn(async () => ({
+      sessionId: '5d7a5769-adf9-4a41-9bd8-12427e0ae921',
+      playlistUrl: '/api/v1/live/5d7a5769-adf9-4a41-9bd8-12427e0ae921/index.m3u8',
+    }))
+    const stopLive = vi.fn(async () => undefined)
+    const liveInventory: DeviceInventory = {
+      ...inventory,
+      cameras: [
+        {
+          ...inventory.cameras[0],
+          capabilities: { ...inventory.cameras[0].capabilities, live: available },
+        },
+        {
+          ...inventory.cameras[0],
+          id: 'camera-2',
+          name: 'Камера у калитки',
+          capabilities: { ...inventory.cameras[0].capabilities, live: available },
+        },
+      ],
+    }
+    vi.spyOn(HTMLMediaElement.prototype, 'canPlayType').mockReturnValue('probably')
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
+    render(<App api={createApi({ getDevices: async () => liveInventory, startLive, stopLive })} />)
+
+    const navigation = within(await screen.findByRole('complementary', { name: 'Основная навигация' }))
+    await user.click(navigation.getByRole('button', { name: 'Камеры' }))
+    await user.click(await screen.findByRole('button', { name: 'Смотреть live' }))
+    expect(await screen.findByLabelText('Live-видео с камеры Камера у подъезда')).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Камера у калитки' }))
+    await user.click(screen.getByRole('button', { name: 'Камера у подъезда' }))
+
+    expect(await screen.findByRole('button', { name: 'Смотреть live' })).toBeVisible()
+    expect(startLive).toHaveBeenCalledTimes(1)
+  })
+
   it('keeps a loading state until the real dashboard request settles', async () => {
     const pending = deferred<PropertyDashboard>()
     render(<App api={createApi({ getDashboard: () => pending.promise })} />)

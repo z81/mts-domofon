@@ -577,6 +577,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
 
     const deviceInventory = devices.data
     const availableCount = deviceInventory.accessPoints.filter((point) => point.available).length
+    const cameraPanelKey = `${selectedFlat.id}\u0000${selectedCamera?.id ?? ''}`
 
     if (page === 'access') {
       return <>
@@ -595,7 +596,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
           {deviceInventory.cameras.map((camera) => <button className={camera.id === selectedCamera?.id ? 'selected' : ''} onClick={() => setSelectedCameraId(camera.id)} type="button" key={camera.id}>{camera.name}</button>)}
         </div>}
         <section className="camera-layout">
-          <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} />
+          <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} key={cameraPanelKey} />
           <aside className="content-card camera-info"><p className="eyebrow">Возможности</p><h2>{selectedCamera?.name ?? 'Камеры не найдены'}</h2><p>{selectedCamera ? 'Сейчас доступен отдельный снимок. Прямой эфир и архив не отображаются, пока их transport не подключён.' : 'Для выбранного объекта MTS не вернул камер.'}</p></aside>
         </section>
       </>
@@ -611,7 +612,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
         <span className="device-summary"><i className={availableCount > 0 ? 'online' : ''} />{availableCount} из {deviceInventory.accessPoints.length} точек доступны</span>
       </section>
       <section className="hero-grid" aria-label="Камера и быстрый доступ">
-        <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} />
+        <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} key={cameraPanelKey} />
         <aside className="quick-panel">
           <div className="section-title-row"><div><p className="eyebrow">Выбранный объект</p><h2>Точки входа</h2></div><span className="count-badge">{deviceInventory.accessPoints.length}</span></div>
           <AccessList accessPoints={deviceInventory.accessPoints} interactionLocked={doorInteractionLocked} preparingAccessPointId={preparingAccessPointId} onPrepare={(point, lock) => void prepareDoor(selectedFlat, point, lock)} />
