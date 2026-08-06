@@ -285,6 +285,23 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(37, 108, 82, .35
 .honest-status p:not(.eyebrow) { max-width: 500px; color: #727b74; font-size: 12px; line-height: 1.55; }
 .honest-status .text-button { margin-top: auto; padding: 0; }
 
+/* Real incoming-call and browser WebRTC states. */
+.call-nav-badge { min-width: 0 !important; min-height: 22px !important; margin-left: auto; padding: 0 7px; display: inline-flex; align-items: center; justify-content: center; color: #fff; border-radius: 999px; background: #c64b45; box-shadow: 0 0 0 4px rgba(198,75,69,.14); font-size: 8px; font-weight: 800; }
+.call-empty { min-height: 390px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 17px; text-align: center; }
+.call-empty .state-icon { width: 56px; height: 56px; display: grid; place-items: center; color: var(--green); border-radius: 17px; background: var(--mint); font-size: 23px; }
+.call-stage { min-height: min(610px, calc(100vh - 210px)); padding: 78px 28px 42px; isolation: isolate; background: #18372c; }
+.call-stage::before { z-index: -1; }
+.call-stage .call-video { position: absolute; z-index: -2; inset: 0; width: 100%; height: 100%; object-fit: cover; background: radial-gradient(circle at 50% 10%,#537f6c 0,#244d3c 58%,#18372c 100%); }
+.call-stage::after { content: ''; position: absolute; z-index: -1; inset: 0; pointer-events: none; background: linear-gradient(180deg,rgba(10,24,17,.18),rgba(10,24,17,.42) 55%,rgba(8,19,13,.82)); }
+.call-overlay { width: min(680px, 100%); margin-top: auto; padding: 28px 22px 4px; display: flex; flex-direction: column; align-items: center; border-radius: 20px; background: linear-gradient(180deg,transparent,rgba(10,27,18,.38)); }
+.call-live-message { position: absolute !important; z-index: 3; left: 22px; top: 22px; max-width: calc(100% - 44px); margin: 0 !important; padding: 9px 12px; color: #fff !important; border-radius: 999px; background: rgba(13,36,24,.72); backdrop-filter: blur(10px); font-size: 10px !important; font-weight: 800; }
+.call-live-message[role="alert"] { background: rgba(126,42,42,.88); }
+.call-stage .call-avatar { flex: 0 0 auto; font-size: 28px; }
+.call-stage .call-actions { margin-top: 8px; }
+.call-stage .call-actions button { min-width: 150px; }
+.call-stage button:disabled { opacity: .55; cursor: not-allowed; }
+.call-open-dialog { max-width: 480px; }
+
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 700px) {
@@ -296,4 +313,11 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(37, 108, 82, .35
   .access-actions .lock-select { max-width: none; flex: 1; }
   .access-actions .open-button { width: auto; min-width: 110px; margin-bottom: 0; }
   .door-summary div { grid-template-columns: 82px minmax(0,1fr); }
+  .call-stage { min-height: calc(100vh - 190px); padding: 72px 15px 28px; }
+  .call-overlay { padding-inline: 5px; }
+  .call-live-message { left: 14px; top: 14px; max-width: calc(100% - 28px); }
+  .call-stage .call-actions { display: grid; width: 100%; }
+  .call-stage .call-actions button { width: 100%; }
+  .mobile-nav button { position: relative; }
+  .mobile-call-badge { position: absolute; right: calc(50% - 21px); top: 4px; width: 9px; height: 9px; min-width: 9px !important; min-height: 9px !important; padding: 0; overflow: hidden; color: transparent; font-size: 0; }
 }

@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { AuthPage } from '../features/auth/AuthPage'
 import type { AuthApi } from '../features/auth/authApi'
+import { CallPage } from '../features/calls/CallPage'
+import {
+  callApi,
+  startCurrentCallPolling,
+  type CallApi,
+  type CurrentCall,
+} from '../features/calls/callApi'
 import {
   IntercomApiError,
   intercomApi,
@@ -30,6 +37,7 @@ type DeviceRemote =
 interface AppProps {
   api?: IntercomApi
   authApi?: AuthApi
+  callsApi?: CallApi
 }
 
 interface PreparedDoorIntent {
@@ -57,6 +65,13 @@ const accessKindLabels: Record<string, string> = {
   elevator: 'Лифт',
   gate: 'Калитка',
   intercom: 'Домофон',
+}
+
+const phaseLabelsForDashboard: Record<CurrentCall['phase'], string> = {
+  ringing: 'Входящий вызов — откройте экран звонка, чтобы ответить.',
+  connecting: 'Соединяем звонок с браузером.',
+  active: 'Аудио и видео звонка подключены.',
+  ending: 'Звонок завершается.',
 }
 
 function Glyph({ children }: { children: ReactNode }) {
@@ -235,7 +250,7 @@ function UnavailablePage({ eyebrow, title, copy }: { eyebrow: string; title: str
   </>
 }
 
-function App({ api = intercomApi, authApi }: AppProps) {
+function App({ api = intercomApi, authApi, callsApi = callApi }: AppProps) {
   const [page, setPage] = useState<Page>('home')
   const [flatOpen, setFlatOpen] = useState(false)
   const [authOpen, setAuthOpen] = useState(false)
@@ -251,9 +266,13 @@ function App({ api = intercomApi, authApi }: AppProps) {
   const [doorExecuting, setDoorExecuting] = useState(false)
   const [doorOutcomeUnknown, setDoorOutcomeUnknown] = useState(false)
   const [doorFeedback, setDoorFeedback] = useState<DoorFeedback | null>(null)
+  const [currentCall, setCurrentCall] = useState<CurrentCall | null>(null)
+  const [callLoading, setCallLoading] = useState(true)
+  const [callPollingError, setCallPollingError] = useState(false)
   const doorPreparationInFlight = useRef(false)
   const doorExecutionInFlight = useRef(false)
   const sessionEpoch = useRef(0)
+  const autoOpenedCallId = useRef<string | null>(null)
 
   useEffect(() => {
     if (!dataSessionEnabled) return
@@ -288,6 +307,38 @@ function App({ api = intercomApi, authApi }: AppProps) {
     })
     return () => controller.abort()
   }, [api, dataSessionEnabled, deviceReload, selectedFlatId])
+
+  const callPollingEnabled = dataSessionEnabled && dashboard.status === 'success'
+
+  useEffect(() => {
+    if (!callPollingEnabled) return
+
+    let active = true
+    const stop = startCurrentCallPolling(callsApi, {
+      onUpdate: (nextCall) => {
+        if (!active) return
+        setCurrentCall(nextCall)
+        setCallLoading(false)
+        setCallPollingError(false)
+        if (nextCall?.phase === 'ringing' && autoOpenedCallId.current !== nextCall.id) {
+          autoOpenedCallId.current = nextCall.id
+          setPage('calls')
+          setFlatOpen(false)
+        }
+      },
+      onError: () => {
+        if (!active) return
+        setCallLoading(false)
+        setCallPollingError(true)
+      },
+    })
+    return () => {
+      active = false
+      stop()
+    }
+  }, [callPollingEnabled, callsApi])
+
+  const activeCurrentCall = callPollingEnabled ? currentCall : null
 
   useEffect(() => {
     if (!doorIntent || doorExecuting) return
@@ -332,6 +383,9 @@ function App({ api = intercomApi, authApi }: AppProps) {
     setAuthOpen(false)
     setDoorOutcomeUnknown(false)
     setDoorFeedback(null)
+    setCurrentCall(null)
+    setCallLoading(true)
+    setCallPollingError(false)
     setDashboard({ status: 'loading' })
     setDashboardReload((value) => value + 1)
   }
@@ -353,6 +407,9 @@ function App({ api = intercomApi, authApi }: AppProps) {
     setDoorExecuting(false)
     setDoorOutcomeUnknown(false)
     setDoorFeedback(null)
+    setCurrentCall(null)
+    setCallLoading(false)
+    setCallPollingError(false)
   }
 
   function retryDashboard() {
@@ -458,10 +515,6 @@ function App({ api = intercomApi, authApi }: AppProps) {
       </>
     }
 
-    if (page === 'calls') {
-      return <UnavailablePage eyebrow="Звонки" title="Приём звонков пока не подключён" copy="Интерфейс не показывает выдуманные вызовы. Здесь появится реальный входящий звонок после подключения SIP/WebRTC transport." />
-    }
-
     if (page === 'events') {
       return <UnavailablePage eyebrow="События" title="События пока не подключены" copy="Журнал останется пустым, пока локальный API не начнёт отдавать реальные события домофона." />
     }
@@ -479,14 +532,16 @@ function App({ api = intercomApi, authApi }: AppProps) {
         </aside>
       </section>
       <section className="lower-grid">
-        <article className="panel honest-status"><span className="state-icon" aria-hidden="true">☎</span><p className="eyebrow">Звонки</p><h2>Приём звонков в работе</h2><p>Пока transport не подключён, входящие вызовы здесь не создаются.</p><button className="text-button" onClick={() => selectPage('calls')} type="button">Подробнее ›</button></article>
+        <article className="panel honest-status"><span className="state-icon" aria-hidden="true">☎</span><p className="eyebrow">Звонки</p><h2>{activeCurrentCall ? activeCurrentCall.callerName : 'Ожидаем входящий вызов'}</h2><p>{activeCurrentCall ? phaseLabelsForDashboard[activeCurrentCall.phase] : 'Локальный сервис проверяет только реальные входящие звонки.'}</p><button className="text-button" onClick={() => selectPage('calls')} type="button">Подробнее ›</button></article>
         <article className="panel honest-status"><span className="state-icon" aria-hidden="true">✓</span><p className="eyebrow">События</p><h2>Журнал ещё не подключён</h2><p>Экран начнёт заполняться только реальными событиями локального API.</p><button className="text-button" onClick={() => selectPage('events')} type="button">Подробнее ›</button></article>
       </section>
     </>
   }
 
   let mainContent: ReactNode
-  if (dashboard.status === 'loading') {
+  if (page === 'calls' && dashboard.status === 'success') {
+    mainContent = <CallPage api={callsApi} call={activeCurrentCall} loading={callPollingEnabled && callLoading} pollingError={callPollingEnabled && callPollingError} />
+  } else if (dashboard.status === 'loading') {
     mainContent = <div className="loading-card" role="status"><span className="loading-ring" /><p>Загружаем объекты…</p></div>
   } else if (dashboard.status === 'error' && isUnauthorized(dashboard.error)) {
     mainContent = <StateCard eyebrow="MTS ID" title="Войдите в MTS ID" action={<button className="primary-button" onClick={() => setAuthOpen(true)} type="button">Войти с MTS ID</button>}><p>Авторизация нужна, чтобы загрузить ваши квартиры и домофоны.</p></StateCard>
@@ -499,12 +554,13 @@ function App({ api = intercomApi, authApi }: AppProps) {
   }
 
   const flatOptions = dashboard.status === 'success' ? dashboard.data.flats : []
+  const incomingCall = activeCurrentCall?.phase === 'ringing'
 
   return <div className="app-frame">
     <a className="skip-link" href="#main-content">К основному содержимому</a>
     <aside className="sidebar" aria-label="Основная навигация">
       <div className="brand"><span className="brand-mark">V</span><span className="brand-name">VDome <b>MTS</b></span></div>
-      <nav className="nav-list">{navigation.map((item) => <button className={`nav-item ${page === item.page ? 'active' : ''}`} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span></button>)}</nav>
+      <nav className="nav-list">{navigation.map((item) => <button className={`nav-item ${page === item.page ? 'active' : ''}`} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span>{item.page === 'calls' && incomingCall && <span className="call-nav-badge">Входящий</span>}</button>)}</nav>
       <div className="sidebar-foot"><small><span className="status-dot" />Локальный API</small></div>
     </aside>
     <div className="app-body">
@@ -521,7 +577,7 @@ function App({ api = intercomApi, authApi }: AppProps) {
       </header>
       <main id="main-content" className="main-content">{mainContent}</main>
     </div>
-    <nav className="mobile-nav" aria-label="Мобильная навигация">{navigation.slice(0, 4).map((item) => <button className={page === item.page ? 'active' : ''} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span></button>)}</nav>
+    <nav className="mobile-nav" aria-label="Мобильная навигация">{navigation.slice(0, 4).map((item) => <button className={page === item.page ? 'active' : ''} onClick={() => selectPage(item.page)} key={item.page} type="button"><Glyph>{item.glyph}</Glyph><span>{item.label}</span>{item.page === 'calls' && incomingCall && <span className="call-nav-badge mobile-call-badge">Входящий</span>}</button>)}</nav>
     {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} onLoggedOut={finishLogout} />}
     {doorIntent && <Modal className="door-dialog" labelledBy="door-confirm-title" onClose={closeDoorIntent} closeOnBackdrop>
       <button aria-label="Закрыть" className="dialog-close" disabled={doorExecuting} onClick={closeDoorIntent} type="button">×</button>

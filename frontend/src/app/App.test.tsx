@@ -2,6 +2,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuthApi } from '../features/auth/authApi'
+import type { CallApi, CurrentCall } from '../features/calls/callApi'
 import {
   IntercomApiError,
   type DeviceInventory,
@@ -96,11 +97,34 @@ function deferred<T>() {
 
 function createApi(overrides: Partial<IntercomApi> = {}): IntercomApi {
   return {
-    createDoorIntent: async () => ({ intentId: 'intent-1', expiresAt: '2026-08-06T12:00:30Z' }),
+    createDoorIntent: async () => ({ intentId: 'intent-1', expiresAt: new Date(Date.now() + 60_000).toISOString() }),
     executeDoorIntent: async () => undefined,
     getDashboard: async () => dashboard,
     getDevices: async () => inventory,
     getSnapshot: async () => new Blob(['snapshot'], { type: 'image/webp' }),
+    ...overrides,
+  }
+}
+
+const ringingCall: CurrentCall = {
+  id: 'call-81',
+  revision: 3,
+  phase: 'ringing',
+  callerName: 'Домофон у подъезда',
+  startedAt: '2026-08-06T12:00:00Z',
+  remoteSdp: 'v=0\r\na=ice-ufrag:remote\r\n',
+  canOpen: true,
+}
+
+function createCallApi(overrides: Partial<CallApi> = {}): CallApi {
+  return {
+    answer: async () => ({ ...ringingCall, phase: 'connecting', revision: 4 }),
+    createOpenIntent: async () => ({ intentId: 'call-intent-1', expiresAt: new Date(Date.now() + 60_000).toISOString() }),
+    decline: async () => undefined,
+    executeOpenIntent: async () => undefined,
+    getCurrent: async () => null,
+    hangup: async () => undefined,
+    ignore: async () => undefined,
     ...overrides,
   }
 }
@@ -297,7 +321,7 @@ describe('live intercom dashboard', () => {
 
   it('requires lock selection, creates an intent, and executes only after explicit confirmation', async () => {
     const user = userEvent.setup()
-    const createDoorIntent = vi.fn<IntercomApi['createDoorIntent']>(async () => ({ intentId: 'intent / 1', expiresAt: '2026-08-06T12:00:30Z' }))
+    const createDoorIntent = vi.fn<IntercomApi['createDoorIntent']>(async () => ({ intentId: 'intent / 1', expiresAt: new Date(Date.now() + 60_000).toISOString() }))
     const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>(async () => undefined)
     const multipleLocks: DeviceInventory = {
       ...inventory,
@@ -449,13 +473,70 @@ describe('live intercom dashboard', () => {
     expect(logout).toHaveBeenCalledTimes(1)
   })
 
-  it('does not invent incoming calls or events', async () => {
+  it('does not poll calls before the authenticated dashboard session is usable', async () => {
+    const pendingDashboard = deferred<PropertyDashboard>()
+    const getCurrent = vi.fn<CallApi['getCurrent']>(async () => null)
+    render(<App
+      api={createApi({ getDashboard: () => pendingDashboard.promise })}
+      callsApi={createCallApi({ getCurrent })}
+    />)
+
+    expect(getCurrent).not.toHaveBeenCalled()
+    await act(async () => pendingDashboard.resolve(dashboard))
+    await waitFor(() => expect(getCurrent).toHaveBeenCalledTimes(1))
+  })
+
+  it('does not poll calls when the data session is unauthorized', async () => {
+    const getCurrent = vi.fn<CallApi['getCurrent']>(async () => null)
+    render(<App
+      api={createApi({ getDashboard: async () => { throw new IntercomApiError(401, 'authentication_required') } })}
+      callsApi={createCallApi({ getCurrent })}
+    />)
+
+    expect(await screen.findByRole('heading', { name: 'Войдите в MTS ID' })).toBeVisible()
+    expect(getCurrent).not.toHaveBeenCalled()
+  })
+
+  it('switches to the calls page and marks navigation for a real incoming call', async () => {
+    render(<App
+      api={createApi()}
+      callsApi={createCallApi({ getCurrent: async () => ringingCall })}
+    />)
+
+    expect(await screen.findByRole('heading', { name: 'Домофон у подъезда' })).toBeVisible()
+    expect(screen.getByRole('status')).toHaveTextContent('Входящий вызов')
+    expect(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: /Звонки.*Входящий/ })).toHaveClass('active')
+  })
+
+  it('aborts call polling and clears the call UI after logout', async () => {
     const user = userEvent.setup()
-    render(<App api={createApi()} />)
+    let callSignal: AbortSignal | undefined
+    const getCurrent = vi.fn<CallApi['getCurrent']>((signal) => {
+      callSignal = signal
+      return new Promise<CurrentCall | null>(() => undefined)
+    })
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({ getCurrent })}
+    />)
+    await waitFor(() => expect(callSignal).toBeDefined())
+
+    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
+    await user.click(await screen.findByRole('button', { name: 'Выйти' }))
+
+    expect(callSignal?.aborted).toBe(true)
+    expect(await screen.findByRole('heading', { name: 'Войдите в MTS ID' })).toBeVisible()
+    expect(screen.queryByRole('heading', { name: 'Домофон у подъезда' })).not.toBeInTheDocument()
+  })
+
+  it('does not invent an incoming call when the call endpoint returns no current call', async () => {
+    const user = userEvent.setup()
+    render(<App api={createApi()} callsApi={createCallApi()} />)
     expect(await screen.findByText('Подъезд 1')).toBeVisible()
 
     await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
-    expect(screen.getByRole('heading', { name: 'Приём звонков пока не подключён' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Нет активного звонка' })).toBeVisible()
     expect(screen.queryByText('Входящий вызов')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Принять вызов' })).not.toBeInTheDocument()
   })
