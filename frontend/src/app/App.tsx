@@ -50,6 +50,11 @@ interface PreparedDoorIntent {
   lockName: string
 }
 
+interface PreparingLock {
+  accessPointId: string
+  lockNumber: string
+}
+
 type DoorFeedback = { kind: 'success' | 'error'; message: string }
 
 const navigation: ReadonlyArray<{ page: Page; label: string; glyph: string }> = [
@@ -115,24 +120,20 @@ function StateCard({ eyebrow, title, children, action }: {
   </section>
 }
 
-function AccessList({ accessPoints, interactionLocked, preparingAccessPointId, onPrepare }: {
+function AccessList({ accessPoints, interactionLocked, preparingLock, onPrepare }: {
   accessPoints: readonly AccessPoint[]
   interactionLocked: boolean
-  preparingAccessPointId: string | null
+  preparingLock: PreparingLock | null
   onPrepare: (point: AccessPoint, lock: Lock) => void
 }) {
-  const [selectedLocks, setSelectedLocks] = useState<Record<string, string>>({})
-
   if (accessPoints.length === 0) {
     return <p className="empty-copy">Точек доступа для этого объекта нет</p>
   }
 
   return <div className="access-list">
     {accessPoints.map((point) => {
-      const selectedNumber = point.locks.length === 1 ? point.locks[0]?.number : selectedLocks[point.id]
-      const selectedLock = point.locks.find((lock) => lock.number === selectedNumber)
       const unavailable = !point.available || point.locks.length === 0
-      const preparing = preparingAccessPointId === point.id
+      const actions: Array<Lock | null> = unavailable ? [null] : point.locks
       return <div className="access-item" key={point.id}>
         <span className="access-icon"><Glyph>{point.kind === 'barrier' ? '↔' : '⌑'}</Glyph></span>
         <span className="access-copy">
@@ -140,23 +141,23 @@ function AccessList({ accessPoints, interactionLocked, preparingAccessPointId, o
           <small><i className={point.available ? 'online' : ''} />{point.available ? 'Доступно' : 'Недоступно'} · {accessKindLabels[point.kind] ?? 'Точка входа'}</small>
         </span>
         <span className="access-actions">
-          {point.locks.length > 1 && <select
-            aria-label={`Замок ${point.name}`}
-            className="lock-select"
-            disabled={interactionLocked}
-            onChange={(event) => setSelectedLocks((current) => ({ ...current, [point.id]: event.target.value }))}
-            value={selectedLocks[point.id] ?? ''}
-          >
-            <option value="">Выберите замок</option>
-            {point.locks.map((lock) => <option value={lock.number} key={lock.number}>{lock.name}</option>)}
-          </select>}
-          <button
-            aria-label={unavailable ? `Открытие ${point.name} недоступно` : `Открыть ${point.name}`}
-            className="open-button"
-            disabled={interactionLocked || unavailable || !selectedLock}
-            onClick={() => selectedLock && onPrepare(point, selectedLock)}
-            type="button"
-          >{preparing ? 'Подготовка…' : unavailable ? 'Недоступно' : 'Открыть'}</button>
+          {actions.map((lock) => {
+            if (!lock) {
+              return <button aria-label={`Открытие ${point.name} недоступно`} className="open-button" disabled type="button" key="unavailable">Недоступно</button>
+            }
+            const lockName = lock.name.trim() || `Замок ${lock.number}`
+            const preparing = preparingLock?.accessPointId === point.id && preparingLock.lockNumber === lock.number
+            const label = point.locks.length === 1 ? 'Открыть' : `Открыть: ${lockName}`
+            const accessibleLabel = point.locks.length === 1 ? `Открыть ${point.name}` : `Открыть ${point.name}: ${lockName}`
+            return <button
+              aria-label={accessibleLabel}
+              className="open-button"
+              disabled={interactionLocked}
+              onClick={() => onPrepare(point, lock)}
+              type="button"
+              key={lock.number}
+            >{preparing ? 'Подготовка…' : label}</button>
+          })}
         </span>
       </div>
     })}
@@ -327,7 +328,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
   const [selectedFlatId, setSelectedFlatId] = useState<string | null>(null)
   const [devices, setDevices] = useState<DeviceRemote>({ status: 'idle' })
   const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null)
-  const [preparingAccessPointId, setPreparingAccessPointId] = useState<string | null>(null)
+  const [preparingLock, setPreparingLock] = useState<PreparingLock | null>(null)
   const [doorIntent, setDoorIntent] = useState<PreparedDoorIntent | null>(null)
   const [doorExecuting, setDoorExecuting] = useState(false)
   const [doorOutcomeUnknown, setDoorOutcomeUnknown] = useState(false)
@@ -443,7 +444,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
 
   const inventory = devices.status === 'success' && devices.flatId === selectedFlatId ? devices.data : null
   const selectedCamera = inventory?.cameras.find((camera) => camera.id === selectedCameraId) ?? inventory?.cameras[0] ?? null
-  const doorInteractionLocked = preparingAccessPointId !== null || doorIntent !== null || doorExecuting || doorOutcomeUnknown
+  const doorInteractionLocked = preparingLock !== null || doorIntent !== null || doorExecuting || doorOutcomeUnknown
 
   function selectPage(next: Page) {
     setPage(next)
@@ -487,7 +488,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
     setSelectedFlatId(null)
     setDevices({ status: 'idle' })
     setSelectedCameraId(null)
-    setPreparingAccessPointId(null)
+    setPreparingLock(null)
     setDoorIntent(null)
     setDoorExecuting(false)
     setDoorOutcomeUnknown(false)
@@ -513,7 +514,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
     if (doorPreparationInFlight.current || doorExecutionInFlight.current || doorIntent) return
     const operationEpoch = sessionEpoch.current
     doorPreparationInFlight.current = true
-    setPreparingAccessPointId(point.id)
+    setPreparingLock({ accessPointId: point.id, lockNumber: lock.number })
     setDoorFeedback(null)
     try {
       const intent = await api.createDoorIntent(flat.id, point.id, lock.number)
@@ -531,7 +532,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
     } finally {
       if (operationEpoch === sessionEpoch.current) {
         doorPreparationInFlight.current = false
-        setPreparingAccessPointId(null)
+        setPreparingLock(null)
       }
     }
   }
@@ -584,7 +585,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
         <section className="page-heading"><div><p className="eyebrow">{selectedFlat.address}</p><h1>Доступ</h1><p>Точки входа, найденные для выбранного объекта.</p></div></section>
         <section className="content-card">
           <div className="section-title-row"><div><h2>Точки доступа</h2><p>Каждое открытие требует отдельного подтверждения.</p></div><span className="count-badge">{deviceInventory.accessPoints.length}</span></div>
-          <AccessList accessPoints={deviceInventory.accessPoints} interactionLocked={doorInteractionLocked} preparingAccessPointId={preparingAccessPointId} onPrepare={(point, lock) => void prepareDoor(selectedFlat, point, lock)} />
+          <AccessList accessPoints={deviceInventory.accessPoints} interactionLocked={doorInteractionLocked} preparingLock={preparingLock} onPrepare={(point, lock) => void prepareDoor(selectedFlat, point, lock)} />
         </section>
       </>
     }
@@ -615,7 +616,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
         <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} key={cameraPanelKey} />
         <aside className="quick-panel">
           <div className="section-title-row"><div><p className="eyebrow">Выбранный объект</p><h2>Точки входа</h2></div><span className="count-badge">{deviceInventory.accessPoints.length}</span></div>
-          <AccessList accessPoints={deviceInventory.accessPoints} interactionLocked={doorInteractionLocked} preparingAccessPointId={preparingAccessPointId} onPrepare={(point, lock) => void prepareDoor(selectedFlat, point, lock)} />
+          <AccessList accessPoints={deviceInventory.accessPoints} interactionLocked={doorInteractionLocked} preparingLock={preparingLock} onPrepare={(point, lock) => void prepareDoor(selectedFlat, point, lock)} />
         </aside>
       </section>
       <section className="lower-grid">

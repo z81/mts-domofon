@@ -383,7 +383,7 @@ describe('live intercom dashboard', () => {
     expect(getSnapshot).not.toHaveBeenCalled()
   })
 
-  it('requires lock selection, creates an intent, and executes only after explicit confirmation', async () => {
+  it('renders one direct button per lock and executes only after explicit confirmation', async () => {
     const user = userEvent.setup()
     const createDoorIntent = vi.fn<IntercomApi['createDoorIntent']>(async () => ({ intentId: 'intent / 1', expiresAt: new Date(Date.now() + 60_000).toISOString() }))
     const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>(async () => undefined)
@@ -398,12 +398,12 @@ describe('live intercom dashboard', () => {
       })),
     }
     render(<App api={createApi({ createDoorIntent, executeDoorIntent, getDevices: async () => multipleLocks })} />)
-    const lockSelect = await screen.findByRole('combobox', { name: 'Замок Подъезд 1' })
-    const prepare = screen.getByRole('button', { name: 'Открыть Подъезд 1' })
-    expect(prepare).toBeDisabled()
+    expect(await screen.findByRole('button', { name: 'Открыть Подъезд 1: Основная дверь' })).toBeEnabled()
+    const secondLock = screen.getByRole('button', { name: 'Открыть Подъезд 1: Вторая дверь' })
+    expect(secondLock).toBeEnabled()
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
 
-    await user.selectOptions(lockSelect, '2')
-    await user.click(prepare)
+    await user.click(secondLock)
 
     expect(createDoorIntent).toHaveBeenCalledWith('flat-81', 'entrance-1', '2')
     expect(executeDoorIntent).not.toHaveBeenCalled()

@@ -99,8 +99,9 @@ const actions = unavailable ? [null] : point.locks
   const lockName = lock.name.trim() || `Замок ${lock.number}`
   const preparing = preparingLock?.accessPointId === point.id && preparingLock.lockNumber === lock.number
   const visibleLabel = point.locks.length === 1 ? 'Открыть' : `Открыть: ${lockName}`
+  const accessibleLabel = point.locks.length === 1 ? `Открыть ${point.name}` : `Открыть ${point.name}: ${lockName}`
   return <button
-    aria-label={`Открыть ${point.name}: ${lockName}`}
+    aria-label={accessibleLabel}
     className="open-button"
     disabled={interactionLocked}
     onClick={() => onPrepare(point, lock)}

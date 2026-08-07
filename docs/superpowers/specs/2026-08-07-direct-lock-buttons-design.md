@@ -8,7 +8,7 @@ Remove the lock selector from each access-point card. Render one direct action f
 
 - Keep one card per access point.
 - Render one button per lock inside the card, in provider order.
-- For a single lock, keep the compact label **Открыть** and an accessible name that identifies both the access point and lock.
+- For a single lock, keep the existing compact label **Открыть** and accessible name that identifies the access point.
 - For multiple locks, label each button **Открыть: {lock name}**. If a lock name is blank, use **Замок {number}** as the visible fallback.
 - Pressing a button prepares an intent for exactly that lock. There is no select state and no implicit first-lock choice.
 - Keep the existing confirmation dialog; it shows the chosen lock and remains the only place that executes the physical open request.
