@@ -116,6 +116,22 @@ impl AppState {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn with_intercom_video_services(
+        property_service: Arc<PropertyService>,
+        device_service: Arc<DeviceService>,
+        live_source_provider: Arc<dyn LiveSourceProvider>,
+        live_session_manager: Arc<LiveSessionManager>,
+    ) -> Self {
+        Self {
+            property_service: Some(property_service),
+            device_service: Some(device_service),
+            live_source_provider: Some(live_source_provider),
+            live_session_manager: Some(live_session_manager),
+            ..Self::default()
+        }
+    }
+
     pub fn with_door_open_service(mut self, door_open_service: Arc<DoorOpenService>) -> Self {
         self.door_open_service = Some(door_open_service);
         self

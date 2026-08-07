@@ -248,14 +248,14 @@ Add `rust-embed = { version = "8.12.0", features = ["compression", "deterministi
 - Create: `CHANGELOG.md`
 
 - [ ] **Step 1: Document setup in Russian** with loopback and Docker examples, WebSSO/SMS expectations, secret-key backup/rotation, remote-bind protection, camera/call browser requirements, webhook signatures, capability behavior, and recovery from expired/unknown manual mutations.
-- [ ] **Step 2: Document the exact core API and `domru-z81` aliases**, OpenAPI location, current APK/version/hash used for interoperability research, unofficial/non-affiliated notice, data retention, and the complete excluded-feature list. Clarify that repository documentation remains while APK end-user document/PDF functionality is excluded.
+- [ ] **Step 2: Document the exact core API and legacy compatibility aliases**, OpenAPI location, current APK/version/hash used for interoperability research, unofficial/non-affiliated notice, data retention, and the complete excluded-feature list. Clarify that repository documentation remains while APK end-user document/PDF functionality is excluded.
 - [ ] **Step 3: Write the controlled live checklist** in this order: login/SMS; all read-only flat/device/camera/archive/event/call-setting checks; passive self-ring observation; then one separately confirmed action at a time for manual door, accept, reject, ignore, hangup, open-during-call, call block, and call-setting update. Include redaction and cleanup after every action.
 - [ ] **Step 4: Run the final gate and container smoke**, inspect the production bundle/OpenAPI/container filesystem for secrets, excluded routes/assets/modules, build tools, and decompilation artifacts, then record only pass/fail plus redacted version/request IDs.
 - [ ] **Step 5: Commit:** `git add README.md LICENSE SECURITY.md docs CHANGELOG.md && git commit -m "docs: publish core deployment and acceptance guide"`.
 
 ## Final Release Gate
 
-Run from `/Users/alex/dev/domru-mts` on a clean checkout:
+Run from the repository root on a clean checkout:
 
 ```bash
 npm --prefix frontend ci

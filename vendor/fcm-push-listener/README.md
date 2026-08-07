@@ -21,7 +21,7 @@ use fcm_push_listener::FcmPushListener;
 let http = reqwest::Client::new();
 let firebase_app_id = "1:1001234567890:android:2665128ba997ffab830a24";
 let firebase_project_id = "myapp-1234567890123";
-let firebase_api_key = "aBcDeFgHiJkLmNoPqRsTu01234_aBcD0123456789";
+let firebase_api_key = "REPLACE_WITH_FIREBASE_API_KEY";
 
 let registration = fcm_push_listener::register(
     &http,

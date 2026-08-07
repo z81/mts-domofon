@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuthApi } from '../features/auth/authApi'
 import type { CallApi, CurrentCall } from '../features/calls/callApi'
 import type { EventApi } from '../features/events/eventApi'
@@ -152,6 +152,19 @@ function authenticatedAuthApi(overrides: Partial<AuthApi> = {}): AuthApi {
   }
 }
 
+function reauthenticatingAuthApi(): AuthApi {
+  let sessionReads = 0
+  return authenticatedAuthApi({
+    getSession: async () => sessionReads++ < 2
+      ? { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' }
+      : { authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null },
+    startAuth: async () => ({
+      status: 'authenticated',
+      session: { authenticated: true, status: 'active', authenticated_at: '2026-08-07T12:00:00Z', expires_at: null },
+    }),
+  })
+}
+
 let objectUrlIndex = 0
 
 beforeEach(() => {
@@ -164,6 +177,10 @@ beforeEach(() => {
     configurable: true,
     value: vi.fn(),
   })
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
 })
 
 describe('live intercom dashboard', () => {
@@ -185,7 +202,8 @@ describe('live intercom dashboard', () => {
     vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
     render(<App api={createApi({ getDevices: async () => liveInventory, startLive, stopLive })} />)
 
-    await user.click(await screen.findByRole('button', { name: 'Смотреть live' }))
+    await user.click(await screen.findByRole('button', { name: 'Смотреть Камера у подъезда' }))
+    await user.click(screen.getByRole('button', { name: 'Эфир' }))
 
     expect(startLive).toHaveBeenCalledWith('flat-81', 'camera-1', expect.any(AbortSignal))
     const video = await screen.findByLabelText('Live-видео с камеры Камера у подъезда')
@@ -221,16 +239,47 @@ describe('live intercom dashboard', () => {
     vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
     render(<App api={createApi({ getDevices: async () => liveInventory, startLive, stopLive })} />)
 
-    const navigation = within(await screen.findByRole('complementary', { name: 'Основная навигация' }))
-    await user.click(navigation.getByRole('button', { name: 'Камеры' }))
-    await user.click(await screen.findByRole('button', { name: 'Смотреть live' }))
+    await user.click(await screen.findByRole('button', { name: 'Смотреть Камера у подъезда' }))
+    expect(screen.getByRole('button', { name: 'Камера у подъезда' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Камера у калитки' })).toHaveAttribute('aria-pressed', 'false')
+    await user.click(await screen.findByRole('button', { name: 'Эфир' }))
     expect(await screen.findByLabelText('Live-видео с камеры Камера у подъезда')).toBeVisible()
 
     await user.click(screen.getByRole('button', { name: 'Камера у калитки' }))
+    expect(screen.getByRole('button', { name: 'Камера у калитки' })).toHaveAttribute('aria-pressed', 'true')
     await user.click(screen.getByRole('button', { name: 'Камера у подъезда' }))
 
-    expect(await screen.findByRole('button', { name: 'Смотреть live' })).toBeVisible()
+    expect(await screen.findByRole('button', { name: 'Эфир' })).toBeVisible()
     expect(startLive).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers an honest keyboard-operable compact camera switch on Home and cleans up the prior snapshot', async () => {
+    const user = userEvent.setup()
+    const multiCameraInventory: DeviceInventory = {
+      ...inventory,
+      cameras: [
+        inventory.cameras[0],
+        { ...inventory.cameras[0], id: 'camera-2', name: 'Камера у калитки' },
+      ],
+    }
+    render(<App api={createApi({ getDevices: async () => multiCameraInventory })} />)
+
+    expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у подъезда' })).toHaveAttribute('src', 'blob:snapshot-1')
+    const switcher = screen.getByRole('group', { name: 'Камеры на главной' })
+    const firstCamera = within(switcher).getByRole('button', { name: 'Камера у подъезда' })
+    const secondCamera = within(switcher).getByRole('button', { name: 'Камера у калитки' })
+    expect(firstCamera).toHaveAttribute('aria-pressed', 'true')
+    expect(secondCamera).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByText('Доступно: кадр')).toBeVisible()
+    expect(document.body).not.toHaveTextContent(/Кадр получен от локального API|онлайн/i)
+
+    secondCamera.focus()
+    await user.keyboard('{Enter}')
+
+    expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у калитки' })).toHaveAttribute('src', 'blob:snapshot-2')
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:snapshot-1')
+    expect(firstCamera).toHaveAttribute('aria-pressed', 'false')
+    expect(secondCamera).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('keeps a loading state until the real dashboard request settles', async () => {
@@ -247,7 +296,7 @@ describe('live intercom dashboard', () => {
   it('renders linked flats and discovered devices without synthetic product claims', async () => {
     render(<App api={createApi()} />)
 
-    expect(await screen.findByRole('heading', { name: 'Домофон' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Главная' })).toBeVisible()
     expect(await screen.findByText('Подъезд 1')).toBeVisible()
     expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у подъезда' })).toHaveAttribute('src', 'blob:snapshot-1')
     expect(screen.getByText('Москва, ул. Примерная, 7')).toBeVisible()
@@ -256,6 +305,31 @@ describe('live intercom dashboard', () => {
     expect(screen.queryByText('Поддержка')).not.toBeInTheDocument()
     expect(screen.queryByText('Документы')).not.toBeInTheDocument()
     expect(screen.queryByText('Избранное')).not.toBeInTheDocument()
+    const navigationElement = screen.getByRole('navigation', { name: 'Основная навигация' })
+    const navigation = within(navigationElement)
+    expect(navigation.getAllByRole('button')).toHaveLength(3)
+    expect(navigation.getByRole('button', { name: 'Главная' })).toHaveAttribute('aria-current', 'page')
+    expect(navigation.getByRole('button', { name: 'События' })).toBeVisible()
+    expect(navigation.getByRole('button', { name: 'Ещё' })).toBeVisible()
+    expect(navigationElement.querySelectorAll('button')).toHaveLength(3)
+    expect(navigation.queryByRole('button', { name: 'Доступ' })).not.toBeInTheDocument()
+    expect(navigation.queryByRole('button', { name: 'Камеры' })).not.toBeInTheDocument()
+    expect(navigation.queryByRole('button', { name: 'Звонки' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Профиль подключения' })).toHaveAttribute('aria-label', 'Профиль подключения')
+  })
+
+  it('opens camera detail and returns to the originating destination', async () => {
+    const user = userEvent.setup()
+    render(<App api={createApi()} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Смотреть Камера у подъезда' }))
+    expect(screen.getByRole('button', { name: 'Назад' })).toBeVisible()
+    expect(screen.getByRole('group', { name: 'Режим камеры' })).toBeVisible()
+    expect(screen.getByText('Архив этой камеры недоступен')).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    expect(await screen.findByRole('heading', { name: 'Главная' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Смотреть Камера у подъезда' })).toBeVisible()
   })
 
   it('offers MTS ID authentication when the dashboard returns 401', async () => {
@@ -332,8 +406,64 @@ describe('live intercom dashboard', () => {
 
     expect(await screen.findByText('Калитка')).toBeVisible()
     expect(await screen.findByRole('img', { name: 'Кадр с камеры Камера у калитки' })).toHaveAttribute('src', 'blob:snapshot-2')
+    const unavailableDoor = screen.getByRole('button', { name: 'Открытие Калитка недоступно' })
+    expect(unavailableDoor).toBeDisabled()
+    expect(unavailableDoor).toHaveTextContent('Недоступно')
     expect(getDevices).toHaveBeenLastCalledWith('flat / 22', expect.any(AbortSignal))
     expect(getSnapshot).toHaveBeenLastCalledWith('flat / 22', 'camera / 2', expect.any(AbortSignal))
+  })
+
+  it('invalidates a deferred door preparation when the selected flat changes without releasing a newer guard', async () => {
+    const user = userEvent.setup()
+    const flatAIntent = deferred<{ intentId: string; expiresAt: string }>()
+    const flatBIntent = deferred<{ intentId: string; expiresAt: string }>()
+    const preparationSignals: AbortSignal[] = []
+    const flatBInventory: DeviceInventory = {
+      ...secondInventory,
+      accessPoints: [{
+        ...secondInventory.accessPoints[0],
+        available: true,
+        locks: [{ number: '1', name: 'Калитка', permanentlyOpen: false }],
+      }],
+    }
+    const createDoorIntent = vi.fn<IntercomApi['createDoorIntent']>((flatId, _accessPointId, _lockNumber, signal) => {
+      if (signal) preparationSignals.push(signal)
+      return flatId === 'flat-81' ? flatAIntent.promise : flatBIntent.promise
+    })
+    const executeDoorIntent = vi.fn<IntercomApi['executeDoorIntent']>()
+    render(<App api={createApi({
+      createDoorIntent,
+      executeDoorIntent,
+      getDevices: async (flatId) => flatId === 'flat-81' ? inventory : flatBInventory,
+    })} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Открыть Подъезд 1' }))
+    await user.click(screen.getByRole('button', { name: /Текущий объект/ }))
+    await user.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: /Квартира 22/ }))
+
+    const openFlatB = await screen.findByRole('button', { name: 'Открыть Калитка' })
+    expect(openFlatB).toBeEnabled()
+    expect(preparationSignals[0]?.aborted).toBe(true)
+    await user.click(openFlatB)
+    expect(createDoorIntent).toHaveBeenCalledTimes(2)
+
+    await act(async () => flatAIntent.resolve({
+      intentId: 'stale-flat-a-intent',
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }))
+
+    expect(screen.queryByRole('dialog', { name: 'Открыть дверь?' })).not.toBeInTheDocument()
+    expect(openFlatB).toBeDisabled()
+    expect(executeDoorIntent).not.toHaveBeenCalled()
+
+    await act(async () => flatBIntent.resolve({
+      intentId: 'current-flat-b-intent',
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }))
+    const dialog = await screen.findByRole('dialog', { name: 'Открыть дверь?' })
+    expect(within(dialog).getByText('Квартира 22')).toBeVisible()
+    expect(within(dialog).getAllByText('Калитка')).toHaveLength(2)
+    expect(executeDoorIntent).not.toHaveBeenCalled()
   })
 
   it('renders honest empty and error states for a selected flat', async () => {
@@ -343,7 +473,7 @@ describe('live intercom dashboard', () => {
       .mockRejectedValueOnce(new IntercomApiError(502, 'upstream_unavailable'))
     render(<App api={createApi({ getDevices })} />)
 
-    expect(await screen.findByText('Точек доступа для этого объекта нет')).toBeVisible()
+    expect(await screen.findByText('Дверей для этого объекта нет')).toBeVisible()
     expect(screen.getByText('Камер для этого объекта нет')).toBeVisible()
 
     await user.click(screen.getByRole('button', { name: /Текущий объект/ }))
@@ -406,9 +536,10 @@ describe('live intercom dashboard', () => {
 
     await user.click(secondLock)
 
-    expect(createDoorIntent).toHaveBeenCalledWith('flat-81', 'entrance-1', '2')
+    expect(createDoorIntent).toHaveBeenCalledWith('flat-81', 'entrance-1', '2', expect.any(AbortSignal))
     expect(executeDoorIntent).not.toHaveBeenCalled()
     const dialog = await screen.findByRole('dialog', { name: 'Открыть дверь?' })
+    expect(within(dialog).getByRole('button', { name: 'Закрыть' })).toHaveAttribute('aria-label', 'Закрыть')
     expect(within(dialog).getByText('Квартира 81')).toBeVisible()
     expect(within(dialog).getByText('Подъезд 1')).toBeVisible()
     expect(within(dialog).getByText('Вторая дверь')).toBeVisible()
@@ -419,6 +550,22 @@ describe('live intercom dashboard', () => {
     expect(executeDoorIntent).toHaveBeenCalledWith('intent / 1')
     expect(await screen.findByRole('status')).toHaveTextContent('Подъезд 1 открыт')
     expect(screen.queryByRole('dialog', { name: 'Открыть дверь?' })).not.toBeInTheDocument()
+  })
+
+  it('uses the lock-number fallback in the final confirmation when a lock name is blank', async () => {
+    const user = userEvent.setup()
+    const blankLockNameInventory: DeviceInventory = {
+      ...inventory,
+      accessPoints: inventory.accessPoints.map((point) => ({
+        ...point,
+        locks: [{ number: '1', name: '  ', permanentlyOpen: false }],
+      })),
+    }
+    render(<App api={createApi({ getDevices: async () => blankLockNameInventory })} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Открыть Подъезд 1' }))
+
+    expect(within(await screen.findByRole('dialog', { name: 'Открыть дверь?' })).getByText('Замок 1')).toBeVisible()
   })
 
   it('cancels a prepared door intent without executing it', async () => {
@@ -478,6 +625,31 @@ describe('live intercom dashboard', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Результат открытия неизвестен. Не повторяйте команду сразу')
     expect(screen.getByRole('button', { name: 'Открыть Подъезд 1' })).toBeDisabled()
     expect(executeDoorIntent).toHaveBeenCalledTimes(1)
+  })
+
+  it('blocks only the lock with a lost execute response', async () => {
+    const user = userEvent.setup()
+    const twoLocks: DeviceInventory = {
+      ...inventory,
+      accessPoints: inventory.accessPoints.map((point) => ({
+        ...point,
+        locks: [
+          { number: '1', name: 'Основная дверь', permanentlyOpen: false },
+          { number: '2', name: 'Вторая дверь', permanentlyOpen: false },
+        ],
+      })),
+    }
+    render(<App api={createApi({
+      executeDoorIntent: async () => { throw new TypeError('network response lost') },
+      getDevices: async () => twoLocks,
+    })} />)
+
+    await user.click(await screen.findByRole('button', { name: 'Открыть Подъезд 1: Вторая дверь' }))
+    await user.click(within(await screen.findByRole('dialog', { name: 'Открыть дверь?' })).getByRole('button', { name: 'Подтвердить открытие' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Результат открытия неизвестен. Не повторяйте команду сразу')
+    expect(screen.getByRole('button', { name: 'Открыть Подъезд 1: Вторая дверь' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Открыть Подъезд 1: Основная дверь' })).toBeEnabled()
   })
 
   it('releases an unexecuted prepared intent only after its local expiry', async () => {
@@ -605,43 +777,99 @@ describe('live intercom dashboard', () => {
       callsApi={createCallApi({ getCurrent: async () => ringingCall })}
     />)
 
-    expect(await screen.findByRole('heading', { name: 'Домофон у подъезда' })).toBeVisible()
-    expect(screen.getByRole('status')).toHaveTextContent('Входящий вызов')
+    const dialog = await screen.findByRole('dialog', { name: 'Входящий вызов' })
+    const shell = screen.getByRole('navigation', { name: 'Основная навигация' }).closest('.app-shell')!
+    expect(shell.compareDocumentPosition(dialog) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(within(dialog).getByRole('heading', { name: 'Домофон у подъезда' })).toBeVisible()
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Входящий вызов')
+    expect(within(screen.getByRole('main')).getByRole('status')).toHaveTextContent('Загружаем объекты')
   })
 
-  it('switches to the calls page and marks navigation for a real incoming call', async () => {
+  it.each([
+    ['2026-08-06T11:59:59Z', null],
+    ['2026-08-06T12:00:01Z', 'Дверь открыта автоматически'],
+  ] as const)('correlates an auto-open result completed at %s to the current call', async (completedAt, expectedMessage) => {
     render(<App
       api={createApi()}
       authApi={authenticatedAuthApi()}
-      callsApi={createCallApi({ getCurrent: async () => ringingCall })}
+      callsApi={createCallApi({
+        getCurrent: async () => ringingCall,
+        getAutoOpenPolicy: async () => ({
+          mode: 'disabled',
+          dismissAfterOpen: false,
+          lastResult: { status: 'opened', completedAt },
+        }),
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => ({ mode: 'disabled', dismissAfterOpen: false }),
+        disableAutoOpen: async () => undefined,
+      })}
     />)
 
-    expect(await screen.findByRole('heading', { name: 'Домофон у подъезда' })).toBeVisible()
-    expect(screen.getByRole('status')).toHaveTextContent('Входящий вызов')
-    expect(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: /Звонки.*Входящий/ })).toHaveClass('active')
+    const dialog = await screen.findByRole('dialog', { name: 'Входящий вызов' })
+    await screen.findByRole('button', { name: 'Автооткрытие' })
+    if (expectedMessage) expect(within(dialog).getByText(expectedMessage)).toBeVisible()
+    else expect(within(dialog).queryByText(/Дверь открыта автоматически|Автоматического повтора не будет/)).not.toBeInTheDocument()
   })
 
-  it('keeps the browser call session mounted while navigating away and back', async () => {
+  it('overlays the saved destination and restores it unchanged when the call disappears', async () => {
     const user = userEvent.setup()
+    const firstCall = deferred<CurrentCall | null>()
+    const getCurrent = vi.fn<CallApi['getCurrent']>()
+      .mockImplementationOnce(() => firstCall.promise)
+      .mockResolvedValue(null)
     render(<App
       api={createApi()}
       authApi={authenticatedAuthApi()}
-      callsApi={createCallApi({ getCurrent: async () => ringingCall })}
+      callsApi={createCallApi({ getCurrent })}
     />)
-    const callHeading = await screen.findByRole('heading', { name: 'Домофон у подъезда' })
-    const navigation = within(screen.getByRole('complementary', { name: 'Основная навигация' }))
+    expect(await screen.findByText('Подъезд 1')).toBeVisible()
+    const navigation = within(screen.getByRole('navigation', { name: 'Основная навигация' }))
+    await user.click(navigation.getByRole('button', { name: 'События' }))
+    expect(await screen.findByRole('heading', { name: 'События' })).toBeVisible()
 
-    await user.click(navigation.getByRole('button', { name: 'Главная' }))
-    expect(callHeading).not.toBeVisible()
-    await user.click(navigation.getByRole('button', { name: /Звонки.*Входящий/ }))
+    await act(async () => firstCall.resolve(ringingCall))
 
-    expect(screen.getByRole('heading', { name: 'Домофон у подъезда' })).toBe(callHeading)
+    expect(await screen.findByRole('dialog', { name: 'Входящий вызов' })).toBeVisible()
+    expect(navigation.getByRole('button', { name: 'События' })).toHaveAttribute('aria-current', 'page')
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Входящий вызов' })).not.toBeInTheDocument(), { timeout: 2_000 })
+    expect(screen.getByRole('heading', { name: 'События' })).toBeVisible()
+    expect(navigation.getByRole('button', { name: 'События' })).toHaveAttribute('aria-current', 'page')
   })
 
-  it('aborts call polling and clears the call UI after logout', async () => {
+  it('keeps one browser call overlay mounted while polling through call phases', async () => {
+    const connectingCall: CurrentCall = { ...ringingCall, phase: 'connecting', revision: 4 }
+    const activeCall: CurrentCall = { ...ringingCall, phase: 'active', revision: 5 }
+    const endingCall: CurrentCall = { ...ringingCall, phase: 'ending', revision: 6 }
+    const getCurrent = vi.fn<CallApi['getCurrent']>()
+      .mockResolvedValueOnce(ringingCall)
+      .mockResolvedValueOnce(connectingCall)
+      .mockResolvedValueOnce(activeCall)
+      .mockResolvedValueOnce(endingCall)
+      .mockImplementation(() => new Promise<CurrentCall | null>(() => undefined))
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({ getCurrent })}
+    />)
+    const dialog = await screen.findByRole('dialog', { name: 'Входящий вызов' })
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Входящий вызов')
+
+    await waitFor(() => expect(within(dialog).getByRole('status')).toHaveTextContent('Подключаем звонок'), { timeout: 2_000 })
+    expect(screen.getByRole('dialog', { name: 'Входящий вызов' })).toBe(dialog)
+    await waitFor(() => expect(within(dialog).getByRole('status')).toHaveTextContent('Звонок идёт'), { timeout: 2_000 })
+    expect(screen.getByRole('dialog', { name: 'Входящий вызов' })).toBe(dialog)
+    expect(within(dialog).getByRole('button', { name: 'Завершить вызов' })).toBeVisible()
+    await waitFor(() => expect(within(dialog).getByRole('status')).toHaveTextContent('Завершаем звонок'), { timeout: 2_000 })
+    expect(screen.getByRole('dialog', { name: 'Входящий вызов' })).toBe(dialog)
+  })
+
+  it('aborts call polling and tears down the call overlay after logout', async () => {
     const user = userEvent.setup()
     let callSignal: AbortSignal | undefined
+    let pollCount = 0
     const getCurrent = vi.fn<CallApi['getCurrent']>((signal) => {
+      pollCount += 1
+      if (pollCount === 1) return Promise.resolve(ringingCall)
       callSignal = signal
       return new Promise<CurrentCall | null>(() => undefined)
     })
@@ -650,24 +878,25 @@ describe('live intercom dashboard', () => {
       authApi={authenticatedAuthApi()}
       callsApi={createCallApi({ getCurrent })}
     />)
-    await waitFor(() => expect(callSignal).toBeDefined())
+    expect(await screen.findByRole('dialog', { name: 'Входящий вызов' })).toBeVisible()
+    await waitFor(() => expect(callSignal).toBeDefined(), { timeout: 2_000 })
 
     await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
     await user.click(await screen.findByRole('button', { name: 'Выйти' }))
 
     expect(callSignal?.aborted).toBe(true)
     expect(await screen.findByRole('heading', { name: 'Войдите в MTS ID' })).toBeVisible()
+    expect(screen.queryByRole('dialog', { name: 'Входящий вызов' })).not.toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Домофон у подъезда' })).not.toBeInTheDocument()
   })
 
   it('does not invent an incoming call when the call endpoint returns no current call', async () => {
-    const user = userEvent.setup()
     render(<App api={createApi()} authApi={authenticatedAuthApi()} callsApi={createCallApi()} />)
     expect(await screen.findByText('Подъезд 1')).toBeVisible()
 
-    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
-    expect(await screen.findByRole('heading', { name: 'Нет активного звонка' })).toBeVisible()
+    expect(screen.queryByRole('dialog', { name: 'Входящий вызов' })).not.toBeInTheDocument()
     expect(screen.queryByText('Входящий вызов')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Нет активного звонка' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Принять вызов' })).not.toBeInTheDocument()
   })
 
@@ -701,18 +930,315 @@ describe('live intercom dashboard', () => {
       callsApi={createCallApi()}
       eventsApi={{ getEvents }}
     />)
-    const navigation = within(screen.getByRole('complementary', { name: 'Основная навигация' }))
+    const navigation = within(screen.getByRole('navigation', { name: 'Основная навигация' }))
     await user.click(navigation.getByRole('button', { name: 'События' }))
 
-    expect(await screen.findByRole('heading', { name: 'Журнал событий' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'События' })).toBeVisible()
     await user.click(screen.getByRole('button', { name: 'Открыть запись камеры' }))
 
     expect(await screen.findByRole('heading', { name: 'Архив' })).toBeVisible()
     expect(screen.getByLabelText('Начало просмотра')).toHaveValue('2026-08-07T12:30')
     expect(getArchiveDistribution).toHaveBeenCalledWith('flat-81', 'camera-1', expect.any(AbortSignal))
+    await user.click(screen.getByRole('button', { name: 'Назад' }))
+    expect(await screen.findByRole('heading', { name: 'События' })).toBeVisible()
   })
 
-  it('shows call history and a global banner for the armed server policy, then clears it on logout', async () => {
+  it('keeps More mounted for policy refresh without exposing hidden settings to accessibility', async () => {
+    const user = userEvent.setup()
+    const getAutoOpenPolicy = vi.fn(async () => ({ mode: 'disabled', dismissAfterOpen: false } as const))
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy,
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => ({ mode: 'disabled', dismissAfterOpen: false }),
+        disableAutoOpen: async () => undefined,
+      })}
+    />)
+
+    await waitFor(() => expect(getAutoOpenPolicy).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('heading', { name: 'Ещё' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /Автооткрытие/ })).not.toBeInTheDocument()
+
+    const navigation = within(screen.getByRole('navigation', { name: 'Основная навигация' }))
+    await user.click(navigation.getByRole('button', { name: 'Ещё' }))
+
+    expect(await screen.findByRole('heading', { name: 'Ещё' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Автооткрытие выключено' })).toBeVisible()
+    expect(getAutoOpenPolicy).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the armed Home state until direct disable is confirmed', async () => {
+    const user = userEvent.setup()
+    const pendingDisable = deferred<void>()
+    const disableAutoOpen = vi.fn(() => pendingDisable.promise)
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        disableAutoOpen,
+      })}
+    />)
+
+    const armedStatus = await screen.findByRole('status', { name: 'Автооткрытие включено' })
+    const disableButton = within(armedStatus).getByRole('button', { name: 'Выключить' })
+    await user.click(disableButton)
+
+    expect(disableAutoOpen).toHaveBeenCalledTimes(1)
+    expect(disableButton).toBeDisabled()
+    expect(screen.getByRole('status', { name: 'Автооткрытие включено' })).toBeVisible()
+
+    const navigation = within(screen.getByRole('navigation', { name: 'Основная навигация' }))
+    await user.click(navigation.getByRole('button', { name: 'Ещё' }))
+    const moreDisable = screen.getByRole('button', { name: 'Выключить автооткрытие' })
+    expect(moreDisable).toBeDisabled()
+    await user.click(moreDisable)
+    expect(disableAutoOpen).toHaveBeenCalledTimes(1)
+
+    await act(async () => pendingDisable.resolve())
+    expect(screen.queryByRole('status', { name: 'Автооткрытие включено' })).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Автооткрытие выключено' })).toBeVisible()
+  })
+
+  it('blocks Home disable while More owns the mutation and syncs the result immediately', async () => {
+    const user = userEvent.setup()
+    const pendingDisable = deferred<void>()
+    const disableAutoOpen = vi.fn(() => pendingDisable.promise)
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        disableAutoOpen,
+      })}
+    />)
+    const navigation = within(screen.getByRole('navigation', { name: 'Основная навигация' }))
+    await user.click(navigation.getByRole('button', { name: 'Ещё' }))
+    await user.click(await screen.findByRole('button', { name: 'Выключить автооткрытие' }))
+
+    await user.click(navigation.getByRole('button', { name: 'Главная' }))
+    const homeDisable = within(await screen.findByRole('status', { name: 'Автооткрытие включено' }))
+      .getByRole('button', { name: 'Выключить' })
+    expect(homeDisable).toBeDisabled()
+    await user.click(homeDisable)
+    expect(disableAutoOpen).toHaveBeenCalledTimes(1)
+
+    await act(async () => pendingDisable.resolve())
+    expect(screen.queryByRole('status', { name: 'Автооткрытие включено' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Автооткрытие' })).toBeVisible()
+  })
+
+  it('keeps a session-B Home mutation owned when a logged-out session-A Home mutation settles', async () => {
+    const user = userEvent.setup()
+    const sessionADisable = deferred<void>()
+    const sessionBDisable = deferred<void>()
+    const mutationSignals: Array<AbortSignal | undefined> = []
+    const disableAutoOpen = vi.fn<NonNullable<CallApi['disableAutoOpen']>>((signal) => {
+      mutationSignals.push(signal)
+      return mutationSignals.length === 1 ? sessionADisable.promise : sessionBDisable.promise
+    })
+    render(<App
+      api={createApi()}
+      authApi={reauthenticatingAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        disableAutoOpen,
+      })}
+    />)
+
+    const firstStatus = await screen.findByRole('status', { name: 'Автооткрытие включено' })
+    await user.click(within(firstStatus).getByRole('button', { name: 'Выключить' }))
+    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
+    await user.click(await screen.findByRole('button', { name: 'Выйти' }))
+    expect(mutationSignals[0]?.aborted).toBe(true)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
+    const authDialog = await screen.findByRole('dialog', { name: 'Вход в VDome' })
+    await user.click(within(authDialog).getByRole('button', { name: 'Войти с MTS ID' }))
+    const secondStatus = await screen.findByRole('status', { name: 'Автооткрытие включено' })
+    const secondDisable = within(secondStatus).getByRole('button', { name: 'Выключить' })
+    await user.click(secondDisable)
+    expect(disableAutoOpen).toHaveBeenCalledTimes(2)
+
+    await act(async () => sessionADisable.resolve())
+    expect(secondDisable).toBeDisabled()
+    expect(screen.getByRole('status', { name: 'Автооткрытие включено' })).toBeVisible()
+
+    await act(async () => sessionBDisable.resolve())
+    expect(await screen.findByRole('button', { name: 'Автооткрытие' })).toBeVisible()
+  })
+
+  it('keeps a session-B More mutation owned when a logged-out session-A More mutation settles', async () => {
+    const user = userEvent.setup()
+    const sessionADisable = deferred<void>()
+    const sessionBDisable = deferred<void>()
+    const mutationSignals: AbortSignal[] = []
+    const disableAutoOpen = vi.fn<NonNullable<CallApi['disableAutoOpen']>>((signal) => {
+      if (signal) mutationSignals.push(signal)
+      return mutationSignals.length === 1 ? sessionADisable.promise : sessionBDisable.promise
+    })
+    render(<App
+      api={createApi()}
+      authApi={reauthenticatingAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        disableAutoOpen,
+      })}
+    />)
+    const navigation = within(screen.getByRole('navigation', { name: 'Основная навигация' }))
+    await user.click(navigation.getByRole('button', { name: 'Ещё' }))
+    await user.click(await screen.findByRole('button', { name: 'Выключить автооткрытие' }))
+
+    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
+    await user.click(await screen.findByRole('button', { name: 'Выйти' }))
+    expect(mutationSignals[0]?.aborted).toBe(true)
+
+    await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
+    const authDialog = await screen.findByRole('dialog', { name: 'Вход в VDome' })
+    await user.click(within(authDialog).getByRole('button', { name: 'Войти с MTS ID' }))
+    await user.click(within(screen.getByRole('navigation', { name: 'Основная навигация' })).getByRole('button', { name: 'Ещё' }))
+    const secondDisable = await screen.findByRole('button', { name: 'Выключить автооткрытие' })
+    await user.click(secondDisable)
+    expect(disableAutoOpen).toHaveBeenCalledTimes(2)
+
+    await act(async () => sessionADisable.resolve())
+    expect(secondDisable).toBeDisabled()
+    expect(screen.getByRole('heading', { name: 'Откроется следующий входящий звонок' })).toBeVisible()
+
+    await act(async () => sessionBDisable.resolve())
+    expect(await screen.findByRole('heading', { name: 'Автооткрытие выключено' })).toBeVisible()
+  })
+
+  it('ignores a pre-mutation poll that resolves after confirmed disable', async () => {
+    const user = userEvent.setup()
+    const armed = { mode: 'next_call', dismissAfterOpen: false } as const
+    const stalePolicy = deferred<typeof armed>()
+    const policyPolls: Array<() => void> = []
+    const originalSetTimeout = window.setTimeout.bind(window)
+    const timerSpy = vi.spyOn(window, 'setTimeout').mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 5_000 && typeof handler === 'function') {
+        policyPolls.push(() => handler(...args))
+        return 1
+      }
+      return originalSetTimeout(handler, timeout)
+    }) as typeof window.setTimeout)
+    const getAutoOpenPolicy = vi.fn<NonNullable<CallApi['getAutoOpenPolicy']>>()
+      .mockResolvedValueOnce(armed)
+      .mockImplementationOnce(() => stalePolicy.promise)
+    const disableAutoOpen = vi.fn(async () => undefined)
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy,
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => armed,
+        disableAutoOpen,
+      })}
+    />)
+
+    const armedStatus = await screen.findByRole('status', { name: 'Автооткрытие включено' })
+    expect(policyPolls).toHaveLength(1)
+    act(() => policyPolls[0]())
+    await waitFor(() => expect(getAutoOpenPolicy).toHaveBeenCalledTimes(2))
+
+    await user.click(within(armedStatus).getByRole('button', { name: 'Выключить' }))
+    expect(await screen.findByRole('button', { name: 'Автооткрытие' })).toBeVisible()
+
+    const navigation = within(screen.getByRole('navigation', { name: 'Основная навигация' }))
+    await user.click(navigation.getByRole('button', { name: 'Ещё' }))
+    expect(screen.getByRole('heading', { name: 'Автооткрытие выключено' })).toBeVisible()
+
+    await act(async () => stalePolicy.resolve(armed))
+
+    expect(screen.getByRole('heading', { name: 'Автооткрытие выключено' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Выключить автооткрытие' })).not.toBeInTheDocument()
+    await user.click(navigation.getByRole('button', { name: 'Главная' }))
+    expect(screen.getByRole('button', { name: 'Автооткрытие' })).toBeVisible()
+    expect(screen.queryByRole('status', { name: 'Автооткрытие включено' })).not.toBeInTheDocument()
+    expect(disableAutoOpen).toHaveBeenCalledTimes(1)
+    timerSpy.mockRestore()
+  })
+
+  it('ignores a pre-mutation poll failure after a confirmed policy mutation', async () => {
+    const user = userEvent.setup()
+    const armed = { mode: 'next_call', dismissAfterOpen: false } as const
+    const stalePoll = deferred<typeof armed>()
+    const policyPolls: Array<() => void> = []
+    const originalSetTimeout = window.setTimeout.bind(window)
+    const timerSpy = vi.spyOn(window, 'setTimeout').mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (timeout === 5_000 && typeof handler === 'function') {
+        policyPolls.push(() => handler(...args))
+        return 1
+      }
+      return originalSetTimeout(handler, timeout)
+    }) as typeof window.setTimeout)
+    const getAutoOpenPolicy = vi.fn<NonNullable<CallApi['getAutoOpenPolicy']>>()
+      .mockResolvedValueOnce(armed)
+      .mockImplementationOnce(() => stalePoll.promise)
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy,
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => armed,
+        disableAutoOpen: async () => undefined,
+      })}
+    />)
+
+    const armedStatus = await screen.findByRole('status', { name: 'Автооткрытие включено' })
+    act(() => policyPolls[0]())
+    await waitFor(() => expect(getAutoOpenPolicy).toHaveBeenCalledTimes(2))
+    await user.click(within(armedStatus).getByRole('button', { name: 'Выключить' }))
+    await user.click(within(screen.getByRole('navigation', { name: 'Основная навигация' })).getByRole('button', { name: 'Ещё' }))
+
+    await act(async () => stalePoll.reject(new Error('stale provider failure')))
+
+    expect(screen.getByRole('heading', { name: 'Автооткрытие выключено' })).toBeVisible()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    timerSpy.mockRestore()
+  })
+
+  it('keeps a failed direct disable visible and retryable', async () => {
+    const user = userEvent.setup()
+    const disableAutoOpen = vi.fn<NonNullable<CallApi['disableAutoOpen']>>()
+      .mockRejectedValueOnce(new Error('private provider response'))
+      .mockResolvedValueOnce(undefined)
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        disableAutoOpen,
+      })}
+    />)
+
+    const armedStatus = await screen.findByRole('status', { name: 'Автооткрытие включено' })
+    await user.click(within(armedStatus).getByRole('button', { name: 'Выключить' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось выключить автооткрытие')
+    expect(document.body).not.toHaveTextContent('private provider response')
+    expect(screen.getByRole('status', { name: 'Автооткрытие включено' })).toBeVisible()
+
+    await user.click(within(armedStatus).getByRole('button', { name: 'Выключить' }))
+    await waitFor(() => expect(disableAutoOpen).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole('status', { name: 'Автооткрытие включено' })).not.toBeInTheDocument()
+  })
+
+  it('shows one recent-events heading and Home controls for the armed server policy, then clears them on logout', async () => {
     const user = userEvent.setup()
     const eventsApi: EventApi = { getEvents: async () => ({
       page: 0,
@@ -735,9 +1261,8 @@ describe('live intercom dashboard', () => {
     />)
 
     expect(await screen.findByRole('status', { name: 'Автооткрытие включено' })).toHaveTextContent('следующий звонок')
-    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
-    expect(await screen.findByRole('heading', { name: 'История звонков' })).toBeVisible()
-    expect(screen.getByText('Пропущенный вызов')).toBeVisible()
+    expect(await screen.findByText(/Пропущенный вызов/)).toBeVisible()
+    expect(screen.getAllByRole('heading', { name: 'Последние события' })).toHaveLength(1)
 
     await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
     await user.click(await screen.findByRole('button', { name: 'Выйти' }))

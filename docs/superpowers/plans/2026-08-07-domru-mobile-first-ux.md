@@ -691,7 +691,7 @@ Run from repository root:
 
 ```bash
 cargo fmt --check
-cargo test --workspace
+cargo test --all-targets --all-features
 git diff --check
 git status --short
 ```

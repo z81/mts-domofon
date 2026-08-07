@@ -10,9 +10,9 @@
 
 ## Global Constraints
 
-- Repository: `/Users/alex/dev/domru-mts`.
-- Structural reference only: `/Users/alex/dev/domru-z81` Rust `origin/main`; do not reuse its Dom.ru protocol.
-- Current interoperability reference: `/Users/alex/Downloads/VDome_3.0.1_APKPure.xapk`, package `ru.mts.vdome.resident`, version `3.0.1` (`300001001`), SHA-256 `1a857b46a2e7aec6d9e01458a9c8e8961e2a1d96a861bd4e1bdcd1ccf368c92b`.
+- Repository: the current standalone checkout.
+- Keep the architecture standalone and do not reuse another provider's protocol or repository-specific structure.
+- Current interoperability reference: VDome distribution package, package `ru.mts.vdome.resident`, version `3.0.1` (`300001001`), SHA-256 `1a857b46a2e7aec6d9e01458a9c8e8961e2a1d96a861bd4e1bdcd1ccf368c92b`.
 - Implement independently from observed contracts; do not copy proprietary APK code, UI, analytics, or assets.
 - Production authentication is challenge-driven MTS ID/WebSSO for client `VDome`; never fall back to obsolete direct SMS.
 - Provider DTOs never cross the service boundary; local JSON remains stable and versioned under `/api/v1`.

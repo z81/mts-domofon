@@ -6,7 +6,7 @@ Status: approved core-only scope
 
 ## 1. Goal
 
-Build an independent Rust implementation of the current MTS VDome resident client in `/Users/alex/dev/domru-mts`, using the Rust implementation from `domru-z81` only as a structural reference.
+Build an independent Rust implementation of the current MTS VDome resident client with a standalone architecture and independently defined provider contracts.
 
 The product is deliberately limited to the main intercom experience:
 
@@ -24,7 +24,7 @@ This is a personal interoperability client. It reproduces independently observed
 
 ### Current product
 
-- XAPK: `/Users/alex/Downloads/VDome_3.0.1_APKPure.xapk`
+- XAPK: VDome 3.0.1 distribution package
 - SHA-256: `1a857b46a2e7aec6d9e01458a9c8e8961e2a1d96a861bd4e1bdcd1ccf368c92b`
 - Package: `ru.mts.vdome.resident`
 - Version: `3.0.1` (`300001001`)
@@ -34,9 +34,9 @@ This is a personal interoperability client. It reproduces independently observed
 
 The APK and safe unauthenticated probes show that production authorization uses gateway `WEB_SSO`, not the obsolete direct-SMS API.
 
-### Structural reference
+### Service architecture
 
-`/Users/alex/dev/domru-z81`, Rust `origin/main`, supplies the desired service shape:
+The service shape is:
 
 - async Rust and Axum;
 - embedded Web UI;
@@ -46,11 +46,11 @@ The APK and safe unauthenticated probes show that production authorization uses 
 - SSE and webhooks;
 - Docker packaging.
 
-Its Dom.ru provider protocol is not reused.
+No third-party intercom provider protocol is reused.
 
 ### Historical reference
 
-`/Users/alex/Downloads/cs12d7a.4pda.ws` (MTS Domofon 1.1.7) is historical evidence only. Its hosts and direct token/SMS flow are not production defaults.
+MTS Domofon 1.1.7 is historical evidence only. Its hosts and direct token/SMS flow are not production defaults.
 
 ## 3. Product boundary
 
@@ -324,7 +324,7 @@ Canonical routes are versioned under `/api/v1`:
 /health/ready
 ```
 
-Compatibility aliases matching `domru-z81` are provided only where semantics stay safe: `/api/login`, `/api/confirm`, `/api/session`, `/api/logout`, `/api/places`, `/api/snapshot/:camera_id`, `/api/stream/:camera_id`, `/api/archive/:camera_id`, and `/api/open-door`. `/api/open-door` cannot bypass the canonical confirmation-intent flow.
+Legacy compatibility aliases are provided only where semantics stay safe: `/api/login`, `/api/confirm`, `/api/session`, `/api/logout`, `/api/places`, `/api/snapshot/:camera_id`, `/api/stream/:camera_id`, `/api/archive/:camera_id`, and `/api/open-door`. `/api/open-door` cannot bypass the canonical confirmation-intent flow.
 
 There is no generic provider request, URL proxy, automatic-open, favorite, support, resident-service, payment, pass, marketplace, document, or event-deletion route.
 
