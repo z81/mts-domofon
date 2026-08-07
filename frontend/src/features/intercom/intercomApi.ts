@@ -71,12 +71,23 @@ export interface LiveSession {
   playlistUrl: string
 }
 
+export interface ArchiveInterval {
+  from: string
+  to: string
+}
+
+export interface ArchiveDistribution {
+  intervals: ArchiveInterval[]
+}
+
 export interface IntercomApi {
   getDashboard(signal?: AbortSignal): Promise<PropertyDashboard>
   getDevices(flatId: string, signal?: AbortSignal): Promise<DeviceInventory>
   getSnapshot(flatId: string, cameraId: string, signal?: AbortSignal): Promise<Blob>
   startLive?(flatId: string, cameraId: string, signal?: AbortSignal): Promise<LiveSession>
   stopLive?(sessionId: string): Promise<void>
+  getArchiveDistribution?(flatId: string, cameraId: string, signal?: AbortSignal): Promise<ArchiveDistribution>
+  startArchive?(flatId: string, cameraId: string, start: string, signal?: AbortSignal): Promise<LiveSession>
   createDoorIntent(flatId: string, accessPointId: string, lockNumber: string, signal?: AbortSignal): Promise<DoorIntent>
   executeDoorIntent(intentId: string, signal?: AbortSignal): Promise<void>
 }
@@ -171,6 +182,20 @@ export function createProductionIntercomApi(fetcher: typeof fetch = fetch): Inte
       if (!response.ok) throw await errorFrom(response)
       if (response.status !== 204) throw new IntercomApiError(502, 'invalid_local_response')
     },
+    getArchiveDistribution: async (flatId, cameraId, signal) => readJson<ArchiveDistribution>(await fetcher(
+      `/api/v1/cameras/${encodeURIComponent(cameraId)}/archive/distribution?flatId=${encodeURIComponent(flatId)}`,
+      jsonRequest(signal),
+    )),
+    startArchive: async (flatId, cameraId, start, signal) => readLiveSession(await fetcher(
+      `/api/v1/cameras/${encodeURIComponent(cameraId)}/archive?flatId=${encodeURIComponent(flatId)}`,
+      {
+        body: JSON.stringify({ start }),
+        credentials: 'same-origin',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        method: 'POST',
+        signal,
+      },
+    )),
     createDoorIntent: async (flatId, accessPointId, lockNumber, signal) => readJson<DoorIntent>(await fetcher('/api/v1/access/intents', {
       body: JSON.stringify({ flatId, accessPointId, lockNumber }),
       credentials: 'same-origin',

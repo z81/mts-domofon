@@ -122,6 +122,34 @@ describe('production call API boundary', () => {
       })],
     ])
   })
+
+  it('reads, confirms, and disables bounded auto-open policies', async () => {
+    const disabled = { mode: 'disabled', dismissAfterOpen: false }
+    const intent = { intentId: 'auto / intent', expiresAt: '2026-08-07T12:00:30Z' }
+    const armed = { mode: 'until', until: '2026-08-07T12:30:00Z', dismissAfterOpen: true }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(disabled))
+      .mockResolvedValueOnce(jsonResponse(intent, 201))
+      .mockResolvedValueOnce(jsonResponse(armed))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    const api = createProductionCallApi(fetcher)
+
+    await expect(api.getAutoOpenPolicy?.()).resolves.toEqual(disabled)
+    await expect(api.createAutoOpenIntent?.('until', true)).resolves.toEqual(intent)
+    await expect(api.executeAutoOpenIntent?.('auto / intent')).resolves.toEqual(armed)
+    await expect(api.disableAutoOpen?.()).resolves.toBeUndefined()
+
+    expect(fetcher.mock.calls).toEqual([
+      ['/api/v1/calls/auto-open', expect.objectContaining({ method: 'GET' })],
+      ['/api/v1/calls/auto-open/intents', expect.objectContaining({
+        body: JSON.stringify({ mode: 'until', dismissAfterOpen: true }), method: 'POST',
+      })],
+      ['/api/v1/calls/auto-open/intents/auto%20%2F%20intent/execute', expect.objectContaining({
+        body: JSON.stringify({}), method: 'POST',
+      })],
+      ['/api/v1/calls/auto-open', expect.objectContaining({ method: 'DELETE' })],
+    ])
+  })
 })
 
 describe('current-call polling', () => {

@@ -3,12 +3,17 @@ import Hls from 'hls.js'
 import { AuthPage } from '../features/auth/AuthPage'
 import { authApi as defaultAuthApi, type AuthApi } from '../features/auth/authApi'
 import { CallPage } from '../features/calls/CallPage'
+import { AutoOpenPanel } from '../features/calls/AutoOpenPanel'
 import {
   callApi,
   startCurrentCallPolling,
+  type AutoOpenPolicy,
   type CallApi,
   type CurrentCall,
 } from '../features/calls/callApi'
+import { EventJournal } from '../features/events/EventJournal'
+import { eventApi as defaultEventApi, type EventApi } from '../features/events/eventApi'
+import { ArchivePlayer } from '../features/intercom/ArchivePlayer'
 import {
   IntercomApiError,
   intercomApi,
@@ -39,6 +44,7 @@ interface AppProps {
   api?: IntercomApi
   authApi?: AuthApi
   callsApi?: CallApi
+  eventsApi?: EventApi
 }
 
 interface PreparedDoorIntent {
@@ -56,6 +62,11 @@ interface PreparingLock {
 }
 
 type DoorFeedback = { kind: 'success' | 'error'; message: string }
+
+interface ArchiveTarget {
+  cameraId: string
+  archiveAt: string
+}
 
 const navigation: ReadonlyArray<{ page: Page; label: string; glyph: string }> = [
   { page: 'home', label: 'Главная', glyph: '⌂' },
@@ -103,6 +114,18 @@ function formatDoorExpiry(value: string): string {
     minute: '2-digit',
     second: '2-digit',
   }).format(expiresAt)
+}
+
+function formatAutoOpenBanner(policy: AutoOpenPolicy | null): string {
+  if (policy?.mode === 'next_call') return 'Автооткрытие: следующий звонок'
+  if (policy?.mode !== 'until' || !policy.until) return 'Автооткрытие включено'
+
+  const until = new Date(policy.until)
+  if (Number.isNaN(until.getTime())) return 'Автооткрытие включено'
+  return `Автооткрытие до ${new Intl.DateTimeFormat('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(until)}`
 }
 
 function StateCard({ eyebrow, title, children, action }: {
@@ -279,20 +302,33 @@ function CameraLive({ api, camera, flatId, onStop }: { api: IntercomApi; camera:
   </div>
 }
 
-function CameraPanel({ api, camera, flatId }: { api: IntercomApi; camera: Camera | null; flatId: string }) {
-  const [liveCameraKey, setLiveCameraKey] = useState<string | null>(null)
-  const cameraKey = camera ? `${flatId}:${camera.id}` : null
-  const live = cameraKey !== null && liveCameraKey === cameraKey
-  const liveAvailable = camera?.capabilities.live.state === 'available' && api.startLive && api.stopLive
+function CameraPanel({ api, camera, flatId, initialArchiveAt }: { api: IntercomApi; camera: Camera | null; flatId: string; initialArchiveAt?: string }) {
+  const archiveAvailable = Boolean(
+    camera?.capabilities.archive.state === 'available'
+    && api.getArchiveDistribution
+    && api.startArchive
+    && api.stopLive,
+  )
+  const [mode, setMode] = useState<'snapshot' | 'live' | 'archive'>(
+    initialArchiveAt && archiveAvailable ? 'archive' : 'snapshot',
+  )
+  const liveAvailable = Boolean(
+    camera?.capabilities.live.state === 'available' && api.startLive && api.stopLive,
+  )
 
   return <article className="camera-card">
-    {camera
-      ? live
-        ? <CameraLive api={api} camera={camera} flatId={flatId} onStop={() => setLiveCameraKey(null)} />
-        : <><CameraSnapshot api={api} camera={camera} flatId={flatId} />
-          {liveAvailable && <button className="live-start-button" onClick={() => setLiveCameraKey(cameraKey)} type="button">Смотреть live</button>}
-        </>
-      : <div className="camera-placeholder"><p>Камер для этого объекта нет</p></div>}
+    {camera ? <>
+      {(liveAvailable || archiveAvailable) && <div className="camera-mode-tabs" role="group" aria-label="Режим камеры">
+        <button className={mode === 'snapshot' ? 'selected' : ''} onClick={() => setMode('snapshot')} type="button">Снимок</button>
+        {liveAvailable && <button className={mode === 'live' ? 'selected' : ''} onClick={() => setMode('live')} type="button">Смотреть live</button>}
+        {archiveAvailable && <button className={mode === 'archive' ? 'selected' : ''} onClick={() => setMode('archive')} type="button">Архив</button>}
+      </div>}
+      {mode === 'live' && liveAvailable
+        ? <CameraLive api={api} camera={camera} flatId={flatId} onStop={() => setMode('snapshot')} />
+        : mode === 'archive' && archiveAvailable
+          ? <ArchivePlayer api={api} cameraId={camera.id} cameraName={camera.name} flatId={flatId} initialAt={initialArchiveAt} />
+          : <CameraSnapshot api={api} camera={camera} flatId={flatId} />}
+    </> : <div className="camera-placeholder"><p>Камер для этого объекта нет</p></div>}
   </article>
 }
 
@@ -306,18 +342,7 @@ function DeviceError({ unauthorized, onAuth, onRetry }: { unauthorized: boolean;
   </StateCard>
 }
 
-function UnavailablePage({ eyebrow, title, copy }: { eyebrow: string; title: string; copy: string }) {
-  return <>
-    <section className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h1>{eyebrow}</h1></div></section>
-    <section className="content-card unavailable-card">
-      <span className="state-icon" aria-hidden="true">○</span>
-      <h2>{title}</h2>
-      <p>{copy}</p>
-    </section>
-  </>
-}
-
-function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }: AppProps) {
+function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, eventsApi = defaultEventApi }: AppProps) {
   const [page, setPage] = useState<Page>('home')
   const [flatOpen, setFlatOpen] = useState(false)
   const [authOpen, setAuthOpen] = useState(false)
@@ -328,6 +353,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
   const [selectedFlatId, setSelectedFlatId] = useState<string | null>(null)
   const [devices, setDevices] = useState<DeviceRemote>({ status: 'idle' })
   const [selectedCameraId, setSelectedCameraId] = useState<string | null>(null)
+  const [archiveTarget, setArchiveTarget] = useState<ArchiveTarget | null>(null)
   const [preparingLock, setPreparingLock] = useState<PreparingLock | null>(null)
   const [doorIntent, setDoorIntent] = useState<PreparedDoorIntent | null>(null)
   const [doorExecuting, setDoorExecuting] = useState(false)
@@ -337,6 +363,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
   const [callLoading, setCallLoading] = useState(true)
   const [callPollingError, setCallPollingError] = useState(false)
   const [callSessionAuthenticated, setCallSessionAuthenticated] = useState<boolean | null>(null)
+  const [autoOpenPolicy, setAutoOpenPolicy] = useState<AutoOpenPolicy | null>(null)
   const doorPreparationInFlight = useRef(false)
   const doorExecutionInFlight = useRef(false)
   const sessionEpoch = useRef(0)
@@ -449,6 +476,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
   function selectPage(next: Page) {
     setPage(next)
     setFlatOpen(false)
+    setArchiveTarget(null)
   }
 
   function selectFlat(flatId: string) {
@@ -458,6 +486,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
     }
     setSelectedFlatId(flatId)
     setSelectedCameraId(null)
+    setArchiveTarget(null)
     setDevices({ status: 'loading', flatId })
     setFlatOpen(false)
   }
@@ -472,6 +501,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
     setCallLoading(true)
     setCallPollingError(false)
     setCallSessionAuthenticated(true)
+    setAutoOpenPolicy(null)
     setDashboard({ status: 'loading' })
     setDashboardReload((value) => value + 1)
   }
@@ -488,6 +518,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
     setSelectedFlatId(null)
     setDevices({ status: 'idle' })
     setSelectedCameraId(null)
+    setArchiveTarget(null)
     setPreparingLock(null)
     setDoorIntent(null)
     setDoorExecuting(false)
@@ -497,6 +528,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
     setCallLoading(false)
     setCallPollingError(false)
     setCallSessionAuthenticated(false)
+    setAutoOpenPolicy(null)
   }
 
   function retryDashboard() {
@@ -508,6 +540,14 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
     if (!selectedFlatId) return
     setDevices({ status: 'loading', flatId: selectedFlatId })
     setDeviceReload((value) => value + 1)
+  }
+
+  function openEventArchive(cameraId: string, archiveAt: string) {
+    if (!inventory?.cameras.some((camera) => camera.id === cameraId)) return
+    setSelectedCameraId(cameraId)
+    setArchiveTarget({ cameraId, archiveAt })
+    setPage('cameras')
+    setFlatOpen(false)
   }
 
   async function prepareDoor(flat: Flat, point: AccessPoint, lock: Lock) {
@@ -578,7 +618,10 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
 
     const deviceInventory = devices.data
     const availableCount = deviceInventory.accessPoints.filter((point) => point.available).length
-    const cameraPanelKey = `${selectedFlat.id}\u0000${selectedCamera?.id ?? ''}`
+    const activeArchiveAt = archiveTarget && archiveTarget.cameraId === selectedCamera?.id
+      ? archiveTarget.archiveAt
+      : undefined
+    const cameraPanelKey = `${selectedFlat.id}\u0000${selectedCamera?.id ?? ''}\u0000${activeArchiveAt ?? ''}`
 
     if (page === 'access') {
       return <>
@@ -594,17 +637,21 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
       return <>
         <section className="page-heading"><div><p className="eyebrow">{selectedFlat.address}</p><h1>Камеры</h1><p>Снимки с камер выбранного объекта.</p></div></section>
         {deviceInventory.cameras.length > 1 && <div className="camera-tabs" aria-label="Выбор камеры" role="group">
-          {deviceInventory.cameras.map((camera) => <button className={camera.id === selectedCamera?.id ? 'selected' : ''} onClick={() => setSelectedCameraId(camera.id)} type="button" key={camera.id}>{camera.name}</button>)}
+          {deviceInventory.cameras.map((camera) => <button className={camera.id === selectedCamera?.id ? 'selected' : ''} onClick={() => { setSelectedCameraId(camera.id); setArchiveTarget(null) }} type="button" key={camera.id}>{camera.name}</button>)}
         </div>}
         <section className="camera-layout">
-          <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} key={cameraPanelKey} />
-          <aside className="content-card camera-info"><p className="eyebrow">Возможности</p><h2>{selectedCamera?.name ?? 'Камеры не найдены'}</h2><p>{selectedCamera ? 'Сейчас доступен отдельный снимок. Прямой эфир и архив не отображаются, пока их transport не подключён.' : 'Для выбранного объекта MTS не вернул камер.'}</p></aside>
+          <CameraPanel api={api} camera={selectedCamera} flatId={selectedFlat.id} initialArchiveAt={activeArchiveAt} key={cameraPanelKey} />
+          <aside className="content-card camera-info"><p className="eyebrow">Возможности</p><h2>{selectedCamera?.name ?? 'Камеры не найдены'}</h2><p>{selectedCamera ? [
+            selectedCamera.capabilities.snapshot.state === 'available' ? 'снимок' : null,
+            selectedCamera.capabilities.live.state === 'available' ? 'прямой эфир со звуком' : null,
+            selectedCamera.capabilities.archive.state === 'available' ? 'архив со звуком' : null,
+          ].filter(Boolean).join(' · ') || 'Медиа недоступно' : 'Для выбранного объекта MTS не вернул камер.'}</p></aside>
         </section>
       </>
     }
 
     if (page === 'events') {
-      return <UnavailablePage eyebrow="События" title="События пока не подключены" copy="Журнал останется пустым, пока локальный API не начнёт отдавать реальные события домофона." />
+      return <EventJournal api={eventsApi} flatId={selectedFlat.id} onOpenArchive={openEventArchive} variant="full" />
     }
 
     return <>
@@ -621,7 +668,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
       </section>
       <section className="lower-grid">
         <article className="panel honest-status"><span className="state-icon" aria-hidden="true">☎</span><p className="eyebrow">Звонки</p><h2>{activeCurrentCall ? activeCurrentCall.callerName : 'Ожидаем входящий вызов'}</h2><p>{activeCurrentCall ? phaseLabelsForDashboard[activeCurrentCall.phase] : 'Локальный сервис проверяет только реальные входящие звонки.'}</p><button className="text-button" onClick={() => selectPage('calls')} type="button">Подробнее ›</button></article>
-        <article className="panel honest-status"><span className="state-icon" aria-hidden="true">✓</span><p className="eyebrow">События</p><h2>Журнал ещё не подключён</h2><p>Экран начнёт заполняться только реальными событиями локального API.</p><button className="text-button" onClick={() => selectPage('events')} type="button">Подробнее ›</button></article>
+        <article className="panel event-home-panel"><EventJournal api={eventsApi} flatId={selectedFlat.id} onOpenArchive={openEventArchive} variant="compact" /><button className="text-button" onClick={() => selectPage('events')} type="button">Весь журнал ›</button></article>
       </section>
     </>
   }
@@ -641,6 +688,8 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
 
   const flatOptions = dashboard.status === 'success' ? dashboard.data.flats : []
   const incomingCall = activeCurrentCall?.phase === 'ringing'
+  const autoOpenArmed = autoOpenPolicy && autoOpenPolicy.mode !== 'disabled'
+  const autoOpenBannerText = formatAutoOpenBanner(autoOpenPolicy)
 
   return <div className="app-frame">
     <a className="skip-link" href="#main-content">К основному содержимому</a>
@@ -661,9 +710,16 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi }
         </div>
         <div className="top-actions"><span className="api-pill"><span />Локальный API</span><button className="avatar" aria-label="Профиль подключения" onClick={() => setAuthOpen(true)} type="button">М</button></div>
       </header>
+      {autoOpenArmed && <div aria-label="Автооткрытие включено" className="auto-open-banner" role="status">
+        <span aria-hidden="true">⌁</span>
+        <span>{autoOpenBannerText}</span>
+        <button onClick={() => selectPage('calls')} type="button">Настроить</button>
+      </div>}
       <main id="main-content" className="main-content">
         {callPollingEnabled && <div className="persistent-call-page" hidden={page !== 'calls'}>
+          <AutoOpenPanel api={callsApi} onPolicyChange={setAutoOpenPolicy} />
           <CallPage api={callsApi} call={activeCurrentCall} loading={callLoading} pollingError={callPollingError} />
+          {selectedFlatId && <EventJournal api={eventsApi} flatId={selectedFlatId} variant="calls" />}
         </div>}
         {(page !== 'calls' || !callPollingEnabled) && mainContent}
       </main>

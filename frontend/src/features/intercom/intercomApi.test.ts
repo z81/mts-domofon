@@ -91,6 +91,30 @@ describe('production intercom API boundary', () => {
     })
   })
 
+  it('loads archive distribution and starts an encoded archive session', async () => {
+    const distribution = { intervals: [{
+      from: '2026-08-07T09:00:00Z',
+      to: '2026-08-07T10:00:00Z',
+    }] }
+    const session = {
+      sessionId: '5d7a5769-adf9-4a41-9bd8-12427e0ae921',
+      playlistUrl: '/api/v1/live/5d7a5769-adf9-4a41-9bd8-12427e0ae921/index.m3u8',
+    }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(distribution))
+      .mockResolvedValueOnce(jsonResponse(session))
+    const api = createProductionIntercomApi(fetcher)
+
+    await expect(api.getArchiveDistribution?.('flat / 81', 'camera / 1')).resolves.toEqual(distribution)
+    await expect(api.startArchive?.('flat / 81', 'camera / 1', '2026-08-07T09:30:00.000Z')).resolves.toEqual(session)
+
+    expect(fetcher).toHaveBeenNthCalledWith(1, '/api/v1/cameras/camera%20%2F%201/archive/distribution?flatId=flat%20%2F%2081', expect.objectContaining({ method: 'GET' }))
+    expect(fetcher).toHaveBeenNthCalledWith(2, '/api/v1/cameras/camera%20%2F%201/archive?flatId=flat%20%2F%2081', expect.objectContaining({
+      body: JSON.stringify({ start: '2026-08-07T09:30:00.000Z' }),
+      method: 'POST',
+    }))
+  })
+
   it('preserves a local 401 status without exposing an untrusted response body', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse({
       code: 'authentication_required',

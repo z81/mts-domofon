@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AuthApi } from '../features/auth/authApi'
 import type { CallApi, CurrentCall } from '../features/calls/callApi'
+import type { EventApi } from '../features/events/eventApi'
 import {
   IntercomApiError,
   type DeviceInventory,
@@ -668,5 +669,78 @@ describe('live intercom dashboard', () => {
     expect(await screen.findByRole('heading', { name: 'Нет активного звонка' })).toBeVisible()
     expect(screen.queryByText('Входящий вызов')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Принять вызов' })).not.toBeInTheDocument()
+  })
+
+  it('opens a camera archive at the timestamp selected from the real event journal', async () => {
+    const user = userEvent.setup()
+    const getEvents = vi.fn<EventApi['getEvents']>(async () => ({
+      page: 0,
+      hasMore: false,
+      items: [{
+        id: 'event-camera-1',
+        occurredAt: '2026-08-07T09:30:00Z',
+        kind: 'camera',
+        title: 'Движение у подъезда',
+        cameraId: 'camera-1',
+        archiveAt: '2026-08-07T09:30:00Z',
+      }],
+    }))
+    const archiveInventory: DeviceInventory = {
+      ...inventory,
+      cameras: inventory.cameras.map((camera) => ({
+        ...camera,
+        capabilities: { ...camera.capabilities, archive: available },
+      })),
+    }
+    const getArchiveDistribution = vi.fn(async () => ({ intervals: [{
+      from: '2026-08-07T09:00:00Z', to: '2026-08-07T10:00:00Z',
+    }] }))
+    render(<App
+      api={createApi({ getArchiveDistribution, getDevices: async () => archiveInventory, startArchive: vi.fn(), stopLive: vi.fn() })}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi()}
+      eventsApi={{ getEvents }}
+    />)
+    const navigation = within(screen.getByRole('complementary', { name: 'Основная навигация' }))
+    await user.click(navigation.getByRole('button', { name: 'События' }))
+
+    expect(await screen.findByRole('heading', { name: 'Журнал событий' })).toBeVisible()
+    await user.click(screen.getByRole('button', { name: 'Открыть запись камеры' }))
+
+    expect(await screen.findByRole('heading', { name: 'Архив' })).toBeVisible()
+    expect(screen.getByLabelText('Начало просмотра')).toHaveValue('2026-08-07T12:30')
+    expect(getArchiveDistribution).toHaveBeenCalledWith('flat-81', 'camera-1', expect.any(AbortSignal))
+  })
+
+  it('shows call history and a global banner for the armed server policy, then clears it on logout', async () => {
+    const user = userEvent.setup()
+    const eventsApi: EventApi = { getEvents: async () => ({
+      page: 0,
+      hasMore: false,
+      items: [{
+        id: 'missed-1', occurredAt: '2026-08-07T08:00:00Z', kind: 'call',
+        title: 'Call', callOutcome: 'missed', sourceLabel: 'Подъезд 1',
+      }],
+    }) }
+    render(<App
+      api={createApi()}
+      authApi={authenticatedAuthApi()}
+      callsApi={createCallApi({
+        getAutoOpenPolicy: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        createAutoOpenIntent: async () => ({ intentId: 'auto-1', expiresAt: '2026-08-07T10:00:30Z' }),
+        executeAutoOpenIntent: async () => ({ mode: 'next_call', dismissAfterOpen: false }),
+        disableAutoOpen: async () => undefined,
+      })}
+      eventsApi={eventsApi}
+    />)
+
+    expect(await screen.findByRole('status', { name: 'Автооткрытие включено' })).toHaveTextContent('следующий звонок')
+    await user.click(within(screen.getByRole('complementary', { name: 'Основная навигация' })).getByRole('button', { name: 'Звонки' }))
+    expect(await screen.findByRole('heading', { name: 'История звонков' })).toBeVisible()
+    expect(screen.getByText('Пропущенный вызов')).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Профиль подключения' }))
+    await user.click(await screen.findByRole('button', { name: 'Выйти' }))
+    expect(screen.queryByRole('status', { name: 'Автооткрытие включено' })).not.toBeInTheDocument()
   })
 })

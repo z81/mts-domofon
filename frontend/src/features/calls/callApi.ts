@@ -16,6 +16,26 @@ export interface CallOpenIntent {
   expiresAt: string
 }
 
+export type AutoOpenMode = 'disabled' | 'next_call' | 'until'
+export type AutoOpenResultStatus = 'opened' | 'failed' | 'outcome_unknown'
+
+export interface AutoOpenResult {
+  status: AutoOpenResultStatus
+  completedAt: string
+}
+
+export interface AutoOpenPolicy {
+  mode: AutoOpenMode
+  until?: string
+  dismissAfterOpen: boolean
+  lastResult?: AutoOpenResult
+}
+
+export interface AutoOpenIntent {
+  intentId: string
+  expiresAt: string
+}
+
 export interface CallApi {
   getCurrent(signal?: AbortSignal): Promise<CurrentCall | null>
   answer(callId: string, revision: number, sdp: string, signal?: AbortSignal): Promise<CurrentCall>
@@ -24,6 +44,10 @@ export interface CallApi {
   hangup(callId: string, revision: number, signal?: AbortSignal): Promise<void>
   createOpenIntent(callId: string, revision: number, signal?: AbortSignal): Promise<CallOpenIntent>
   executeOpenIntent(callId: string, intentId: string, revision: number, signal?: AbortSignal): Promise<void>
+  getAutoOpenPolicy?(signal?: AbortSignal): Promise<AutoOpenPolicy>
+  createAutoOpenIntent?(mode: Exclude<AutoOpenMode, 'disabled'>, dismissAfterOpen: boolean, signal?: AbortSignal): Promise<AutoOpenIntent>
+  executeAutoOpenIntent?(intentId: string, signal?: AbortSignal): Promise<AutoOpenPolicy>
+  disableAutoOpen?(signal?: AbortSignal): Promise<void>
 }
 
 interface ErrorBody {
@@ -109,6 +133,21 @@ export function createProductionCallApi(fetcher: typeof fetch = fetch): CallApi 
       const path = `${callRoute(callId, 'open-intents')}/${encodeURIComponent(intentId)}/execute`
       await readNoContent(await fetcher(path, postRequest({ revision }, signal)))
     },
+    getAutoOpenPolicy: async (signal) => readJson<AutoOpenPolicy>(await fetcher(
+      '/api/v1/calls/auto-open', getRequest(signal),
+    )),
+    createAutoOpenIntent: async (mode, dismissAfterOpen, signal) => readJson<AutoOpenIntent>(await fetcher(
+      '/api/v1/calls/auto-open/intents', postRequest({ mode, dismissAfterOpen }, signal),
+    )),
+    executeAutoOpenIntent: async (intentId, signal) => readJson<AutoOpenPolicy>(await fetcher(
+      `/api/v1/calls/auto-open/intents/${encodeURIComponent(intentId)}/execute`,
+      postRequest({}, signal),
+    )),
+    disableAutoOpen: async (signal) => readNoContent(await fetcher('/api/v1/calls/auto-open', {
+      credentials: 'same-origin',
+      method: 'DELETE',
+      signal,
+    })),
   }
 }
 
