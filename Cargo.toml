@@ -72,6 +72,11 @@ path = "tests/live_session.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "default_camera_stream"
+path = "tests/default_camera_stream.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "door_open"
 path = "tests/door_open.rs"
 required-features = ["test-support"]

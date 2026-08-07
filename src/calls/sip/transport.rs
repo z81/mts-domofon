@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use http::header::{HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use http::header::{HeaderValue, ORIGIN, SEC_WEBSOCKET_PROTOCOL};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -85,6 +85,18 @@ impl WssTransportConfig {
             .as_str()
             .into_client_request()
             .map_err(|_| TransportError::InvalidConfig)?;
+        let mut origin_url = self.url.clone();
+        origin_url
+            .set_scheme("https")
+            .map_err(|_| TransportError::InvalidConfig)?;
+        origin_url.set_path("");
+        origin_url.set_query(None);
+        origin_url.set_fragment(None);
+        let origin = origin_url.origin().ascii_serialization();
+        request.headers_mut().insert(
+            ORIGIN,
+            HeaderValue::from_str(&origin).map_err(|_| TransportError::InvalidConfig)?,
+        );
         request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::from_static(SIP_SUBPROTOCOL),

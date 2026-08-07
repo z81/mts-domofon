@@ -1,9 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,7 +8,7 @@ use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch},
     task::JoinHandle,
     time::{Instant, sleep},
 };
@@ -27,6 +22,7 @@ const SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const MAX_PLAYLIST_BYTES: usize = 256 * 1024;
 const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CAMERA_KEY_BYTES: usize = 2_200;
+const STARTUP_SEGMENT_COUNT: usize = 3;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,13 +65,83 @@ struct LiveSession {
 struct Sessions {
     active: HashMap<Uuid, LiveSession>,
     by_camera: HashMap<String, Uuid>,
-    starting: HashSet<String>,
+    starting: HashMap<String, StartingCamera>,
+}
+
+struct StartingCamera {
+    token: Uuid,
+    completion: watch::Sender<bool>,
 }
 
 struct Inner {
     runner: Arc<dyn LiveProcessRunner>,
     capacity: Arc<Semaphore>,
     sessions: Mutex<Sessions>,
+}
+
+struct StartingCameraGuard {
+    inner: Arc<Inner>,
+    camera_key: Option<String>,
+    token: Uuid,
+    completion: watch::Sender<bool>,
+}
+
+impl StartingCameraGuard {
+    fn new(
+        inner: Arc<Inner>,
+        camera_key: String,
+        token: Uuid,
+        completion: watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            inner,
+            camera_key: Some(camera_key),
+            token,
+            completion,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.camera_key = None;
+        self.completion.send_replace(true);
+    }
+}
+
+impl Drop for StartingCameraGuard {
+    fn drop(&mut self) {
+        let Some(camera_key) = self.camera_key.take() else {
+            return;
+        };
+        if let Ok(mut sessions) = self.inner.sessions.try_lock() {
+            remove_starting_if_owned(&mut sessions, &camera_key, self.token);
+            drop(sessions);
+            self.completion.send_replace(true);
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        let token = self.token;
+        let completion = self.completion.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                let mut sessions = inner.sessions.lock().await;
+                remove_starting_if_owned(&mut sessions, &camera_key, token);
+                drop(sessions);
+                completion.send_replace(true);
+            }));
+        } else {
+            self.completion.send_replace(true);
+        }
+    }
+}
+
+fn remove_starting_if_owned(sessions: &mut Sessions, camera_key: &str, token: Uuid) {
+    if sessions
+        .starting
+        .get(camera_key)
+        .is_some_and(|starting| starting.token == token)
+    {
+        sessions.starting.remove(camera_key);
+    }
 }
 
 #[derive(Clone)]
@@ -116,24 +182,40 @@ impl LiveSessionManager {
     ) -> Result<LiveSessionView, AppError> {
         validate_source(&source)?;
         validate_camera_key(&camera_key)?;
-        {
+        let (start_token, start_completion) = loop {
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(session_id) = sessions.by_camera.get(&camera_key) {
                 return Ok(session_view(*session_id));
             }
-            if !sessions.starting.insert(camera_key.clone()) {
-                return Err(live_unavailable());
+            if let Some(starting) = sessions.starting.get(&camera_key) {
+                let mut completion = starting.completion.subscribe();
+                drop(sessions);
+                let _ = completion.changed().await;
+                continue;
             }
-        }
+            let token = Uuid::new_v4();
+            let (completion, _) = watch::channel(false);
+            sessions.starting.insert(
+                camera_key.clone(),
+                StartingCamera {
+                    token,
+                    completion: completion.clone(),
+                },
+            );
+            break (token, completion);
+        };
+        let mut starting_camera = StartingCameraGuard::new(
+            Arc::clone(&self.inner),
+            camera_key.clone(),
+            start_token,
+            start_completion,
+        );
         let permit = Arc::clone(&self.inner.capacity)
             .try_acquire_owned()
             .map_err(|_| live_unavailable());
         let permit = match permit {
             Ok(permit) => permit,
-            Err(error) => {
-                self.clear_starting_camera(&camera_key).await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let directory = tempfile::Builder::new()
             .prefix("domru-mts-live-")
@@ -141,25 +223,24 @@ impl LiveSessionManager {
             .map_err(|_| live_unavailable());
         let directory = match directory {
             Ok(directory) => directory,
-            Err(error) => {
-                self.clear_starting_camera(&camera_key).await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let process = self.inner.runner.start(&source, directory.path()).await;
         let process = match process {
             Ok(process) => Arc::new(Mutex::new(process)),
-            Err(error) => {
-                self.clear_starting_camera(&camera_key).await;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let session_id = Uuid::new_v4();
         let inserted = {
             let mut sessions = self.inner.sessions.lock().await;
-            if !sessions.starting.remove(&camera_key) {
+            if sessions
+                .starting
+                .get(&camera_key)
+                .is_none_or(|starting| starting.token != start_token)
+            {
                 false
             } else {
+                sessions.starting.remove(&camera_key);
                 sessions.by_camera.insert(camera_key.clone(), session_id);
                 sessions.active.insert(
                     session_id,
@@ -178,6 +259,7 @@ impl LiveSessionManager {
             process.lock().await.stop().await;
             return Err(live_unavailable());
         }
+        starting_camera.disarm();
         let manager = self.clone();
         let supervisor = tokio::spawn(async move {
             manager.supervise(session_id, process).await;
@@ -236,17 +318,15 @@ impl LiveSessionManager {
     pub async fn stop_all(&self) {
         let sessions = {
             let mut sessions = self.inner.sessions.lock().await;
-            sessions.starting.clear();
+            for starting in sessions.starting.drain().map(|(_, starting)| starting) {
+                starting.completion.send_replace(true);
+            }
             sessions.by_camera.clear();
             std::mem::take(&mut sessions.active)
         };
         for session in sessions.into_values() {
             Self::stop_session(session, true).await;
         }
-    }
-
-    async fn clear_starting_camera(&self, camera_key: &str) {
-        self.inner.sessions.lock().await.starting.remove(camera_key);
     }
 
     async fn take_session(&self, session_id: Uuid) -> Option<LiveSession> {
@@ -346,6 +426,25 @@ fn sanitize_playlist(bytes: &[u8]) -> Result<Bytes, AppError> {
         output.push('\n');
     }
     Ok(Bytes::from(output))
+}
+
+fn playlist_has_startup_window(bytes: &[u8]) -> bool {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    source
+        .lines()
+        .filter(|line| {
+            Path::new(line)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    asset_contract(name).is_ok_and(|(content_type, _)| content_type == "video/mp2t")
+                })
+        })
+        .take(STARTUP_SEGMENT_COUNT)
+        .count()
+        == STARTUP_SEGMENT_COUNT
 }
 
 struct FfmpegRunner;
@@ -453,9 +552,9 @@ impl LiveProcessRunner for FfmpegRunner {
 
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
-            if tokio::fs::metadata(&playlist)
+            if tokio::fs::read(&playlist)
                 .await
-                .is_ok_and(|metadata| metadata.len() > 0)
+                .is_ok_and(|bytes| playlist_has_startup_window(&bytes))
             {
                 return Ok(Box::new(FfmpegProcess { child, stderr_task }));
             }
@@ -558,4 +657,25 @@ fn live_unavailable() -> AppError {
         "Live video is unavailable.",
         true,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::playlist_has_startup_window;
+
+    #[test]
+    fn playlist_is_not_ready_until_three_segments_are_published() {
+        let two_segments = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nsegment-000000.ts\n#EXTINF:1.0,\nsegment-000001.ts\n";
+        let three_segments = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nsegment-000000.ts\n#EXTINF:1.0,\nsegment-000001.ts\n#EXTINF:1.0,\nsegment-000002.ts\n";
+
+        assert!(!playlist_has_startup_window(two_segments));
+        assert!(playlist_has_startup_window(three_segments));
+    }
+
+    #[test]
+    fn master_playlist_uris_do_not_count_as_ready_segments() {
+        let master_playlist = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1400000\nmedium/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2800000\nhigh/index.m3u8\n";
+
+        assert!(!playlist_has_startup_window(master_playlist));
+    }
 }

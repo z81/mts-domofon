@@ -15,34 +15,85 @@ fn defaults_are_loopback_and_local_data() {
 }
 
 #[test]
-fn rejects_every_non_loopback_bind_until_local_api_authentication_exists() {
-    // Catches exposing mutation endpoints on wildcard, LAN, or public interfaces without local
-    // client authentication.
-    for value in [
-        "0.0.0.0:3000",
-        "[::]:3000",
-        "192.168.1.50:3000",
-        "10.0.0.8:3000",
-        "[2001:db8::1]:3000",
-    ] {
-        let error = AppConfig::from_iter([("VDOME_BIND", value)]).unwrap_err();
-        assert!(
-            matches!(error, ConfigError::BindMustBeLoopback),
-            "{value} failed with the wrong stable config error: {error}"
-        );
+fn wildcard_bind_requires_exact_opt_in() {
+    for bind in ["0.0.0.0:3000", "[::]:3000"] {
+        assert!(matches!(
+            AppConfig::from_iter([("VDOME_BIND", bind)]),
+            Err(ConfigError::BindNotAllowed)
+        ));
+        assert!(matches!(
+            AppConfig::from_iter([("VDOME_BIND", bind), ("VDOME_ALLOW_NON_LOOPBACK", "false"),]),
+            Err(ConfigError::BindNotAllowed)
+        ));
         assert_eq!(
-            error.to_string(),
-            "VDOME_BIND must use a loopback IP address until local API authentication is configured"
+            AppConfig::from_iter([("VDOME_BIND", bind), ("VDOME_ALLOW_NON_LOOPBACK", "true"),])
+                .unwrap()
+                .bind
+                .to_string(),
+            bind
         );
     }
 }
 
 #[test]
-fn accepts_ipv4_and_ipv6_loopback_bind_addresses() {
+fn rejects_invalid_or_stale_non_loopback_opt_in() {
+    for value in [
+        "", "1", "TRUE", " true", "true ", " false", "false ", "FALSE",
+    ] {
+        assert!(matches!(
+            AppConfig::from_iter([("VDOME_ALLOW_NON_LOOPBACK", value)]),
+            Err(ConfigError::InvalidAllowNonLoopback)
+        ));
+    }
+    assert!(matches!(
+        AppConfig::from_iter([("VDOME_ALLOW_NON_LOOPBACK", "true")]),
+        Err(ConfigError::AllowNonLoopbackRequiresWildcard)
+    ));
+}
+
+#[test]
+fn rejected_config_values_are_not_rendered_in_errors() {
+    let sensitive_flag = "sensitive-flag-token";
+    let flag_error =
+        AppConfig::from_iter([("VDOME_ALLOW_NON_LOOPBACK", sensitive_flag)]).unwrap_err();
+    assert!(matches!(flag_error, ConfigError::InvalidAllowNonLoopback));
+    assert_eq!(flag_error.to_string(), "invalid VDOME_ALLOW_NON_LOOPBACK");
+    assert!(!flag_error.to_string().contains(sensitive_flag));
+
+    let sensitive_bind = "10.73.42.19:49152";
+    let bind_error = AppConfig::from_iter([
+        ("VDOME_BIND", sensitive_bind),
+        ("VDOME_ALLOW_NON_LOOPBACK", "true"),
+    ])
+    .unwrap_err();
+    assert!(matches!(bind_error, ConfigError::BindNotAllowed));
+    assert_eq!(bind_error.to_string(), "VDOME_BIND is not allowed");
+    assert!(!bind_error.to_string().contains(sensitive_bind));
+}
+
+#[test]
+fn accepts_loopback_bind_addresses_without_or_with_disabled_opt_in() {
     for value in ["127.0.0.2:3100", "[::1]:3100"] {
-        let config = AppConfig::from_iter([("VDOME_BIND", value)]).unwrap();
-        assert!(config.bind.ip().is_loopback());
-        assert_eq!(config.bind.port(), 3100);
+        for allow_non_loopback in [None, Some("false")] {
+            let values = std::iter::once(("VDOME_BIND", value)).chain(
+                allow_non_loopback
+                    .into_iter()
+                    .map(|flag| ("VDOME_ALLOW_NON_LOOPBACK", flag)),
+            );
+            let config = AppConfig::from_iter(values).unwrap();
+            assert!(config.bind.ip().is_loopback());
+            assert_eq!(config.bind.port(), 3100);
+        }
+    }
+}
+
+#[test]
+fn rejects_non_wildcard_non_loopback_binds_even_with_opt_in() {
+    for bind in ["192.168.1.50:3000", "10.0.0.8:3000", "[2001:db8::1]:3000"] {
+        assert!(matches!(
+            AppConfig::from_iter([("VDOME_BIND", bind), ("VDOME_ALLOW_NON_LOOPBACK", "true"),]),
+            Err(ConfigError::BindNotAllowed)
+        ));
     }
 }
 

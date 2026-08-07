@@ -340,7 +340,7 @@ POST   /api/open-door
 
 ## Phase Acceptance Gate
 
-Run from `/Users/alex/dev/domru-mts`:
+Run from the repository root:
 
 ```bash
 cargo fmt --check

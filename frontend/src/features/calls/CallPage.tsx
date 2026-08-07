@@ -18,6 +18,7 @@ export interface CallPageProps {
   createPeerConnection?: () => RTCPeerConnection
   getUserMedia?: (constraints: MediaStreamConstraints) => Promise<MediaStream>
   iceGatheringTimeoutMs?: number
+  presentation?: 'page' | 'embedded'
 }
 
 const DEFAULT_ICE_GATHERING_TIMEOUT_MS = 25_000
@@ -93,7 +94,10 @@ async function waitForIceGatheringComplete(peer: RTCPeerConnection, signal: Abor
 }
 
 export function CallPage(props: CallPageProps) {
-  return <CallPageSession key={props.call?.id ?? 'no-current-call'} {...props} />
+  const sessionKey = props.call
+    ? `${props.call.id}\u0000${props.call.phase === 'ending' ? 'ending' : 'ongoing'}`
+    : 'no-current-call'
+  return <CallPageSession key={sessionKey} {...props} />
 }
 
 function CallPageSession({
@@ -104,6 +108,7 @@ function CallPageSession({
   createPeerConnection = defaultPeerConnection,
   getUserMedia = defaultGetUserMedia,
   iceGatheringTimeoutMs = DEFAULT_ICE_GATHERING_TIMEOUT_MS,
+  presentation = 'page',
 }: CallPageProps) {
   const [commandBusy, setCommandBusy] = useState<'answer' | 'decline' | 'ignore' | 'hangup' | null>(null)
   const [feedback, setFeedback] = useState<Feedback | null>(null)
@@ -112,6 +117,8 @@ function CallPageSession({
   const [openExecuting, setOpenExecuting] = useState(false)
   const [openOutcomeUnknown, setOpenOutcomeUnknown] = useState(false)
   const [answerSubmittedRevision, setAnswerSubmittedRevision] = useState<number | null>(null)
+  const [microphoneReady, setMicrophoneReady] = useState(false)
+  const [microphoneMuted, setMicrophoneMuted] = useState(false)
   const commandInFlight = useRef(false)
   const openPreparationInFlight = useRef(false)
   const openExecutionInFlight = useRef(false)
@@ -133,16 +140,18 @@ function CallPageSession({
     localStream?.getTracks().forEach((track) => track.stop())
     remoteStreamRef.current = null
     audioSenderRef.current = null
+    setMicrophoneReady(false)
+    setMicrophoneMuted(false)
     if (videoRef.current) videoRef.current.srcObject = null
   }, [])
 
   useEffect(() => {
-    return cleanupMedia
+    const mountedVideo = videoRef.current
+    return () => {
+      cleanupMedia()
+      if (mountedVideo) mountedVideo.srcObject = null
+    }
   }, [cleanupMedia])
-
-  useEffect(() => {
-    if (!call || call.phase === 'ending') cleanupMedia()
-  }, [call, cleanupMedia])
 
   useEffect(() => {
     if (!preparedOpen || openExecuting) return
@@ -185,7 +194,10 @@ function CallPageSession({
         return
       }
       localStreamRef.current = localStream
-      for (const track of localStream.getAudioTracks()) {
+      const audioTracks = localStream.getAudioTracks()
+      setMicrophoneReady(audioTracks.length > 0)
+      setMicrophoneMuted(false)
+      for (const track of audioTracks) {
         const sender = peer.addTrack(track, localStream)
         if (!audioSenderRef.current) audioSenderRef.current = sender
       }
@@ -227,6 +239,13 @@ function CallPageSession({
       commandInFlight.current = false
       setCommandBusy(null)
     }
+  }
+
+  function toggleMicrophone() {
+    setMicrophoneMuted((muted) => {
+      localStreamRef.current?.getAudioTracks().forEach((track) => { track.enabled = muted })
+      return !muted
+    })
   }
 
   async function prepareOpen() {
@@ -283,21 +302,21 @@ function CallPageSession({
 
   if (loading && !call) {
     return <>
-      <section className="page-heading"><div><p className="eyebrow">Звонки</p><h1>Звонки</h1></div></section>
+      {presentation === 'page' && <section className="page-heading"><div><p className="eyebrow">Звонки</p><h1>Звонки</h1></div></section>}
       <section className="content-card call-empty" role="status"><span className="loading-ring" /><h2>Проверяем входящие звонки…</h2></section>
     </>
   }
 
   if (pollingError && !call) {
     return <>
-      <section className="page-heading"><div><p className="eyebrow">Звонки</p><h1>Звонки</h1></div></section>
+      {presentation === 'page' && <section className="page-heading"><div><p className="eyebrow">Звонки</p><h1>Звонки</h1></div></section>}
       <section className="content-card call-empty" role="alert"><span className="state-icon" aria-hidden="true">!</span><h2>Не удалось проверить звонки</h2><p>Локальный сервис продолжит попытки подключения автоматически.</p></section>
     </>
   }
 
   if (!call) {
     return <>
-      <section className="page-heading"><div><p className="eyebrow">Звонки</p><h1>Звонки</h1></div></section>
+      {presentation === 'page' && <section className="page-heading"><div><p className="eyebrow">Звонки</p><h1>Звонки</h1></div></section>}
       <section className="content-card call-empty"><span className="state-icon" aria-hidden="true">☎</span><h2>Нет активного звонка</h2><p>Здесь появится только реальный вызов, полученный локальным сервисом.</p></section>
     </>
   }
@@ -308,7 +327,7 @@ function CallPageSession({
   const liveRole = feedback?.kind === 'error' ? 'alert' : 'status'
 
   return <>
-    <section className="page-heading"><div><p className="eyebrow">Домофон</p><h1>Звонок</h1><p>Сигнал и медиа получены через локальный API.</p></div></section>
+    {presentation === 'page' && <section className="page-heading"><div><p className="eyebrow">Домофон</p><h1>Звонок</h1><p>Сигнал и медиа получены через локальный API.</p></div></section>}
     <section className={`call-stage call-${call.phase}`} aria-labelledby="current-call-title">
       <p className="call-live-message" role={liveRole}>{liveMessage}</p>
       <video
@@ -330,6 +349,7 @@ function CallPageSession({
             <button className="secondary-button" disabled={controlsDisabled} onClick={() => void runCommand('ignore')} type="button">Игнорировать вызов</button>
           </>}
           {(call.phase === 'connecting' || call.phase === 'active') && <button className="secondary-button danger-outline" disabled={controlsDisabled} onClick={() => void runCommand('hangup')} type="button">Завершить вызов</button>}
+          {microphoneReady && <button className="secondary-button" onClick={toggleMicrophone} type="button">{microphoneMuted ? 'Включить микрофон' : 'Выключить микрофон'}</button>}
           {call.canOpen && <button
             className="secondary-button"
             disabled={controlsDisabled || openPreparing || preparedOpen !== null || openExecuting || openOutcomeUnknown}

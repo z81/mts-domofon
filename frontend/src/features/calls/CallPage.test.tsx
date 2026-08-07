@@ -76,7 +76,7 @@ class FakePeerConnection extends EventTarget {
 }
 
 function mediaFixture() {
-  const localTrack = { kind: 'audio', stop: vi.fn() } as unknown as MediaStreamTrack
+  const localTrack = { enabled: true, kind: 'audio', stop: vi.fn() } as unknown as MediaStreamTrack
   const localStream = {
     getAudioTracks: () => [localTrack],
     getTracks: () => [localTrack],
@@ -104,6 +104,14 @@ describe('call page states and controls', () => {
     expect(screen.getByRole('button', { name: 'Игнорировать вызов' })).toBeEnabled()
     expect(screen.getByLabelText('Видео звонка от Подъезд 1')).toHaveAttribute('poster', ringingCall.previewUrl)
     expect(document.body).not.toHaveTextContent('ice-ufrag')
+  })
+
+  it('removes only the redundant page heading when embedded', () => {
+    render(<CallPage api={createApi()} call={ringingCall} presentation="embedded" />)
+
+    expect(screen.queryByRole('heading', { name: 'Звонок' })).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Подъезд 1' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Принять вызов' })).toBeEnabled()
   })
 
   it('dispatches only one decline while the command is in flight', async () => {
@@ -138,6 +146,37 @@ describe('call page states and controls', () => {
 })
 
 describe('browser WebRTC answer', () => {
+  it('offers microphone mute only after a local audio track exists and toggles that track', async () => {
+    const user = userEvent.setup()
+    const peer = new FakePeerConnection()
+    const media = mediaFixture()
+    const view = render(<CallPage
+      api={createApi()}
+      call={ringingCall}
+      createPeerConnection={() => peer as unknown as RTCPeerConnection}
+      getUserMedia={media.getUserMedia}
+      presentation="embedded"
+    />)
+
+    expect(screen.queryByRole('button', { name: 'Выключить микрофон' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Принять вызов' }))
+
+    const mute = await screen.findByRole('button', { name: 'Выключить микрофон' })
+    await user.click(mute)
+    expect(media.localTrack.enabled).toBe(false)
+    expect(screen.getByRole('button', { name: 'Включить микрофон' })).toBeVisible()
+
+    view.rerender(<CallPage
+      api={createApi()}
+      call={{ ...ringingCall, phase: 'ending', revision: 5 }}
+      createPeerConnection={() => peer as unknown as RTCPeerConnection}
+      getUserMedia={media.getUserMedia}
+      presentation="embedded"
+    />)
+    expect(screen.queryByRole('button', { name: 'Включить микрофон' })).not.toBeInTheDocument()
+    expect(media.localTrack.stop).toHaveBeenCalledTimes(1)
+  })
+
   it('adds only microphone audio and posts the candidate-complete local SDP', async () => {
     const user = userEvent.setup()
     const peer = new FakePeerConnection()
@@ -248,7 +287,8 @@ describe('browser WebRTC answer', () => {
     const remoteStream = { getTracks: () => [] } as unknown as MediaStream
 
     act(() => peer.emitRemoteStream(remoteStream))
-    expect(screen.getByLabelText('Видео звонка от Подъезд 1')).toHaveProperty('srcObject', remoteStream)
+    const activeVideo = screen.getByLabelText('Видео звонка от Подъезд 1')
+    expect(activeVideo).toHaveProperty('srcObject', remoteStream)
 
     view.rerender(<CallPage
       api={api}
@@ -258,7 +298,8 @@ describe('browser WebRTC answer', () => {
     />)
     expect(peer.close).toHaveBeenCalledTimes(1)
     expect(media.localTrack.stop).toHaveBeenCalledTimes(1)
-    expect(screen.getByLabelText('Видео звонка от Подъезд 1')).toHaveProperty('srcObject', null)
+    expect(activeVideo).toHaveProperty('srcObject', null)
+    expect(screen.getByLabelText('Видео звонка от Подъезд 1')).not.toBe(activeVideo)
   })
 
   it('builds and retains a remote stream when the browser track event has no streams', async () => {

@@ -255,7 +255,7 @@ async fn rejects_an_unlinked_flat_before_returning_its_devices() {
 }
 
 #[tokio::test]
-async fn keeps_nested_and_domru_z81_compatible_read_aliases_ownership_checked() {
+async fn keeps_nested_and_legacy_compatible_read_aliases_ownership_checked() {
     let (app, _directory, calls) = app().await;
 
     let nested = app
