@@ -21,10 +21,14 @@ use super::{
 };
 
 const ACCESS_POINTS_PATH: &str = "/vdome-smart-facade/devices/api/v1/accessPoints";
+const AVAILABLE_PATH: &str = "/vdome-smart-facade/devices/api/v1/flats";
 const CAMERAS_PATH: &str = "/vdome-smart-facade/devices/api/v1/cameras";
+const ACCESS_POINT_CATEGORY: &str = "accessPoint";
+const DRIVE_POINT_CATEGORY: &str = "drivePoint";
 const PAGE_SIZE: u32 = 100;
 const MAX_PAGES: u32 = 50;
 const MAX_ITEMS: u64 = 5_000;
+const MAX_AVAILABLE_ALIASES: usize = 32;
 const MAX_SCOPE_BYTES: usize = 512;
 const MAX_ID_BYTES: usize = 512;
 const MAX_NAME_BYTES: usize = 2_048;
@@ -76,9 +80,10 @@ impl MtsDeviceProvider {
         path: &str,
         flat: &FlatId,
         category: Option<&str>,
+        max_items: u64,
         mut state: S,
         mut merge: F,
-    ) -> Result<S, AppError>
+    ) -> Result<(S, u64), AppError>
     where
         T: DeserializeOwned,
         F: FnMut(&mut S, T) -> Result<(), AppError>,
@@ -97,12 +102,18 @@ impl MtsDeviceProvider {
                 self.client
                     .authorized(Method::GET, ProviderBase::Gateway, &request_path)?;
             let page: SpringPage<T> = self.client.send_json(request).await?;
-            validate_page(&page, number, expected_total_pages, expected_total_elements)?;
+            validate_page(
+                &page,
+                number,
+                expected_total_pages,
+                expected_total_elements,
+                max_items,
+            )?;
 
             let total_pages = *expected_total_pages.get_or_insert(page.total_pages);
             let total_elements = *expected_total_elements.get_or_insert(page.total_elements);
             raw_count = raw_count.saturating_add(page.content.len() as u64);
-            if raw_count > MAX_ITEMS || raw_count > total_elements {
+            if raw_count > max_items || raw_count > total_elements {
                 return Err(schema_error());
             }
             for item in page.content {
@@ -113,13 +124,62 @@ impl MtsDeviceProvider {
                 if raw_count != total_elements {
                     return Err(schema_error());
                 }
-                return Ok(state);
+                return Ok((state, raw_count));
             }
             if total_pages == 0 || number + 1 >= total_pages {
                 return Err(schema_error());
             }
         }
         Err(schema_error())
+    }
+
+    async fn available_access_categories(
+        &self,
+        flat: &FlatId,
+    ) -> Result<Vec<&'static str>, AppError> {
+        validate_scope(&flat.0)?;
+        let request = self.client.authorized_with_path_segment(
+            Method::GET,
+            ProviderBase::Gateway,
+            AVAILABLE_PATH,
+            &flat.0,
+            Some("available"),
+        )?;
+        let aliases: Option<BoundedVec<String, MAX_AVAILABLE_ALIASES>> =
+            self.client.send_json(request).await?;
+        let mut available = BTreeSet::new();
+        for alias in aliases.map(BoundedVec::into_vec).unwrap_or_default() {
+            if alias.len() > MAX_SCOPE_BYTES {
+                return Err(schema_error());
+            }
+            let alias = alias.trim();
+            if alias.eq_ignore_ascii_case(ACCESS_POINT_CATEGORY) {
+                available.insert(ACCESS_POINT_CATEGORY);
+            } else if alias.eq_ignore_ascii_case(DRIVE_POINT_CATEGORY) {
+                available.insert(DRIVE_POINT_CATEGORY);
+            }
+        }
+        Ok([ACCESS_POINT_CATEGORY, DRIVE_POINT_CATEGORY]
+            .into_iter()
+            .filter(|category| available.contains(category))
+            .collect())
+    }
+
+    async fn fold_access_point_category(
+        &self,
+        flat: &FlatId,
+        category: &str,
+        max_items: u64,
+    ) -> Result<(BTreeMap<String, AccessPointAccumulator>, u64), AppError> {
+        self.fold_pages(
+            ACCESS_POINTS_PATH,
+            flat,
+            Some(category),
+            max_items,
+            BTreeMap::new(),
+            merge_access_point,
+        )
+        .await
     }
 }
 
@@ -130,15 +190,44 @@ impl DeviceProvider for MtsDeviceProvider {
         flat: &FlatId,
         category: Option<&str>,
     ) -> Result<Vec<AccessPoint>, AppError> {
-        let merged = self
-            .fold_pages(
-                ACCESS_POINTS_PATH,
-                flat,
-                category,
-                BTreeMap::new(),
-                merge_access_point,
-            )
-            .await?;
+        let merged = if let Some(category) = category {
+            self.fold_access_point_category(flat, category, MAX_ITEMS)
+                .await?
+                .0
+        } else {
+            let categories = self.available_access_categories(flat).await?;
+            let mut merged = BTreeMap::new();
+            let mut remaining_items = MAX_ITEMS;
+            let mut successful_categories = 0_usize;
+            let mut category_error = None;
+            for category in &categories {
+                match self
+                    .fold_access_point_category(flat, category, remaining_items)
+                    .await
+                {
+                    Ok((source, raw_count)) => {
+                        let mut candidate = merged.clone();
+                        match merge_access_point_map(&mut candidate, source) {
+                            Ok(()) => {
+                                merged = candidate;
+                                remaining_items = remaining_items.saturating_sub(raw_count);
+                                successful_categories += 1;
+                            }
+                            Err(error) => {
+                                category_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        category_error.get_or_insert(error);
+                    }
+                }
+            }
+            if successful_categories == 0 && !categories.is_empty() {
+                return Err(category_error.unwrap_or_else(schema_error));
+            }
+            merged
+        };
         Ok(merged
             .into_values()
             .map(|point| point.into_access_point(flat))
@@ -147,10 +236,16 @@ impl DeviceProvider for MtsDeviceProvider {
 
     async fn cameras(&self, flat: &FlatId) -> Result<Vec<Camera>, AppError> {
         let merged = self
-            .fold_pages(CAMERAS_PATH, flat, None, BTreeMap::new(), |merged, dto| {
-                merge_camera(flat, merged, dto)
-            })
-            .await?;
+            .fold_pages(
+                CAMERAS_PATH,
+                flat,
+                None,
+                MAX_ITEMS,
+                BTreeMap::new(),
+                |merged, dto| merge_camera(flat, merged, dto),
+            )
+            .await?
+            .0;
         Ok(merged.into_values().collect())
     }
 }
@@ -164,6 +259,7 @@ impl LiveSourceProvider for MtsDeviceProvider {
                 CAMERAS_PATH,
                 flat,
                 None,
+                MAX_ITEMS,
                 LiveSourceSelection::default(),
                 |selected, dto: CameraDto| {
                     if dto.id != camera_id {
@@ -178,7 +274,8 @@ impl LiveSourceProvider for MtsDeviceProvider {
                     selected.merge_ivideon(ivideon_candidate(dto.ivideon.as_ref())?)
                 },
             )
-            .await?;
+            .await?
+            .0;
         if let Some(ivideon) = source.ivideon {
             return self
                 .ivideon
@@ -286,6 +383,7 @@ fn validate_page<T>(
     expected_number: u32,
     expected_total_pages: Option<u32>,
     expected_total_elements: Option<u64>,
+    max_items: u64,
 ) -> Result<(), AppError> {
     let computed_total_pages = if page.total_elements == 0 {
         0
@@ -305,7 +403,7 @@ fn validate_page<T>(
     if page.number != expected_number
         || page.size != PAGE_SIZE
         || page.total_pages > MAX_PAGES
-        || page.total_elements > MAX_ITEMS
+        || page.total_elements > max_items
         || page.total_pages != computed_total_pages
         || (page.total_pages > 0 && page.number >= page.total_pages)
         || page.content.len() != expected_content_len
@@ -320,6 +418,7 @@ fn validate_page<T>(
     Ok(())
 }
 
+#[derive(Clone)]
 struct AccessPointAccumulator {
     id: String,
     name: String,
@@ -405,6 +504,30 @@ fn merge_access_point(
             }
             existing.merge_locks(locks)?;
             existing.merge_camera_id(dto.camera)?;
+        }
+    }
+    Ok(())
+}
+
+fn merge_access_point_map(
+    target: &mut BTreeMap<String, AccessPointAccumulator>,
+    source: BTreeMap<String, AccessPointAccumulator>,
+) -> Result<(), AppError> {
+    for (id, source_point) in source {
+        match target.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(source_point);
+            }
+            Entry::Occupied(mut entry) => {
+                let target_point = entry.get_mut();
+                if target_point.name != source_point.name {
+                    return Err(schema_error());
+                }
+                target_point.merge_locks(source_point.locks.into_values().collect())?;
+                for camera_id in source_point.camera_ids {
+                    target_point.merge_camera_id(Some(camera_id))?;
+                }
+            }
         }
     }
     Ok(())

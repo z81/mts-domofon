@@ -16,10 +16,11 @@ use tokio::sync::Mutex;
 use url::Url;
 use wiremock::{
     Mock, MockServer, Request, Respond, ResponseTemplate,
-    matchers::{method, path, query_param},
+    matchers::{method, path, path_regex, query_param},
 };
 
 const ACCESS_PATH: &str = "/vdome-smart-facade/devices/api/v1/accessPoints";
+const AVAILABLE_PATH_PREFIX: &str = "/vdome-smart-facade/devices/api/v1/flats";
 const CAMERA_PATH: &str = "/vdome-smart-facade/devices/api/v1/cameras";
 
 #[derive(Clone, Copy)]
@@ -49,17 +50,179 @@ fn client(server: &MockServer) -> MtsClient {
     MtsClient::new_for_test(base.clone(), base, Arc::new(TestTokens)).unwrap()
 }
 
-fn empty_page() -> serde_json::Value {
-    serde_json::json!({
-        "content": [],
-        "totalElements": 0,
-        "totalPages": 0,
-        "number": 0,
-        "size": 100,
-        "last": true,
-        "first": true,
-        "empty": true
-    })
+#[tokio::test]
+async fn unfiltered_access_points_discover_and_merge_advertised_door_categories() {
+    let server = MockServer::start().await;
+    let flat = FlatId("flat /?#&+".to_owned());
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^{AVAILABLE_PATH_PREFIX}/.+/available$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            "camera",
+            "ACCESSPOINT",
+            " accessPoint ",
+            "drivepoint",
+            "unknown"
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (category, id) in [("accessPoint", "access-main"), ("drivePoint", "drive-main")] {
+        Mock::given(method("GET"))
+            .and(path(ACCESS_PATH))
+            .and(query_param("flatId", &flat.0))
+            .and(query_param("category", category))
+            .and(query_param("page", "0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(single_access_page(id, serde_json::json!([]))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let provider = MtsDeviceProvider::new(client(&server));
+
+    let points = provider.access_points(&flat, None).await.unwrap();
+
+    assert_eq!(
+        points
+            .iter()
+            .map(|point| point.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["access-main", "drive-main"]
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].url.path(),
+        "/vdome-smart-facade/devices/api/v1/flats/flat%20%2F%3F%23&+/available"
+    );
+    assert_eq!(
+        requests[1].url.query(),
+        Some("flatId=flat+%2F%3F%23%26%2B&category=accessPoint&page=0&size=100&sort=name%2Casc")
+    );
+    assert_eq!(
+        requests[2].url.query(),
+        Some("flatId=flat+%2F%3F%23%26%2B&category=drivePoint&page=0&size=100&sort=name%2Casc")
+    );
+}
+
+#[tokio::test]
+async fn unfiltered_access_points_return_empty_without_advertised_door_categories() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^{AVAILABLE_PATH_PREFIX}/flat-no-doors/available$"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!(["camera", "elevators"])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = MtsDeviceProvider::new(client(&server));
+
+    let points = provider
+        .access_points(&FlatId("flat-no-doors".to_owned()), None)
+        .await
+        .unwrap();
+
+    assert!(points.is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unfiltered_access_points_keep_successful_category_when_another_fails() {
+    let server = MockServer::start().await;
+    let flat = FlatId("flat-partial-categories".to_owned());
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^{AVAILABLE_PATH_PREFIX}/flat-partial-categories/available$"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!(["accessPoint", "drivePoint"])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(ACCESS_PATH))
+        .and(query_param("flatId", &flat.0))
+        .and(query_param("category", "accessPoint"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(single_access_page("access-success", serde_json::json!([]))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(ACCESS_PATH))
+        .and(query_param("flatId", &flat.0))
+        .and(query_param("category", "drivePoint"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = MtsDeviceProvider::new(client(&server));
+
+    let points = provider.access_points(&flat, None).await.unwrap();
+
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].id, "access-success");
+}
+
+#[tokio::test]
+async fn unfiltered_access_points_fail_when_alias_discovery_or_every_category_fails() {
+    let discovery_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^{AVAILABLE_PATH_PREFIX}/flat-discovery-failure/available$"
+        )))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&discovery_server)
+        .await;
+    let discovery_error = MtsDeviceProvider::new(client(&discovery_server))
+        .access_points(&FlatId("flat-discovery-failure".to_owned()), None)
+        .await
+        .unwrap_err();
+
+    let categories_server = MockServer::start().await;
+    let flat = FlatId("flat-categories-failure".to_owned());
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^{AVAILABLE_PATH_PREFIX}/flat-categories-failure/available$"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!(["accessPoint", "drivePoint"])),
+        )
+        .expect(1)
+        .mount(&categories_server)
+        .await;
+    for category in ["accessPoint", "drivePoint"] {
+        Mock::given(method("GET"))
+            .and(path(ACCESS_PATH))
+            .and(query_param("flatId", &flat.0))
+            .and(query_param("category", category))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&categories_server)
+            .await;
+    }
+    let categories_error = MtsDeviceProvider::new(client(&categories_server))
+        .access_points(&flat, None)
+        .await
+        .unwrap_err();
+
+    assert_eq!(discovery_error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(categories_error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(discovery_error.message, "Provider is unavailable.");
+    assert_eq!(categories_error.message, "Provider is unavailable.");
 }
 
 #[tokio::test]
@@ -621,7 +784,10 @@ async fn provider_rejects_contradictory_identity_and_bounded_pagination() {
     let provider = MtsDeviceProvider::new(client(&server));
 
     let identity_error = provider
-        .access_points(&FlatId("flat-contradictory".to_owned()), None)
+        .access_points(
+            &FlatId("flat-contradictory".to_owned()),
+            Some("accessPoint"),
+        )
         .await
         .unwrap_err();
     let pagination_error = provider
@@ -662,7 +828,10 @@ async fn access_point_lock_merge_preserves_null_evidence_and_rejects_conflicts()
     let provider = MtsDeviceProvider::new(client(&server));
 
     let points = provider
-        .access_points(&FlatId("flat-lock-evidence".to_owned()), None)
+        .access_points(
+            &FlatId("flat-lock-evidence".to_owned()),
+            Some("accessPoint"),
+        )
         .await
         .unwrap();
 
@@ -697,7 +866,7 @@ async fn access_point_lock_merge_preserves_null_evidence_and_rejects_conflicts()
         let provider = MtsDeviceProvider::new(client(&server));
 
         let error = provider
-            .access_points(&FlatId(format!("flat-lock-{case}")), None)
+            .access_points(&FlatId(format!("flat-lock-{case}")), Some("accessPoint"))
             .await
             .expect_err(case);
 
@@ -757,7 +926,10 @@ async fn access_point_locks_reject_malformed_required_fields_and_nested_bounds()
         let provider = MtsDeviceProvider::new(client(&server));
 
         let error = provider
-            .access_points(&FlatId(format!("flat-malformed-{case}")), None)
+            .access_points(
+                &FlatId(format!("flat-malformed-{case}")),
+                Some("accessPoint"),
+            )
             .await
             .expect_err(case);
 
@@ -782,7 +954,10 @@ async fn duplicate_access_point_locks_are_aggregate_bounded_across_pages() {
     let provider = MtsDeviceProvider::new(client(&server));
 
     let error = provider
-        .access_points(&FlatId("flat-aggregate-locks".to_owned()), None)
+        .access_points(
+            &FlatId("flat-aggregate-locks".to_owned()),
+            Some("accessPoint"),
+        )
         .await
         .unwrap_err();
 
@@ -811,7 +986,10 @@ async fn duplicate_access_point_cameras_are_aggregate_bounded_across_pages() {
     let provider = MtsDeviceProvider::new(client(&server));
 
     let error = provider
-        .access_points(&FlatId("flat-aggregate-cameras".to_owned()), None)
+        .access_points(
+            &FlatId("flat-aggregate-cameras".to_owned()),
+            Some("accessPoint"),
+        )
         .await
         .unwrap_err();
 
@@ -1234,9 +1412,10 @@ async fn camera_lookup_propagates_camera_source_errors_without_specific_or_unown
     for (case, camera_response, expected_code, expected_retry_after) in cases {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(ACCESS_PATH))
-            .and(query_param("flatId", "flat-owned"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .and(path_regex(format!(
+                "^{AVAILABLE_PATH_PREFIX}/flat-owned/available$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1264,12 +1443,20 @@ async fn camera_lookup_propagates_camera_source_errors_without_specific_or_unown
             .map(|request| request.url.path())
             .collect::<Vec<_>>();
         paths.sort_unstable();
-        assert_eq!(paths, vec![ACCESS_PATH, CAMERA_PATH], "case {case}");
+        assert_eq!(
+            paths,
+            vec![
+                CAMERA_PATH,
+                "/vdome-smart-facade/devices/api/v1/flats/flat-owned/available"
+            ],
+            "case {case}"
+        );
         assert!(requests.iter().all(|request| {
-            request
-                .url
-                .query_pairs()
-                .any(|(name, value)| name == "flatId" && value == "flat-owned")
+            request.url.path().contains("flat-owned")
+                || request
+                    .url
+                    .query_pairs()
+                    .any(|(name, value)| name == "flatId" && value == "flat-owned")
         }));
     }
 }
