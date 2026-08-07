@@ -3,13 +3,14 @@ use std::sync::Arc;
 use crate::{
     auth::AuthCoordinator,
     provider::mts::{
-        MtsClient, MtsDashboardProvider, door::MtsDoorOpenProvider, events::MtsEventProvider,
-        intercom::LiveSourceProvider, intercom::MtsDeviceProvider, media::MtsMediaProvider,
-        sms::MtsLegacySmsAuth,
+        MtsClient, MtsDashboardProvider, archive::MtsArchiveProvider, door::MtsDoorOpenProvider,
+        events::MtsEventProvider, intercom::LiveSourceProvider, intercom::MtsDeviceProvider,
+        media::MtsMediaProvider, sms::MtsLegacySmsAuth,
     },
     service::{
-        calls::CallService, devices::DeviceService, door::DoorOpenService, events::EventService,
-        live::LiveSessionManager, media::MediaService, property::PropertyService,
+        archive::ArchiveService, calls::CallService, devices::DeviceService, door::DoorOpenService,
+        events::EventService, live::LiveSessionManager, media::MediaService,
+        property::PropertyService,
     },
     storage::SecretStore,
 };
@@ -26,6 +27,7 @@ pub struct AppState {
     live_session_manager: Option<Arc<LiveSessionManager>>,
     door_open_service: Option<Arc<DoorOpenService>>,
     event_service: Option<Arc<EventService>>,
+    archive_service: Option<Arc<ArchiveService>>,
     legacy_sms_auth: Option<Arc<MtsLegacySmsAuth>>,
     call_service: Option<Arc<CallService>>,
 }
@@ -43,6 +45,7 @@ impl AppState {
             live_session_manager: None,
             door_open_service: None,
             event_service: None,
+            archive_service: None,
             legacy_sms_auth: None,
             call_service: None,
         }
@@ -73,6 +76,13 @@ impl AppState {
             Arc::clone(&device_service),
             Arc::new(MtsEventProvider::new((*mts_client).clone())),
         ));
+        let live_session_manager = Arc::new(LiveSessionManager::production());
+        let archive_service = Arc::new(ArchiveService::new(
+            Arc::clone(&property_service),
+            Arc::clone(&device_service),
+            Arc::new(MtsArchiveProvider::new((*mts_client).clone())),
+            Arc::clone(&live_session_manager),
+        ));
         Self {
             secret_store: Some(Arc::new(secret_store)),
             auth_coordinator: Some(auth_coordinator),
@@ -81,9 +91,10 @@ impl AppState {
             device_service: Some(device_service),
             media_service: Some(media_service),
             live_source_provider: Some(mts_devices),
-            live_session_manager: Some(Arc::new(LiveSessionManager::production())),
+            live_session_manager: Some(live_session_manager),
             door_open_service: Some(door_open_service),
             event_service: Some(event_service),
+            archive_service: Some(archive_service),
             legacy_sms_auth: None,
             call_service: None,
         }
@@ -114,6 +125,11 @@ impl AppState {
 
     pub fn with_event_service(mut self, event_service: Arc<EventService>) -> Self {
         self.event_service = Some(event_service);
+        self
+    }
+
+    pub fn with_archive_service(mut self, archive_service: Arc<ArchiveService>) -> Self {
+        self.archive_service = Some(archive_service);
         self
     }
 
@@ -160,6 +176,10 @@ impl AppState {
 
     pub fn event_service(&self) -> Option<&Arc<EventService>> {
         self.event_service.as_ref()
+    }
+
+    pub fn archive_service(&self) -> Option<&Arc<ArchiveService>> {
+        self.archive_service.as_ref()
     }
 
     pub fn legacy_sms_auth(&self) -> Option<&Arc<MtsLegacySmsAuth>> {

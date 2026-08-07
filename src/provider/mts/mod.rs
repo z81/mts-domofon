@@ -1,3 +1,4 @@
+pub mod archive;
 mod auth_api;
 mod bootstrap;
 pub mod call;

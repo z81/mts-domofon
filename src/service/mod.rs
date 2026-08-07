@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod calls;
 pub mod devices;
 pub mod door;

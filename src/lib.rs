@@ -13,6 +13,7 @@ pub mod state;
 pub mod storage;
 pub mod web;
 
+pub use domain::archive::{ArchiveDistribution, ArchiveInterval};
 pub use domain::event::{CallOutcome, EventItem, EventKind, EventPage, EventQuery};
 pub use domain::{
     AccessPoint, AccessPointKind, CallMode, CallSettings, CallSettingsPatch, CallSettingsStatus,

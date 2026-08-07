@@ -99,6 +99,30 @@ pub struct PreparedRequest {
 }
 
 impl PreparedRequest {
+    pub fn query_pairs(mut self, pairs: &[(&str, &str)]) -> Result<Self, AppError> {
+        if pairs.len() > 16
+            || pairs.iter().any(|(key, value)| {
+                key.is_empty()
+                    || key.len() > 64
+                    || !key.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                    || value.len() > 4_096
+                    || value.chars().any(char::is_control)
+            })
+        {
+            return Err(AppError::invalid_request("invalid provider query"));
+        }
+        let PreparedTarget::ClientBuiltUrl(url) = &mut self.target else {
+            return Err(AppError::invalid_request("invalid provider query target"));
+        };
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(AppError::invalid_request("invalid provider query target"));
+        }
+        url.query_pairs_mut().extend_pairs(pairs.iter().copied());
+        Ok(self)
+    }
+
     pub fn json<T>(mut self, value: &T) -> Result<Self, AppError>
     where
         T: Serialize + ?Sized,

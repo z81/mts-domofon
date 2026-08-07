@@ -76,6 +76,7 @@ impl RedactedUri {
 fn is_query_sensitive_route_path(path: &str) -> bool {
     is_removed_mts_relay_path(path)
         || is_camera_live_path(path)
+        || is_camera_archive_path(path)
         || path == "/api/v1/door-open-intents"
         || path == "/api/v1/door-open-intents/confirm"
         || path == "/api/v1/access/intents"
@@ -98,6 +99,16 @@ fn is_query_sensitive_route_path(path: &str) -> bool {
 fn is_camera_live_path(path: &str) -> bool {
     path.strip_prefix("/api/v1/cameras/")
         .and_then(|descendant| descendant.strip_suffix("/live"))
+        .is_some_and(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
+}
+
+fn is_camera_archive_path(path: &str) -> bool {
+    let Some(descendant) = path.strip_prefix("/api/v1/cameras/") else {
+        return false;
+    };
+    descendant
+        .strip_suffix("/archive")
+        .or_else(|| descendant.strip_suffix("/archive/distribution"))
         .is_some_and(|camera_id| !camera_id.is_empty() && !camera_id.contains('/'))
 }
 
@@ -127,6 +138,14 @@ fn redacted_path(path: &str) -> String {
     }
     if is_camera_live_path(path) {
         return "/api/v1/cameras/[REDACTED]/live".to_owned();
+    }
+    if is_camera_archive_path(path) {
+        let suffix = if path.ends_with("/archive/distribution") {
+            "/archive/distribution"
+        } else {
+            "/archive"
+        };
+        return format!("/api/v1/cameras/[REDACTED]{suffix}");
     }
     path.to_owned()
 }

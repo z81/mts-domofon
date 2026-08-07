@@ -244,6 +244,43 @@ async fn camera_live_scope_is_redacted_from_request_metadata() {
 }
 
 #[tokio::test]
+async fn camera_archive_scope_and_time_are_redacted_from_request_metadata() {
+    // Catches archive camera IDs, flat IDs, or selected timestamps entering request traces.
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
+    async fn handler(Extension(redacted_uri): Extension<RedactedUri>) -> String {
+        redacted_uri.to_string()
+    }
+
+    let app = app::with_http_middleware(
+        Router::new()
+            .route("/api/v1/cameras/{camera_id}/archive", get(handler))
+            .route(
+                "/api/v1/cameras/{camera_id}/archive/distribution",
+                get(handler),
+            ),
+    );
+    for (path, expected) in [
+        (
+            "/api/v1/cameras/private-camera/archive?flatId=private-flat&start=private-time",
+            "/api/v1/cameras/[REDACTED]/archive?[REDACTED]",
+        ),
+        (
+            "/api/v1/cameras/private-camera/archive/distribution?flatId=private-flat",
+            "/api/v1/cameras/[REDACTED]/archive/distribution?[REDACTED]",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, expected.as_bytes());
+    }
+}
+
+#[tokio::test]
 async fn valid_request_id_is_retained_in_the_response() {
     let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     let app = app::test_router().await;

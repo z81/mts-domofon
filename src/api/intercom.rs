@@ -1,11 +1,12 @@
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Extension, Path, Query, State},
-    http::{HeaderValue, Response, StatusCode, header},
+    body::{Body, to_bytes},
+    extract::{Extension, FromRequest, Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue, Response, StatusCode, header},
+    response::IntoResponse,
     routing::{delete, get, post},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     domain::{Capability, FlatId},
@@ -22,6 +23,11 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/devices", get(devices_scoped))
         .route("/api/v1/cameras/{camera_id}/snapshot", get(snapshot_scoped))
         .route("/api/v1/cameras/{camera_id}/live", post(start_live))
+        .route(
+            "/api/v1/cameras/{camera_id}/archive/distribution",
+            get(archive_distribution),
+        )
+        .route("/api/v1/cameras/{camera_id}/archive", post(start_archive))
         .route("/api/v1/live/{session_id}/{asset}", get(read_live_asset))
         .route("/api/v1/live/{session_id}", delete(stop_live))
         .route("/api/v1/flats/{flat_id}/devices", get(devices_nested))
@@ -37,6 +43,113 @@ pub fn router() -> Router<AppState> {
         .route("/api/places/{flat_id}/cameras", get(compat_cameras))
         .route("/api/snapshot/{flat_id}/{camera_id}", get(snapshot_nested))
         .route("/api/snapshot/{camera_id}", get(snapshot_scoped))
+}
+
+const ARCHIVE_JSON_LIMIT: usize = 4 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveStartRequest {
+    start: chrono::DateTime<chrono::Utc>,
+}
+
+struct ArchiveJson<T>(T);
+
+impl<T, S> FromRequest<S> for ArchiveJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = request
+            .extensions()
+            .get::<RequestId>()
+            .copied()
+            .unwrap_or_else(RequestId::generate);
+        if !request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+        {
+            return Err(ApiError::new(
+                request_id,
+                AppError::new(
+                    ErrorCode::UnsupportedMediaType,
+                    "Content-Type must be application/json.",
+                    false,
+                ),
+            ));
+        }
+        let bytes = to_bytes(request.into_body(), ARCHIVE_JSON_LIMIT)
+            .await
+            .map_err(|_| {
+                ApiError::new(
+                    request_id,
+                    AppError::new(
+                        ErrorCode::PayloadTooLarge,
+                        "JSON request body is too large.",
+                        false,
+                    ),
+                )
+            })?;
+        serde_json::from_slice(&bytes)
+            .map(ArchiveJson)
+            .map_err(|_| {
+                ApiError::new(
+                    request_id,
+                    AppError::invalid_request("JSON request body is invalid."),
+                )
+            })
+    }
+}
+
+async fn archive_distribution(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(camera_id): Path<String>,
+    Query(scope): Query<FlatScope>,
+) -> Result<axum::response::Response, ApiError> {
+    validate_opaque_id(&scope.flat_id).map_err(|error| ApiError::new(request_id, error))?;
+    validate_opaque_id(&camera_id).map_err(|error| ApiError::new(request_id, error))?;
+    let distribution = state
+        .archive_service()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .distribution(&FlatId(scope.flat_id), &camera_id)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    let mut response = Json(distribution).into_response();
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+async fn start_archive(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(camera_id): Path<String>,
+    Query(scope): Query<FlatScope>,
+    ArchiveJson(request): ArchiveJson<ArchiveStartRequest>,
+) -> Result<axum::response::Response, ApiError> {
+    validate_opaque_id(&scope.flat_id).map_err(|error| ApiError::new(request_id, error))?;
+    validate_opaque_id(&camera_id).map_err(|error| ApiError::new(request_id, error))?;
+    let session = state
+        .archive_service()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .start(&FlatId(scope.flat_id), &camera_id, request.start)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    let mut response = Json(session).into_response();
+    no_store(response.headers_mut());
+    Ok(response)
+}
+
+fn no_store(headers: &mut HeaderMap) {
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
 
 async fn start_live(

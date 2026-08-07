@@ -26,7 +26,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 const SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const MAX_PLAYLIST_BYTES: usize = 256 * 1024;
 const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CAMERA_KEY_BYTES: usize = 1_028;
+const MAX_CAMERA_KEY_BYTES: usize = 2_200;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
