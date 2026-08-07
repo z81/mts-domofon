@@ -3,7 +3,10 @@ use std::{collections::BTreeSet, sync::Arc};
 use chrono::TimeDelta;
 
 use crate::{
-    domain::event::{CallOutcome, EventItem, EventKind, EventPage, EventQuery},
+    domain::{
+        Capability,
+        event::{CallOutcome, EventItem, EventKind, EventPage, EventQuery},
+    },
     error::AppError,
     provider::mts::events::{EventProvider, ProviderEvent, ProviderEventQuery},
 };
@@ -42,13 +45,17 @@ impl EventService {
         let inventory = self.devices.inventory(&query.flat_id).await?;
         let mut owned = BTreeSet::from([query.flat_id.0.clone()]);
         let mut owned_cameras = BTreeSet::new();
+        let mut archive_cameras = BTreeSet::new();
         for point in inventory.access_points {
             owned.insert(point.id);
             owned.extend(point.camera_ids);
         }
         for camera in inventory.cameras {
             owned.insert(camera.id.clone());
-            owned_cameras.insert(camera.id);
+            owned_cameras.insert(camera.id.clone());
+            if matches!(camera.capabilities.archive, Capability::Available) {
+                archive_cameras.insert(camera.id);
+            }
         }
 
         let skip = usize::try_from(query.page)
@@ -75,7 +82,7 @@ impl EventService {
                 if !seen.insert(event.id.clone()) || !is_owned(&event, &owned) {
                     continue;
                 }
-                let item = normalize_event(event, &owned_cameras);
+                let item = normalize_event(event, &owned_cameras, &archive_cameras);
                 if query.kind.is_some_and(|kind| kind != item.kind) {
                     continue;
                 }
@@ -127,8 +134,12 @@ fn is_owned(event: &ProviderEvent, owned: &BTreeSet<String>) -> bool {
         .any(|identity| owned.contains(identity))
 }
 
-fn normalize_event(event: ProviderEvent, owned_cameras: &BTreeSet<String>) -> EventItem {
-    let camera_id = event
+fn normalize_event(
+    event: ProviderEvent,
+    owned_cameras: &BTreeSet<String>,
+    archive_cameras: &BTreeSet<String>,
+) -> EventItem {
+    let owned_camera_id = event
         .camera_id
         .as_ref()
         .filter(|camera_id| owned_cameras.contains(*camera_id));
@@ -137,7 +148,7 @@ fn normalize_event(event: ProviderEvent, owned_cameras: &BTreeSet<String>) -> Ev
         EventKind::Call
     } else if alias == "intercom.unlocked" || event.unlocked {
         EventKind::Access
-    } else if camera_id.is_some() || alias.starts_with("camera.") {
+    } else if owned_camera_id.is_some() || alias.starts_with("camera.") {
         EventKind::Camera
     } else {
         EventKind::Other
@@ -160,7 +171,9 @@ fn normalize_event(event: ProviderEvent, owned_cameras: &BTreeSet<String>) -> Ev
         .map(|(started, finished)| finished.signed_duration_since(started).num_seconds())
         .filter(|seconds| (0..=MAX_EVENT_DURATION_SECONDS).contains(seconds))
         .map(|seconds| seconds as u64);
-    let camera_id = camera_id.cloned();
+    let camera_id = owned_camera_id
+        .filter(|camera_id| archive_cameras.contains(*camera_id))
+        .cloned();
     let archive_at = camera_id.as_ref().map(|_| event.occurred_at);
 
     EventItem {

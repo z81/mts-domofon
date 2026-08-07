@@ -77,7 +77,7 @@ async fn provider_uses_the_apk_event_contract_and_retains_only_normalization_evi
                 "payload": {
                     "apartment": {"id": "flat-owned", "building": "private-building", "owner": "private-owner"},
                     "camera": {"id": "camera-owned", "pictureUrl": "https://private.invalid/frame"},
-                    "context": {"id": "entry-owned", "type": "INTERCOM"},
+                    "context": [{"id": "entry-owned", "type": "INTERCOM"}],
                     "device": {"id": "entry-owned", "name": "Подъезд 1", "type": "INTERCOM"},
                     "intercom": {"id": "entry-owned", "name": "Домофон", "sip": "private-sip"},
                     "createdAt": "2026-08-07T08:15:30.125",
@@ -197,7 +197,9 @@ impl PropertyProvider for OwnedPropertyProvider {
     }
 }
 
-struct OwnedDevices;
+struct OwnedDevices {
+    archive: Capability,
+}
 
 #[async_trait]
 impl DeviceProvider for OwnedDevices {
@@ -230,7 +232,7 @@ impl DeviceProvider for OwnedDevices {
             capabilities: CameraCapabilities {
                 snapshot: Capability::Available,
                 live: Capability::Available,
-                archive: Capability::Available,
+                archive: self.archive.clone(),
             },
         }])
     }
@@ -280,6 +282,13 @@ fn provider_event(
 }
 
 async fn event_service(pages: Vec<ProviderEventPage>) -> EventService {
+    event_service_with_archive(pages, Capability::Available).await
+}
+
+async fn event_service_with_archive(
+    pages: Vec<ProviderEventPage>,
+    archive: Capability,
+) -> EventService {
     let directory = tempfile::tempdir().unwrap();
     let store = SecretStore::open(directory.path(), Some([17; 32]))
         .await
@@ -287,7 +296,7 @@ async fn event_service(pages: Vec<ProviderEventPage>) -> EventService {
     // PropertyService owns a store clone; keeping the temporary directory is unnecessary after
     // construction because this test does not select a flat or persist property state.
     let properties = Arc::new(PropertyService::new(Arc::new(OwnedPropertyProvider), store));
-    let devices = Arc::new(DeviceService::new(Arc::new(OwnedDevices)));
+    let devices = Arc::new(DeviceService::new(Arc::new(OwnedDevices { archive })));
     EventService::new(
         properties,
         devices,
@@ -295,6 +304,41 @@ async fn event_service(pages: Vec<ProviderEventPage>) -> EventService {
             pages: Mutex::new(pages.into()),
         }),
     )
+}
+
+#[tokio::test]
+async fn events_do_not_offer_an_archive_link_for_a_camera_without_provider_archive() {
+    let service = event_service_with_archive(
+        vec![ProviderEventPage {
+            events: vec![provider_event(
+                "owned-access",
+                Some("intercom.unlocked"),
+                &["entry-owned"],
+                Some("camera-owned"),
+                None,
+            )],
+            last: true,
+        }],
+        Capability::Unavailable { reason: None },
+    )
+    .await;
+
+    let page = service
+        .events(EventQuery {
+            flat_id: FlatId("flat-owned".to_owned()),
+            page: 0,
+            size: 20,
+            from: Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
+            to: Utc.with_ymd_and_hms(2026, 8, 7, 23, 59, 59).unwrap(),
+            kind: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].kind, EventKind::Access);
+    assert_eq!(page.items[0].camera_id, None);
+    assert_eq!(page.items[0].archive_at, None);
 }
 
 #[tokio::test]

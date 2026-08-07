@@ -18,6 +18,7 @@ const MAX_ID_BYTES: usize = 2 * 1024;
 const MAX_LABEL_BYTES: usize = 2 * 1024;
 const MAX_ALIAS_BYTES: usize = 512;
 const MAX_PEERS: usize = 64;
+const MAX_CONTEXTS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct ProviderEventQuery {
@@ -169,7 +170,7 @@ struct EventDto {
 struct PayloadDto {
     apartment: Option<IdentityDto>,
     camera: Option<IdentityDto>,
-    context: Option<IdentityDto>,
+    context: Option<IdentityEvidenceDto>,
     device: Option<IdentityDto>,
     intercom: Option<IdentityDto>,
     created_at: Option<String>,
@@ -196,6 +197,13 @@ struct IdentityDto {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum IdentityEvidenceDto {
+    One(IdentityDto),
+    Many(Vec<IdentityDto>),
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PeerDto {
     dial_status: Option<DialStatusDto>,
@@ -218,6 +226,9 @@ impl TryFrom<EventDto> for ProviderEvent {
             .peers
             .as_ref()
             .is_some_and(|peers| peers.len() > MAX_PEERS)
+            || payload.context.as_ref().is_some_and(|context| {
+                matches!(context, IdentityEvidenceDto::Many(values) if values.len() > MAX_CONTEXTS)
+            })
         {
             return Err(schema_error());
         }
@@ -249,7 +260,6 @@ impl TryFrom<EventDto> for ProviderEvent {
                 .as_ref()
                 .and_then(|value| value.id.as_ref()),
             payload.camera.as_ref().and_then(|value| value.id.as_ref()),
-            payload.context.as_ref().and_then(|value| value.id.as_ref()),
             payload.device.as_ref().and_then(|value| value.id.as_ref()),
             payload
                 .intercom
@@ -260,6 +270,22 @@ impl TryFrom<EventDto> for ProviderEvent {
         .flatten()
         {
             identities.insert(required_value(Some(candidate.clone()), MAX_ID_BYTES)?);
+        }
+        if let Some(context) = payload.context.as_ref() {
+            match context {
+                IdentityEvidenceDto::One(value) => {
+                    if let Some(id) = value.id.as_ref() {
+                        identities.insert(required_value(Some(id.clone()), MAX_ID_BYTES)?);
+                    }
+                }
+                IdentityEvidenceDto::Many(values) => {
+                    for value in values {
+                        if let Some(id) = value.id.as_ref() {
+                            identities.insert(required_value(Some(id.clone()), MAX_ID_BYTES)?);
+                        }
+                    }
+                }
+            }
         }
         let source_label = [
             payload
