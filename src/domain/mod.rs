@@ -2,6 +2,7 @@ pub mod auth;
 pub mod call;
 pub mod device;
 pub mod door;
+pub mod event;
 pub mod media;
 pub mod page;
 pub mod property;

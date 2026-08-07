@@ -1,6 +1,7 @@
 pub mod calls;
 pub mod devices;
 pub mod door;
+pub mod events;
 pub mod live;
 pub mod media;
 pub mod property;

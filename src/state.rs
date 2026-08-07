@@ -3,11 +3,12 @@ use std::sync::Arc;
 use crate::{
     auth::AuthCoordinator,
     provider::mts::{
-        MtsClient, MtsDashboardProvider, door::MtsDoorOpenProvider, intercom::LiveSourceProvider,
-        intercom::MtsDeviceProvider, media::MtsMediaProvider, sms::MtsLegacySmsAuth,
+        MtsClient, MtsDashboardProvider, door::MtsDoorOpenProvider, events::MtsEventProvider,
+        intercom::LiveSourceProvider, intercom::MtsDeviceProvider, media::MtsMediaProvider,
+        sms::MtsLegacySmsAuth,
     },
     service::{
-        calls::CallService, devices::DeviceService, door::DoorOpenService,
+        calls::CallService, devices::DeviceService, door::DoorOpenService, events::EventService,
         live::LiveSessionManager, media::MediaService, property::PropertyService,
     },
     storage::SecretStore,
@@ -24,6 +25,7 @@ pub struct AppState {
     live_source_provider: Option<Arc<dyn LiveSourceProvider>>,
     live_session_manager: Option<Arc<LiveSessionManager>>,
     door_open_service: Option<Arc<DoorOpenService>>,
+    event_service: Option<Arc<EventService>>,
     legacy_sms_auth: Option<Arc<MtsLegacySmsAuth>>,
     call_service: Option<Arc<CallService>>,
 }
@@ -40,6 +42,7 @@ impl AppState {
             live_source_provider: None,
             live_session_manager: None,
             door_open_service: None,
+            event_service: None,
             legacy_sms_auth: None,
             call_service: None,
         }
@@ -65,6 +68,11 @@ impl AppState {
             Arc::clone(&device_service),
             Arc::new(MtsDoorOpenProvider::new((*mts_client).clone())),
         ));
+        let event_service = Arc::new(EventService::new(
+            Arc::clone(&property_service),
+            Arc::clone(&device_service),
+            Arc::new(MtsEventProvider::new((*mts_client).clone())),
+        ));
         Self {
             secret_store: Some(Arc::new(secret_store)),
             auth_coordinator: Some(auth_coordinator),
@@ -75,6 +83,7 @@ impl AppState {
             live_source_provider: Some(mts_devices),
             live_session_manager: Some(Arc::new(LiveSessionManager::production())),
             door_open_service: Some(door_open_service),
+            event_service: Some(event_service),
             legacy_sms_auth: None,
             call_service: None,
         }
@@ -100,6 +109,11 @@ impl AppState {
 
     pub fn with_legacy_sms_auth(mut self, legacy_sms_auth: Arc<MtsLegacySmsAuth>) -> Self {
         self.legacy_sms_auth = Some(legacy_sms_auth);
+        self
+    }
+
+    pub fn with_event_service(mut self, event_service: Arc<EventService>) -> Self {
+        self.event_service = Some(event_service);
         self
     }
 
@@ -142,6 +156,10 @@ impl AppState {
 
     pub fn door_open_service(&self) -> Option<&Arc<DoorOpenService>> {
         self.door_open_service.as_ref()
+    }
+
+    pub fn event_service(&self) -> Option<&Arc<EventService>> {
+        self.event_service.as_ref()
     }
 
     pub fn legacy_sms_auth(&self) -> Option<&Arc<MtsLegacySmsAuth>> {
