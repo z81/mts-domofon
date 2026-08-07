@@ -319,6 +319,12 @@ async fn logout(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
 ) -> Result<Json<LogoutResult>, ApiError> {
+    if let Some(auto_open) = state.auto_open_service() {
+        auto_open
+            .disable()
+            .await
+            .map_err(|error| ApiError::new(request_id, error))?;
+    }
     let coordinator = coordinator(&state, request_id)?;
     let result = coordinator.logout().await;
     if let Some(manager) = state.live_session_manager() {

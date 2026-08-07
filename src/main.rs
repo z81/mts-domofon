@@ -15,6 +15,7 @@ use domru_mts::{
         sso::MtsSsoTransport,
     },
     service::{
+        auto_open::{AutoOpenService, run_auto_open_watcher},
         calls::CallService,
         push::{IncomingCallHandler, PushSupervisor, PushSupervisorConfig},
     },
@@ -26,6 +27,8 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+const AUTO_OPEN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const AUTO_OPEN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct RuntimeIncomingCallHandler {
     runtime: Arc<SipCallRuntime>,
@@ -54,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token_source: Arc<dyn TokenSource> = auth_coordinator.clone();
     let mts_client = Arc::new(MtsClient::new(&config, token_source)?);
     let legacy_sms_auth = Arc::new(MtsLegacySmsAuth::new()?);
+    let auto_open_service = Arc::new(AutoOpenService::restore(secret_store.clone()).await?);
 
     let call_runtime = Arc::new(SipCallRuntime::production(Arc::new(
         MtsCallActionProvider::new((*mts_client).clone()),
@@ -78,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let state = AppState::with_dependencies(secret_store, auth_coordinator, mts_client)
         .with_legacy_sms_auth(legacy_sms_auth)
-        .with_call_service(call_service);
+        .with_call_service(call_service.clone())
+        .with_auto_open_service(auto_open_service.clone());
     let live_sessions = state.live_session_manager().cloned();
 
     let listener = TcpListener::bind(config.bind).await?;
@@ -91,6 +96,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::error!(%error, "push supervisor stopped");
         }
     });
+    let auto_open_cancellation = cancellation.clone();
+    let mut auto_open_task = tokio::spawn(run_auto_open_watcher(
+        auto_open_service,
+        call_service,
+        auto_open_cancellation,
+        AUTO_OPEN_POLL_INTERVAL,
+    ));
 
     let shutdown_cancellation = cancellation.clone();
     let server_result = axum::serve(listener, build_router(state))
@@ -103,6 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cancellation.cancel();
     if let Some(manager) = live_sessions {
         manager.stop_all().await;
+    }
+    if tokio::time::timeout(AUTO_OPEN_SHUTDOWN_TIMEOUT, &mut auto_open_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("auto-open watcher did not stop gracefully; aborting task");
+        auto_open_task.abort();
+        let _ = auto_open_task.await;
     }
     if tokio::time::timeout(SUPERVISOR_SHUTDOWN_TIMEOUT, &mut supervisor_task)
         .await

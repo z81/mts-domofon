@@ -281,6 +281,36 @@ async fn camera_archive_scope_and_time_are_redacted_from_request_metadata() {
 }
 
 #[tokio::test]
+async fn auto_open_confirmation_identifier_is_redacted_from_request_metadata() {
+    let _tracing_guard = TRACING_TEST_LOCK.lock().await;
+    async fn handler(Extension(redacted_uri): Extension<RedactedUri>) -> String {
+        redacted_uri.to_string()
+    }
+
+    let app = app::with_http_middleware(Router::new().route(
+        "/api/v1/calls/auto-open/intents/{intent_id}/execute",
+        get(handler),
+    ));
+    let response = app
+        .oneshot(
+            Request::get(
+                "/api/v1/calls/auto-open/intents/private-intent/execute?future=private-value",
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        &body[..],
+        b"/api/v1/calls/auto-open/intents/[REDACTED]/execute?[REDACTED]"
+    );
+}
+
+#[tokio::test]
 async fn valid_request_id_is_retained_in_the_response() {
     let _tracing_guard = TRACING_TEST_LOCK.lock().await;
     let app = app::test_router().await;

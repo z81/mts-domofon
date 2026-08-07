@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod auto_open;
 pub mod calls;
 pub mod devices;
 pub mod door;

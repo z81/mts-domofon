@@ -29,12 +29,15 @@ const SESSION_FILE: &str = "session.enc";
 const DEVICE_FILE: &str = "device.enc";
 const SELECTED_FLAT_FILE: &str = "selected-flat.enc";
 const CALL_PUSH_FILE: &str = "call-push.enc";
+const AUTO_OPEN_FILE: &str = "auto-open.enc";
 const MASTER_KEY_FILE: &str = "master.key";
 const SESSION_AAD: &[u8] = b"domru-mts/session/v1";
 const DEVICE_AAD: &[u8] = b"domru-mts/device/v1";
 const SELECTED_FLAT_AAD: &[u8] = b"domru-mts/selected-flat/v1";
 const CALL_PUSH_AAD: &[u8] = b"domru-mts/call-push/v1";
+const AUTO_OPEN_AAD: &[u8] = b"domru-mts/auto-open/v1";
 const MAX_CALL_PUSH_STATE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_AUTO_OPEN_STATE_BYTES: usize = 64 * 1024;
 
 /// Encrypted durable storage for the currently supported Linux and macOS targets.
 #[derive(Clone)]
@@ -272,6 +275,28 @@ impl SecretStore {
 
     pub async fn clear_call_push_state(&self) -> Result<(), AppError> {
         let path = self.data_dir.join(CALL_PUSH_FILE);
+        match fs::remove_file(path).await {
+            Ok(()) => sync_parent(&self.data_dir).await,
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(storage_failure()),
+        }
+    }
+
+    pub async fn load_auto_open_state(&self) -> Result<Option<Zeroizing<Vec<u8>>>, AppError> {
+        self.read_encrypted(AUTO_OPEN_FILE, AUTO_OPEN_AAD).await
+    }
+
+    pub async fn save_auto_open_state(&self, state: &[u8]) -> Result<(), AppError> {
+        if state.len() > MAX_AUTO_OPEN_STATE_BYTES {
+            return Err(AppError::invalid_request("auto-open state is too large"));
+        }
+        let state = Zeroizing::new(state.to_vec());
+        let encrypted = self.encrypt(&state, AUTO_OPEN_AAD)?;
+        self.atomic_replace(AUTO_OPEN_FILE, &encrypted).await
+    }
+
+    pub async fn clear_auto_open_state(&self) -> Result<(), AppError> {
+        let path = self.data_dir.join(AUTO_OPEN_FILE);
         match fs::remove_file(path).await {
             Ok(()) => sync_parent(&self.data_dir).await,
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -525,6 +550,7 @@ async fn encrypted_data_exists(data_dir: &Path) -> Result<bool, AppError> {
         DEVICE_FILE,
         SELECTED_FLAT_FILE,
         CALL_PUSH_FILE,
+        AUTO_OPEN_FILE,
     ] {
         match fs::symlink_metadata(data_dir.join(file_name)).await {
             Ok(_) => return Ok(true),
@@ -542,6 +568,7 @@ async fn repair_existing_secret_permissions(data_dir: &Path) -> Result<(), AppEr
         DEVICE_FILE,
         SELECTED_FLAT_FILE,
         CALL_PUSH_FILE,
+        AUTO_OPEN_FILE,
     ] {
         repair_secret_permissions_if_exists(&data_dir.join(file_name)).await?;
     }

@@ -1,5 +1,6 @@
 use std::{
     io::Write,
+    path::PathBuf,
     str::FromStr,
     sync::{
         Arc, Mutex,
@@ -21,8 +22,10 @@ use domru_mts::{
     domain::auth::{
         AuthFlavor, AuthFlowId, AuthProgress, ChallengeInput, PersistedSession, TokenBundle,
     },
+    domain::auto_open::AutoOpenMode,
     error::{AppError, ErrorCode},
     provider::mts::{KeycloakRotation, MtsClient, ProviderAuthApi, TokenSource},
+    service::auto_open::AutoOpenService,
     state::AppState,
     storage::SecretStore,
 };
@@ -139,14 +142,18 @@ struct FakeProviderAuthApi {
     keycloak_calls: AtomicUsize,
     web_sso_calls: AtomicUsize,
     logout_calls: AtomicUsize,
+    auto_open_path: PathBuf,
+    auto_open_was_cleared_before_logout: AtomicBool,
 }
 
 impl FakeProviderAuthApi {
-    fn new() -> Self {
+    fn new(auto_open_path: PathBuf) -> Self {
         Self {
             keycloak_calls: AtomicUsize::new(0),
             web_sso_calls: AtomicUsize::new(0),
             logout_calls: AtomicUsize::new(0),
+            auto_open_path,
+            auto_open_was_cleared_before_logout: AtomicBool::new(false),
         }
     }
 }
@@ -198,6 +205,8 @@ impl ProviderAuthApi for FakeProviderAuthApi {
             Some(DEVICE_SECRET)
         );
         assert_eq!(auth_flavor, AuthFlavor::WebSso);
+        self.auto_open_was_cleared_before_logout
+            .store(!self.auto_open_path.exists(), Ordering::SeqCst);
         self.logout_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -215,6 +224,7 @@ struct TestFixture {
     app: Router,
     sso: Arc<FakeSsoTransport>,
     provider: Arc<FakeProviderAuthApi>,
+    auto_open: Arc<AutoOpenService>,
     _data_dir: TempDir,
 }
 
@@ -234,7 +244,9 @@ async fn fixture(active_session: bool) -> TestFixture {
             .unwrap();
     }
     let sso = Arc::new(FakeSsoTransport::new());
-    let provider = Arc::new(FakeProviderAuthApi::new());
+    let provider = Arc::new(FakeProviderAuthApi::new(
+        data_dir.path().join("auto-open.enc"),
+    ));
     let coordinator = AuthCoordinator::restore_for_test(
         store.clone(),
         sso.clone(),
@@ -246,13 +258,16 @@ async fn fixture(active_session: bool) -> TestFixture {
     let config = AppConfig::from_iter(std::iter::empty::<(&str, &str)>()).unwrap();
     let token_source: Arc<dyn TokenSource> = coordinator.clone();
     let client = Arc::new(MtsClient::new(&config, token_source).unwrap());
-    let state = AppState::with_dependencies(store, coordinator, client);
+    let auto_open = Arc::new(AutoOpenService::restore(store.clone()).await.unwrap());
+    let state = AppState::with_dependencies(store, coordinator, client)
+        .with_auto_open_service(auto_open.clone());
     let app = build_router_with_config(state, &config);
 
     TestFixture {
         app,
         sso,
         provider,
+        auto_open,
         _data_dir: data_dir,
     }
 }
@@ -367,6 +382,16 @@ async fn callback_authenticates_once_and_session_exposes_only_public_metadata() 
 #[tokio::test]
 async fn refresh_and_logout_return_exact_public_json_and_update_session() {
     let fixture = fixture(true).await;
+    let intent = fixture
+        .auto_open
+        .create_intent(AutoOpenMode::NextCall, false)
+        .await
+        .unwrap();
+    fixture
+        .auto_open
+        .execute_intent(&intent.intent_id)
+        .await
+        .unwrap();
 
     let refresh = fixture
         .app
@@ -400,6 +425,16 @@ async fn refresh_and_logout_return_exact_public_json_and_update_session() {
     assert_eq!(logout, json!({ "warning": null }));
     assert!(!raw.contains("secret"));
     assert_eq!(fixture.provider.logout_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        fixture
+            .provider
+            .auto_open_was_cleared_before_logout
+            .load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        fixture.auto_open.policy().await.unwrap().mode,
+        AutoOpenMode::Disabled
+    );
 
     let session = fixture
         .app

@@ -77,6 +77,8 @@ fn is_query_sensitive_route_path(path: &str) -> bool {
     is_removed_mts_relay_path(path)
         || is_camera_live_path(path)
         || is_camera_archive_path(path)
+        || path == "/api/v1/calls/auto-open"
+        || path.starts_with("/api/v1/calls/auto-open/")
         || path == "/api/v1/door-open-intents"
         || path == "/api/v1/door-open-intents/confirm"
         || path == "/api/v1/access/intents"
@@ -117,6 +119,12 @@ fn is_removed_mts_relay_path(path: &str) -> bool {
 }
 
 fn redacted_path(path: &str) -> String {
+    const AUTO_OPEN_PREFIX: &str = "/api/v1/calls/auto-open/intents/";
+    if let Some(descendant) = path.strip_prefix(AUTO_OPEN_PREFIX)
+        && let Some((_intent_id, suffix)) = descendant.split_once('/')
+    {
+        return format!("{AUTO_OPEN_PREFIX}[REDACTED]/{suffix}");
+    }
     const PREFIX: &str = "/api/v1/access/intents/";
     if let Some(descendant) = path.strip_prefix(PREFIX) {
         if let Some((intent_id, suffix)) = descendant.split_once('/') {

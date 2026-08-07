@@ -8,9 +8,9 @@ use crate::{
         media::MtsMediaProvider, sms::MtsLegacySmsAuth,
     },
     service::{
-        archive::ArchiveService, calls::CallService, devices::DeviceService, door::DoorOpenService,
-        events::EventService, live::LiveSessionManager, media::MediaService,
-        property::PropertyService,
+        archive::ArchiveService, auto_open::AutoOpenService, calls::CallService,
+        devices::DeviceService, door::DoorOpenService, events::EventService,
+        live::LiveSessionManager, media::MediaService, property::PropertyService,
     },
     storage::SecretStore,
 };
@@ -30,6 +30,7 @@ pub struct AppState {
     archive_service: Option<Arc<ArchiveService>>,
     legacy_sms_auth: Option<Arc<MtsLegacySmsAuth>>,
     call_service: Option<Arc<CallService>>,
+    auto_open_service: Option<Arc<AutoOpenService>>,
 }
 
 impl AppState {
@@ -48,6 +49,7 @@ impl AppState {
             archive_service: None,
             legacy_sms_auth: None,
             call_service: None,
+            auto_open_service: None,
         }
     }
 
@@ -97,6 +99,7 @@ impl AppState {
             archive_service: Some(archive_service),
             legacy_sms_auth: None,
             call_service: None,
+            auto_open_service: None,
         }
     }
 
@@ -135,6 +138,11 @@ impl AppState {
 
     pub fn with_call_service(mut self, call_service: Arc<CallService>) -> Self {
         self.call_service = Some(call_service);
+        self
+    }
+
+    pub fn with_auto_open_service(mut self, auto_open_service: Arc<AutoOpenService>) -> Self {
+        self.auto_open_service = Some(auto_open_service);
         self
     }
 
@@ -188,5 +196,9 @@ impl AppState {
 
     pub fn call_service(&self) -> Option<&Arc<CallService>> {
         self.call_service.as_ref()
+    }
+
+    pub fn auto_open_service(&self) -> Option<&Arc<AutoOpenService>> {
+        self.auto_open_service.as_ref()
     }
 }

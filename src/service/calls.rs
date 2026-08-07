@@ -461,6 +461,27 @@ impl CallService {
         self.opener.open(&intercom_id, &call_session_id).await
     }
 
+    /// Opens the call-associated default lock without accepting provider identifiers
+    /// from a browser. This is reserved for the session-bound auto-open watcher.
+    pub async fn auto_open(&self, id: &CallId) -> Result<CallRevision, AppError> {
+        let (revision, intercom_id, call_session_id) = {
+            let state = self.state.lock().await;
+            let current = current_for(&state, id)?;
+            if !matches!(current.session.phase(), CallPhase::Ringing) {
+                return Err(AppError::invalid_request(
+                    "Automatic opening is only valid for a ringing call.",
+                ));
+            }
+            (
+                current.session.revision(),
+                current.intercom_id.clone(),
+                current.call_session_id.clone(),
+            )
+        };
+        self.opener.open(&intercom_id, &call_session_id).await?;
+        Ok(revision)
+    }
+
     async fn transition(&self, id: &CallId, command: CallCommand) -> Result<CallView, AppError> {
         let now = self.clock.now();
         let mut state = self.state.lock().await;
