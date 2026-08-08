@@ -13,7 +13,7 @@ use domru_mts::{
     service::live::{LiveProcess, LiveProcessRunner, LiveSessionManager},
 };
 use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 
 #[derive(Default)]
 struct FakeRunner {
@@ -76,6 +76,28 @@ impl FakeRunner {
 
     async fn output_for(&self, index: usize) -> PathBuf {
         self.outputs.lock().await[index].clone()
+    }
+}
+
+#[derive(Default)]
+struct CancelOnceRunner {
+    first_started: Notify,
+    starts: AtomicUsize,
+    fallback: FakeRunner,
+}
+
+#[async_trait]
+impl LiveProcessRunner for CancelOnceRunner {
+    async fn start(
+        &self,
+        source: &SecretString,
+        output: &Path,
+    ) -> Result<Box<dyn LiveProcess>, AppError> {
+        if self.starts.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_started.notify_one();
+            return std::future::pending().await;
+        }
+        self.fallback.start(source, output).await
     }
 }
 
@@ -196,6 +218,78 @@ async fn session_start_reuses_the_active_camera_session() {
     assert_eq!(repeated.session_id, first.session_id);
     assert_eq!(runner.sources.lock().await.len(), 1);
     manager.stop_all().await;
+}
+
+#[tokio::test]
+async fn cancelled_start_releases_the_camera_for_a_fresh_attempt() {
+    let runner = Arc::new(CancelOnceRunner::default());
+    let manager = LiveSessionManager::new_for_test(runner.clone(), 1).unwrap();
+    let cancelled_manager = manager.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelled_manager
+            .start(
+                "camera-one".to_owned(),
+                SecretString::from("rtsp://provider.invalid/cancelled"),
+            )
+            .await
+    });
+
+    runner.first_started.notified().await;
+    cancelled.abort();
+    let _ = cancelled.await;
+
+    let fresh = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.start(
+            "camera-one".to_owned(),
+            SecretString::from("rtsp://provider.invalid/fresh"),
+        ),
+    )
+    .await
+    .expect("fresh attempt does not hang")
+    .expect("cancelled start releases the camera");
+
+    manager.stop(fresh.session_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn overlapping_retry_survives_cancellation_of_the_original_start() {
+    let runner = Arc::new(CancelOnceRunner::default());
+    let manager = LiveSessionManager::new_for_test(runner.clone(), 1).unwrap();
+    let cancelled_manager = manager.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelled_manager
+            .start(
+                "camera-one".to_owned(),
+                SecretString::from("rtsp://provider.invalid/cancelled"),
+            )
+            .await
+    });
+    runner.first_started.notified().await;
+
+    let retry_manager = manager.clone();
+    let retry_entered = Arc::new(Notify::new());
+    let retry_entered_task = Arc::clone(&retry_entered);
+    let retry = tokio::spawn(async move {
+        retry_entered_task.notify_one();
+        retry_manager
+            .start(
+                "camera-one".to_owned(),
+                SecretString::from("rtsp://provider.invalid/fresh"),
+            )
+            .await
+    });
+    retry_entered.notified().await;
+    cancelled.abort();
+    let _ = cancelled.await;
+
+    let fresh = tokio::time::timeout(Duration::from_secs(1), retry)
+        .await
+        .expect("overlapping retry does not hang")
+        .expect("retry task does not panic")
+        .expect("retry continues after the cancelled start releases the camera");
+
+    manager.stop(fresh.session_id).await.unwrap();
 }
 
 #[tokio::test]

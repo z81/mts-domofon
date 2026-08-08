@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { eventApi, type EventApi, type EventItem, type EventKind } from './eventApi'
 
-type JournalVariant = 'full' | 'compact' | 'calls'
+type JournalVariant = 'full' | 'compact'
 
 interface EventJournalProps {
   api?: EventApi
@@ -11,9 +11,11 @@ interface EventJournalProps {
 }
 
 type JournalRemote =
-  | { status: 'loading' }
-  | { status: 'error' }
-  | { status: 'success'; items: EventItem[]; page: number; hasMore: boolean }
+  | { status: 'loading'; flatId: string }
+  | { status: 'error'; flatId: string }
+  | { status: 'success'; flatId: string; items: EventItem[]; page: number; hasMore: boolean }
+
+const MAX_EVENT_PAGE = 20
 
 const callLabels: Record<NonNullable<EventItem['callOutcome']>, string> = {
   accepted: 'Принятый вызов',
@@ -28,11 +30,6 @@ const kindGlyphs: Record<EventKind, string> = {
   access: '⌑',
   camera: '◉',
   other: '•',
-}
-
-function eventTitle(event: EventItem): string {
-  if (event.kind === 'call' && event.callOutcome) return callLabels[event.callOutcome]
-  return event.title
 }
 
 function eventTime(value: string): string {
@@ -64,10 +61,14 @@ export function EventJournal({
   variant,
   onOpenArchive,
 }: EventJournalProps) {
-  const [filter, setFilter] = useState<EventKind | undefined>(variant === 'calls' ? 'call' : undefined)
-  const [requestedPage, setRequestedPage] = useState(0)
+  const [filter, setFilter] = useState<EventKind | undefined>()
+  const [pagination, setPagination] = useState({ flatId, page: 0 })
   const [reload, setReload] = useState(0)
-  const [remote, setRemote] = useState<JournalRemote>({ status: 'loading' })
+  const [remote, setRemote] = useState<JournalRemote>({ status: 'loading', flatId })
+  const requestedPage = pagination.flatId === flatId ? pagination.page : 0
+  const currentRemote: JournalRemote = remote.flatId === flatId
+    ? remote
+    : { status: 'loading', flatId }
   const range = useMemo(() => {
     const to = new Date()
     const from = new Date(to.getTime() - 30 * 24 * 60 * 60 * 1_000)
@@ -83,56 +84,61 @@ export function EventJournal({
       size,
       from: range.from,
       to: range.to,
-      kind: variant === 'calls' ? 'call' : filter,
+      kind: filter,
     }, controller.signal).then((page) => {
       if (controller.signal.aborted) return
       setRemote((previous) => ({
         status: 'success',
-        items: requestedPage > 0 && previous.status === 'success'
+        flatId,
+        items: requestedPage > 0 && previous.status === 'success' && previous.flatId === flatId
           ? [...previous.items, ...page.items]
           : page.items,
         page: page.page,
-        hasMore: page.hasMore,
+        hasMore: page.hasMore && page.page < MAX_EVENT_PAGE,
       }))
     }).catch(() => {
-      if (!controller.signal.aborted) setRemote({ status: 'error' })
+      if (!controller.signal.aborted) setRemote({ status: 'error', flatId })
     })
     return () => controller.abort()
-  }, [api, filter, flatId, range.from, range.to, reload, requestedPage, variant])
+  }, [api, filter, flatId, pagination.flatId, range.from, range.to, reload, requestedPage, variant])
 
   function chooseFilter(next: EventKind | undefined) {
+    if (filter === next) return
     setFilter(next)
-    setRequestedPage(0)
-    setRemote({ status: 'loading' })
+    setPagination({ flatId, page: 0 })
+    setRemote({ status: 'loading', flatId })
   }
 
-  const title = variant === 'calls' ? 'История звонков' : variant === 'compact' ? 'Последние события' : 'Журнал событий'
   const content = <>
     {variant === 'full' && <div className="event-filters" role="group" aria-label="Фильтр событий">
-      <button className={filter === undefined ? 'selected' : ''} onClick={() => chooseFilter(undefined)} type="button">Все события</button>
-      <button className={filter === 'call' ? 'selected' : ''} onClick={() => chooseFilter('call')} type="button" aria-label="Только звонки">Звонки</button>
-      <button className={filter === 'access' ? 'selected' : ''} onClick={() => chooseFilter('access')} type="button">Доступ</button>
-      <button className={filter === 'camera' ? 'selected' : ''} onClick={() => chooseFilter('camera')} type="button">Камеры</button>
+      <button aria-pressed={filter === undefined} className={filter === undefined ? 'selected' : ''} onClick={() => chooseFilter(undefined)} type="button">Все</button>
+      <button aria-pressed={filter === 'call'} className={filter === 'call' ? 'selected' : ''} onClick={() => chooseFilter('call')} type="button">Звонки</button>
+      <button aria-pressed={filter === 'access'} className={filter === 'access' ? 'selected' : ''} onClick={() => chooseFilter('access')} type="button">Доступ</button>
+      <button aria-pressed={filter === 'camera'} className={filter === 'camera' ? 'selected' : ''} onClick={() => chooseFilter('camera')} type="button">Камеры</button>
     </div>}
-    {remote.status === 'loading' && <div className="journal-state" role="status"><span className="loading-ring" />Загружаем журнал…</div>}
-    {remote.status === 'error' && <div className="journal-state" role={variant === 'full' ? 'alert' : undefined}>
-      <p>{variant === 'calls' ? 'Не удалось загрузить историю звонков' : 'Не удалось загрузить журнал событий'}</p>
-      <button className="secondary-button" onClick={() => { setRemote({ status: 'loading' }); setRequestedPage(0); setReload((value) => value + 1) }} type="button">Повторить</button>
+    {currentRemote.status === 'loading' && <div className="journal-state" role="status"><span className="loading-ring" />Загружаем журнал…</div>}
+    {currentRemote.status === 'error' && <div className="journal-state" role={variant === 'full' ? 'alert' : undefined}>
+      <p>Не удалось загрузить события</p>
+      <button className="secondary-button" onClick={() => { setRemote({ status: 'loading', flatId }); setPagination({ flatId, page: 0 }); setReload((value) => value + 1) }} type="button">Повторить</button>
     </div>}
-    {remote.status === 'success' && remote.items.length === 0 && <p className="empty-copy">
-      {variant === 'calls' ? 'История звонков пока пуста' : 'Событий за выбранный период нет'}
+    {currentRemote.status === 'success' && currentRemote.items.length === 0 && <p className="empty-copy">
+      Событий за выбранный период нет
     </p>}
-    {remote.status === 'success' && remote.items.length > 0 && <div className="event-list">
-      {remote.items.map((event, index) => {
-        const showDate = index === 0 || eventDate(remote.items[index - 1].occurredAt) !== eventDate(event.occurredAt)
+    {currentRemote.status === 'success' && currentRemote.items.length > 0 && <div className="event-list">
+      {currentRemote.items.map((event, index) => {
+        const showDate = index === 0 || eventDate(currentRemote.items[index - 1].occurredAt) !== eventDate(event.occurredAt)
         const duration = durationLabel(event.durationSeconds)
         return <div className="event-row-wrap" key={event.id}>
           {showDate && <h3 className="event-date">{eventDate(event.occurredAt)}</h3>}
           <article className={`event-row event-${event.kind}`}>
             <span className="event-glyph" aria-hidden="true">{kindGlyphs[event.kind]}</span>
             <span className="event-copy">
-              <b>{eventTitle(event)}</b>
-              <small>{[event.sourceLabel, duration].filter(Boolean).join(' · ') || 'Домофон'}</small>
+              <b>{event.title}</b>
+              <small>{[
+                event.sourceLabel,
+                event.callOutcome ? callLabels[event.callOutcome] : null,
+                duration,
+              ].filter(Boolean).join(' · ') || 'Домофон'}</small>
             </span>
             <time dateTime={event.occurredAt}>{eventTime(event.occurredAt)}</time>
             {event.cameraId && event.archiveAt && onOpenArchive && <button
@@ -143,18 +149,17 @@ export function EventJournal({
           </article>
         </div>
       })}
-      {remote.hasMore && variant !== 'compact' && <button className="secondary-button journal-more" onClick={() => setRequestedPage(remote.page + 1)} type="button">Показать ещё</button>}
+      {currentRemote.hasMore && variant !== 'compact' && <button className="secondary-button journal-more" onClick={() => setPagination({ flatId, page: currentRemote.page + 1 })} type="button">Показать ещё</button>}
     </div>}
   </>
 
   if (variant === 'full') {
     return <>
-      <section className="page-heading"><div><p className="eyebrow">События домофона</p><h1>{title}</h1><p>Реальные события выбранного объекта за последние 30 дней.</p></div></section>
+      <header className="screen-heading"><h1>События</h1></header>
       <section className="content-card event-journal">{content}</section>
     </>
   }
   return <section className={`content-card event-journal event-journal-${variant}`}>
-    <div className="section-title-row"><div><p className="eyebrow">{variant === 'calls' ? 'Звонки' : 'События'}</p><h2>{title}</h2></div></div>
     {content}
   </section>
 }

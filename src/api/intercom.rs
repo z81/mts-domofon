@@ -21,6 +21,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/devices", get(devices_scoped))
+        .route("/api/v1/cameras/stream", get(start_default_live))
         .route("/api/v1/cameras/{camera_id}/snapshot", get(snapshot_scoped))
         .route("/api/v1/cameras/{camera_id}/live", post(start_live))
         .route(
@@ -152,6 +153,70 @@ fn no_store(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
 
+async fn start_default_live(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Response<Body>, ApiError> {
+    let dashboard = load_dashboard(&state, request_id).await?;
+    let selected_flat = dashboard.selected_flat_id.as_ref().and_then(|selected| {
+        dashboard
+            .flats
+            .iter()
+            .any(|flat| &flat.id == selected)
+            .then(|| selected.clone())
+    });
+    let flat_id = selected_flat
+        .or_else(|| dashboard.flats.first().map(|flat| flat.id.clone()))
+        .ok_or_else(|| ApiError::new(request_id, linked_flat_not_found()))?;
+    let inventory = load_inventory(&state, request_id, flat_id.0.clone()).await?;
+    let camera = inventory
+        .cameras
+        .into_iter()
+        .find(|camera| matches!(camera.capabilities.live, Capability::Available))
+        .ok_or_else(|| ApiError::new(request_id, live_video_not_found()))?;
+    let view = start_live_session(&state, request_id, &flat_id, &camera.id).await?;
+    temporary_live_redirect(request_id, view)
+}
+
+async fn start_live_session(
+    state: &AppState,
+    request_id: RequestId,
+    flat_id: &FlatId,
+    camera_id: &str,
+) -> Result<crate::service::live::LiveSessionView, ApiError> {
+    let camera_key = format!("{:04x}{}{}", flat_id.0.len(), flat_id.0, camera_id);
+    let source = state
+        .live_source_provider()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .live_source(flat_id, camera_id)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?;
+    state
+        .live_session_manager()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .start(camera_key, source)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))
+}
+
+fn temporary_live_redirect(
+    request_id: RequestId,
+    view: crate::service::live::LiveSessionView,
+) -> Result<Response<Body>, ApiError> {
+    let location = format!("/api/v1/live/{}/index.m3u8", view.session_id);
+    if view.playlist_url != location {
+        return Err(ApiError::new(request_id, runtime_unavailable()));
+    }
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, location)
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .body(Body::empty())
+        .map_err(|_| ApiError::new(request_id, runtime_unavailable()))
+}
+
 async fn start_live(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -171,26 +236,9 @@ async fn start_live(
         .await
         .map_err(|error| ApiError::new(request_id, error))?;
     if !matches!(camera.capabilities.live, Capability::Available) {
-        return Err(ApiError::new(
-            request_id,
-            AppError::new(ErrorCode::NotFound, "Live video is unavailable.", false),
-        ));
+        return Err(ApiError::new(request_id, live_video_not_found()));
     }
-    let camera_key = format!("{:04x}{}{}", flat_id.0.len(), flat_id.0, camera_id);
-    let source = state
-        .live_source_provider()
-        .ok_or_else(runtime_unavailable)
-        .map_err(|error| ApiError::new(request_id, error))?
-        .live_source(&flat_id, &camera_id)
-        .await
-        .map_err(|error| ApiError::new(request_id, error))?;
-    let view = state
-        .live_session_manager()
-        .ok_or_else(runtime_unavailable)
-        .map_err(|error| ApiError::new(request_id, error))?
-        .start(camera_key, source)
-        .await
-        .map_err(|error| ApiError::new(request_id, error))?;
+    let view = start_live_session(&state, request_id, &flat_id, &camera_id).await?;
     Ok(Json(view))
 }
 
@@ -422,4 +470,12 @@ fn runtime_unavailable() -> AppError {
         "Runtime service is unavailable.",
         false,
     )
+}
+
+fn linked_flat_not_found() -> AppError {
+    AppError::new(ErrorCode::NotFound, "Linked flat was not found.", false)
+}
+
+fn live_video_not_found() -> AppError {
+    AppError::new(ErrorCode::NotFound, "Live video is unavailable.", false)
 }

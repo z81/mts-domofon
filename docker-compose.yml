@@ -1,0 +1,27 @@
+services:
+  domru-mts:
+    image: ${DOMRU_MTS_IMAGE:-ghcr.io/z81/mts-domofon:edge}
+    build: .
+    environment:
+      VDOME_BIND: 0.0.0.0:3000
+      VDOME_ALLOW_NON_LOOPBACK: "true"
+    ports:
+      - target: 3000
+        published: "${VDOME_HOST_PORT:-3000}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: volume
+        source: domru-mts-data
+        target: /var/lib/domru-mts
+    user: "10001:10001"
+    read_only: true
+    tmpfs: /tmp:rw,size=536870912,mode=1777,nodev,nosuid,noexec
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
+
+volumes:
+  domru-mts-data:

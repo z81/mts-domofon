@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Work only in `/Users/alex/dev/domru-mts`; use `/Users/alex/dev/domru-z81` `origin/main` as a structural reference, not as the MTS protocol implementation.
+- Keep the implementation standalone and do not reuse another provider's protocol or repository-specific structure.
 - Core provider hosts are exactly `https://gateway.vdome.mts.ru/`, `https://resident-rest.vdome.mts.ru`, and `https://webrtc.domofon.mts.ru/ws`; media hosts are admitted later only when returned for an owned camera and accepted by the media policy.
 - Production authentication is MTS ID/WebSSO for client `VDome`; do not make the obsolete direct SMS endpoints the default.
 - Upstream access, refresh, WebSSO, ID, device, phone, OTP, password, captcha, and media credentials must never appear in logs or frontend storage.

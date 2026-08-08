@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { AutoOpenPanel } from './AutoOpenPanel'
@@ -24,6 +24,14 @@ function api(overrides: Partial<CallApi>): CallApi {
 
 const disabled: AutoOpenPolicy = {
   mode: 'disabled', dismissAfterOpen: false,
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve
+  })
+  return { promise, resolve }
 }
 
 describe('auto-open panel', () => {
@@ -74,5 +82,56 @@ describe('auto-open panel', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось обновить автооткрытие')
     expect(screen.queryByRole('button', { name: 'Открыть следующий звонок' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Включить на 30 минут' })).not.toBeInTheDocument()
+  })
+
+  it('uses the shared mutation guard and follows controlled policy changes', async () => {
+    const user = userEvent.setup()
+    const pendingDisable = deferred<void>()
+    const disableAutoOpen = vi.fn(() => pendingDisable.promise)
+    const onMutationStart = vi.fn((controller: AbortController) => ({ signal: controller.signal }))
+    const onMutationEnd = vi.fn()
+    const onPolicyChange = vi.fn()
+    const armed: AutoOpenPolicy = { mode: 'next_call', dismissAfterOpen: false }
+    const callsApi = api({
+      createAutoOpenIntent: vi.fn(),
+      disableAutoOpen,
+      executeAutoOpenIntent: vi.fn(),
+      getAutoOpenPolicy: async () => armed,
+    })
+    const view = render(<AutoOpenPanel
+      api={callsApi}
+      mutationBusy={false}
+      onMutationEnd={onMutationEnd}
+      onMutationStart={onMutationStart}
+      onPolicyChange={onPolicyChange}
+      policy={armed}
+    />)
+
+    await user.click(screen.getByRole('button', { name: 'Выключить автооткрытие' }))
+    expect(onMutationStart).toHaveBeenCalledTimes(1)
+    expect(disableAutoOpen).toHaveBeenCalledTimes(1)
+
+    view.rerender(<AutoOpenPanel
+      api={callsApi}
+      mutationBusy
+      onMutationEnd={onMutationEnd}
+      onMutationStart={onMutationStart}
+      onPolicyChange={onPolicyChange}
+      policy={armed}
+    />)
+    expect(screen.getByRole('button', { name: 'Выключить автооткрытие' })).toBeDisabled()
+
+    await act(async () => pendingDisable.resolve())
+    expect(onMutationEnd).toHaveBeenCalledTimes(1)
+
+    view.rerender(<AutoOpenPanel
+      api={callsApi}
+      mutationBusy={false}
+      onMutationEnd={onMutationEnd}
+      onMutationStart={onMutationStart}
+      onPolicyChange={onPolicyChange}
+      policy={disabled}
+    />)
+    expect(screen.getByRole('heading', { name: 'Автооткрытие выключено' })).toBeVisible()
   })
 })

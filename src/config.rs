@@ -46,8 +46,19 @@ impl AppConfig {
         let bind: SocketAddr = value_or_default(&values, "VDOME_BIND", DEFAULT_BIND)
             .parse()
             .map_err(ConfigError::InvalidBind)?;
-        if !bind.ip().is_loopback() {
-            return Err(ConfigError::BindMustBeLoopback);
+        let allow_non_loopback = match values.get("VDOME_ALLOW_NON_LOOPBACK").map(String::as_str) {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => return Err(ConfigError::InvalidAllowNonLoopback),
+        };
+        match (
+            bind.ip().is_loopback(),
+            bind.ip().is_unspecified(),
+            allow_non_loopback,
+        ) {
+            (true, _, false) | (false, true, true) => {}
+            (true, _, true) => return Err(ConfigError::AllowNonLoopbackRequiresWildcard),
+            _ => return Err(ConfigError::BindNotAllowed),
         }
         let data_dir = PathBuf::from(value_or_default(
             &values,
@@ -90,10 +101,12 @@ impl AppConfig {
 pub enum ConfigError {
     #[error("invalid VDOME_BIND: {0}")]
     InvalidBind(#[source] AddrParseError),
-    #[error(
-        "VDOME_BIND must use a loopback IP address until local API authentication is configured"
-    )]
-    BindMustBeLoopback,
+    #[error("invalid VDOME_ALLOW_NON_LOOPBACK")]
+    InvalidAllowNonLoopback,
+    #[error("VDOME_ALLOW_NON_LOOPBACK requires wildcard VDOME_BIND")]
+    AllowNonLoopbackRequiresWildcard,
+    #[error("VDOME_BIND is not allowed")]
+    BindNotAllowed,
     #[error("invalid provider URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
     #[error("provider URL must use https")]

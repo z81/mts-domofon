@@ -1,0 +1,328 @@
+name: Container
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/z81/mts-domofon
+  DOCKER_METADATA_SHORT_SHA_LENGTH: 12
+
+jobs:
+  quality:
+    name: Source quality
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.96
+        run: >-
+          rustup toolchain install 1.96 --profile minimal
+          --component rustfmt --component clippy
+      - name: Check Rust formatting
+        run: cargo +1.96 fmt --all -- --check
+      - name: Lint Rust
+        run: cargo +1.96 clippy --all-targets --all-features -- -D warnings
+      - name: Test Rust
+        run: cargo +1.96 test --all-features
+      - name: Set up Node.js 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+      - name: Test frontend
+        run: npm --prefix frontend test
+      - name: Lint frontend
+        run: npm --prefix frontend run lint
+      - name: Build frontend
+        run: npm --prefix frontend run build
+
+  smoke-amd64:
+    name: Runtime smoke (amd64)
+    runs-on: ubuntu-24.04
+    env:
+      DOMRU_MTS_IMAGE: domru-mts:ci-amd64
+      DOMRU_MTS_SMOKE_PROJECT: domru-mts-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      EXPORT_CONTAINER: domru-mts-export-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Create ignored build-context canaries
+        run: |
+          env_canary="env-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
+          data_canary="data-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
+          npm_canary="npm-canary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
+          mkdir -p .env data
+          printf '%s\n' "$env_canary" >.env/container-canary
+          printf '%s\n' "$data_canary" >data/container-canary
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$npm_canary" >frontend/.npmrc
+          printf 'ENV_CANARY=%s\n' "$env_canary" >>"$GITHUB_ENV"
+          printf 'DATA_CANARY=%s\n' "$data_canary" >>"$GITHUB_ENV"
+          printf 'NPM_CANARY=%s\n' "$npm_canary" >>"$GITHUB_ENV"
+      - name: Build amd64 image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.DOMRU_MTS_IMAGE }}
+          build-args: |
+            OCI_REVISION=${{ github.sha }}
+            OCI_VERSION=ci-amd64
+            OCI_CREATED=1970-01-01T00:00:00Z
+      - name: Run effective-runtime smoke test
+        run: scripts/container-smoke.sh
+      - name: Audit image, layers, exported filesystem, and service logs
+        run: |
+          assert_absent() {
+            description=$1
+            shift
+            if grep "$@"; then
+              echo "$description" >&2
+              exit 1
+            else
+              grep_status=$?
+              if [ "$grep_status" -ne 1 ]; then
+                echo "grep failed with status $grep_status while checking: $description" >&2
+                return "$grep_status"
+              fi
+            fi
+          }
+
+          audit_dir="$RUNNER_TEMP/container-smoke-audit"
+          mkdir -p "$audit_dir/image-save" "$audit_dir/exported-root"
+
+          docker image inspect "$DOMRU_MTS_IMAGE" >"$audit_dir/image-inspect.json"
+          docker image history --no-trunc "$DOMRU_MTS_IMAGE" >"$audit_dir/image-history.txt"
+          assert_absent 'Canary found in image inspect or history' \
+            -aF -e "$ENV_CANARY" -e "$DATA_CANARY" -e "$NPM_CANARY" \
+            "$audit_dir/image-inspect.json" "$audit_dir/image-history.txt"
+
+          docker image save --output "$audit_dir/image.tar" "$DOMRU_MTS_IMAGE"
+          tar -xf "$audit_dir/image.tar" -C "$audit_dir/image-save"
+          assert_absent 'Canary found in saved image layers' \
+            -raF -e "$ENV_CANARY" -e "$DATA_CANARY" -e "$NPM_CANARY" \
+            "$audit_dir/image-save"
+
+          docker create --platform linux/amd64 --name "$EXPORT_CONTAINER" "$DOMRU_MTS_IMAGE"
+          docker export --output "$audit_dir/rootfs.tar" "$EXPORT_CONTAINER"
+          tar -xf "$audit_dir/rootfs.tar" -C "$audit_dir/exported-root"
+          assert_absent 'Canary found in exported image filesystem' \
+            -raF -e "$ENV_CANARY" -e "$DATA_CANARY" -e "$NPM_CANARY" \
+            "$audit_dir/exported-root"
+          docker rm "$EXPORT_CONTAINER"
+
+          docker compose --project-name "$DOMRU_MTS_SMOKE_PROJECT" \
+            up --no-build --wait --wait-timeout 90 --detach domru-mts
+          docker compose --project-name "$DOMRU_MTS_SMOKE_PROJECT" \
+            logs --no-color domru-mts >"$audit_dir/service.log"
+          assert_absent 'Canary found in service logs' \
+            -aF -e "$ENV_CANARY" -e "$DATA_CANARY" -e "$NPM_CANARY" \
+            "$audit_dir/service.log"
+      - name: Clean up smoke resources
+        if: always()
+        run: |
+          docker compose --project-name "$DOMRU_MTS_SMOKE_PROJECT" \
+            down --volumes --remove-orphans || true
+          docker rm --force "$EXPORT_CONTAINER" 2>/dev/null || true
+          docker image rm "$DOMRU_MTS_IMAGE" 2>/dev/null || true
+          rm -f .env/container-canary data/container-canary frontend/.npmrc
+          rm -rf "$RUNNER_TEMP/container-smoke-audit"
+
+  smoke-arm64:
+    name: Image smoke (arm64)
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    env:
+      ARM64_IMAGE: domru-mts:ci-arm64
+      ARM64_CONTAINER: domru-mts-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+      ARM64_VOLUME: domru-mts-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Build arm64 image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: ${{ env.ARM64_IMAGE }}
+          build-args: |
+            OCI_REVISION=${{ github.sha }}
+            OCI_VERSION=ci-arm64
+            OCI_CREATED=1970-01-01T00:00:00Z
+      - name: Check arm64 image under emulation
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' "$ARM64_IMAGE")" = '10001:10001'
+          docker volume create "$ARM64_VOLUME"
+          docker run --detach --platform linux/arm64 \
+            --name "$ARM64_CONTAINER" \
+            --read-only \
+            --tmpfs /tmp:rw,nodev,nosuid,noexec,size=536870912 \
+            --mount "type=volume,source=$ARM64_VOLUME,target=/var/lib/domru-mts" \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            "$ARM64_IMAGE"
+
+          for attempt in $(seq 1 30); do
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$ARM64_CONTAINER")"
+            [ "$health" = healthy ] && break
+            [ "$health" != unhealthy ] || {
+              docker logs "$ARM64_CONTAINER" >&2
+              exit 1
+            }
+            sleep 2
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' "$ARM64_CONTAINER")" = healthy
+          test "$(docker exec "$ARM64_CONTAINER" id -u)" = 10001
+          docker exec "$ARM64_CONTAINER" sh -eu -c '
+            ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq "[[:space:]]libx264[[:space:]]"
+            ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq "[[:space:]]aac[[:space:]]"
+            ffmpeg -hide_banner -muxers 2>/dev/null | grep -Eq "[[:space:]]hls[[:space:]]"
+            ffmpeg -hide_banner -demuxers 2>/dev/null | grep -Eq "[[:space:]]concat[[:space:]]"
+            ! command -v cargo >/dev/null 2>&1
+            ! command -v node >/dev/null 2>&1
+          '
+      - name: Clean up arm64 resources
+        if: always()
+        run: |
+          docker rm --force "$ARM64_CONTAINER" 2>/dev/null || true
+          docker volume rm "$ARM64_VOLUME" 2>/dev/null || true
+          docker image rm "$ARM64_IMAGE" 2>/dev/null || true
+
+  publish:
+    name: Publish multi-platform image
+    needs: [quality, smoke-amd64, smoke-arm64]
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        id: release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          prerelease_id='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          build_id='[0-9A-Za-z-]+'
+          semver_re="^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-${prerelease_id}(\\.${prerelease_id})*)?(\\+${build_id}(\\.${build_id})*)?$"
+          [[ "$RELEASE_TAG" =~ $semver_re ]] || {
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          }
+          full_tag="${RELEASE_TAG#v}"
+          full_tag="${full_tag//+/-}"
+          printf 'full_tag=%s\n' "$full_tag" >>"$GITHUB_OUTPUT"
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: latest=auto
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.release.outputs.full_tag }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=sha,format=short,prefix=sha-
+      - name: Assert complete release tag metadata
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          METADATA_TAGS: ${{ steps.meta.outputs.tags }}
+          FULL_RELEASE_TAG: ${{ steps.release.outputs.full_tag }}
+        run: |
+          expected_tag="$IMAGE_NAME:$FULL_RELEASE_TAG"
+          grep -Fxq "$expected_tag" <<<"$METADATA_TAGS" || {
+            echo "Metadata is missing complete release tag: $expected_tag" >&2
+            exit 1
+          }
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        id: publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            OCI_REVISION=${{ github.sha }}
+            OCI_VERSION=${{ steps.meta.outputs.version }}
+            OCI_CREATED=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          cache-from: type=gha,scope=container
+          cache-to: type=gha,mode=max,scope=container
+          provenance: mode=max
+          sbom: true
+      - name: Attest published image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Assert published platforms
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          manifest_json="$(docker buildx imagetools inspect \
+            "$IMAGE_NAME@$IMAGE_DIGEST" --format '{{json .Manifest}}')"
+          printf '%s\n' "$manifest_json" | jq -e '
+            [.manifests[].platform | "\(.os)/\(.architecture)"] as $platforms
+            | ($platforms | index("linux/amd64")) != null
+              and ($platforms | index("linux/arm64")) != null
+          '
