@@ -937,7 +937,8 @@ describe('live intercom dashboard', () => {
     await user.click(screen.getByRole('button', { name: 'Открыть запись камеры' }))
 
     expect(await screen.findByRole('heading', { name: 'Архив' })).toBeVisible()
-    expect(screen.getByLabelText('Начало просмотра')).toHaveValue('2026-08-07T12:30')
+    const archiveStart = screen.getByLabelText('Начало просмотра') as HTMLInputElement
+    expect(new Date(archiveStart.value).toISOString()).toBe('2026-08-07T09:30:00.000Z')
     expect(getArchiveDistribution).toHaveBeenCalledWith('flat-81', 'camera-1', expect.any(AbortSignal))
     await user.click(screen.getByRole('button', { name: 'Назад' }))
     expect(await screen.findByRole('heading', { name: 'События' })).toBeVisible()
