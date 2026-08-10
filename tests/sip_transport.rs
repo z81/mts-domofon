@@ -9,7 +9,7 @@ use domru_mts::calls::sip::{
 use url::Url;
 
 #[test]
-fn wss_config_requires_secure_websocket_and_sip_subprotocol() {
+fn wss_config_requires_secure_websocket_and_builds_a_safe_handshake() {
     for url in ["ws://sip.example/ws", "https://sip.example/ws"] {
         assert!(
             WssTransportConfig::new(Url::parse(url).expect("URL"), SipLimits::default()).is_err()
@@ -29,9 +29,15 @@ fn wss_config_requires_secure_websocket_and_sip_subprotocol() {
             .and_then(|value| value.to_str().ok()),
         Some("sip")
     );
+    assert_eq!(
+        request
+            .headers()
+            .get("Origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://secret-host.example")
+    );
     assert!(request.headers().get("Authorization").is_none());
     assert!(request.headers().get("Cookie").is_none());
-    assert!(request.headers().get("Origin").is_none());
 
     let diagnostics = format!("{config:?}");
     assert!(!diagnostics.contains("secret-host"));

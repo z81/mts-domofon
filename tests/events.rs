@@ -159,6 +159,46 @@ async fn provider_uses_the_apk_event_contract_and_retains_only_normalization_evi
     );
 }
 
+#[tokio::test]
+async fn provider_accepts_the_current_string_dial_status() {
+    // Catches treating the current string-valued dialStatus as the older nested object.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{
+                "id": "event-current-call",
+                "created": "2025-01-02T03:04:05.678",
+                "payload": {
+                    "peers": [{"dialStatus": "MISSED", "opened": false}]
+                }
+            }],
+            "first": true,
+            "last": true,
+            "empty": false,
+            "number": 0,
+            "numberOfElements": 1,
+            "size": 20,
+            "totalElements": 1,
+            "totalPages": 1
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let page = MtsEventProvider::new(client(&server))
+        .page(ProviderEventQuery {
+            page: 0,
+            size: 20,
+            from: Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap(),
+            to: Utc.with_ymd_and_hms(2025, 1, 2, 23, 59, 59).unwrap(),
+        })
+        .await
+        .expect("current event schema should deserialize");
+
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].status.as_deref(), Some("missed"));
+}
+
 #[derive(Clone)]
 struct OwnedPropertyProvider;
 
