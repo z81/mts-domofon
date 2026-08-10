@@ -211,8 +211,19 @@ struct PeerDto {
 }
 
 #[derive(Deserialize)]
-struct DialStatusDto {
-    name: Option<String>,
+#[serde(untagged)]
+enum DialStatusDto {
+    Text(String),
+    Details { name: Option<String> },
+}
+
+impl DialStatusDto {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Text(value) => Some(value),
+            Self::Details { name } => name.as_deref(),
+        }
+    }
 }
 
 impl TryFrom<EventDto> for ProviderEvent {
@@ -305,7 +316,8 @@ impl TryFrom<EventDto> for ProviderEvent {
             .as_ref()
             .and_then(|peers| peers.first())
             .and_then(|peer| peer.dial_status.as_ref())
-            .and_then(|status| status.name.clone());
+            .and_then(DialStatusDto::as_str)
+            .map(ToOwned::to_owned);
         let status = payload
             .status
             .as_ref()
