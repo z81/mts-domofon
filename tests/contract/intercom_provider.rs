@@ -99,13 +99,17 @@ async fn unfiltered_access_points_discover_and_merge_advertised_door_categories(
         requests[0].url.path(),
         "/vdome-smart-facade/devices/api/v1/flats/flat%20%2F%3F%23&+/available"
     );
+    let mut category_queries = requests[1..]
+        .iter()
+        .map(|request| request.url.query().unwrap())
+        .collect::<Vec<_>>();
+    category_queries.sort_unstable();
     assert_eq!(
-        requests[1].url.query(),
-        Some("flatId=flat+%2F%3F%23%26%2B&category=accessPoint&page=0&size=100&sort=name%2Casc")
-    );
-    assert_eq!(
-        requests[2].url.query(),
-        Some("flatId=flat+%2F%3F%23%26%2B&category=drivePoint&page=0&size=100&sort=name%2Casc")
+        category_queries,
+        vec![
+            "flatId=flat+%2F%3F%23%26%2B&category=accessPoint&page=0&size=100&sort=name%2Casc",
+            "flatId=flat+%2F%3F%23%26%2B&category=drivePoint&page=0&size=100&sort=name%2Casc"
+        ]
     );
 }
 
@@ -1437,20 +1441,13 @@ async fn camera_lookup_propagates_camera_source_errors_without_specific_or_unown
             "case {case}"
         );
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2, "case {case}");
+        assert_eq!(requests.len(), 1, "case {case}");
         let mut paths = requests
             .iter()
             .map(|request| request.url.path())
             .collect::<Vec<_>>();
         paths.sort_unstable();
-        assert_eq!(
-            paths,
-            vec![
-                CAMERA_PATH,
-                "/vdome-smart-facade/devices/api/v1/flats/flat-owned/available"
-            ],
-            "case {case}"
-        );
+        assert_eq!(paths, vec![CAMERA_PATH], "case {case}");
         assert!(requests.iter().all(|request| {
             request.url.path().contains("flat-owned")
                 || request

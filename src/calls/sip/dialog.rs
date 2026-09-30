@@ -59,7 +59,9 @@ pub struct SipDialog {
     remote_target: String,
     local_contact: String,
     local_sent_by: String,
+    route_set: Vec<String>,
     offer_sdp: Vec<u8>,
+    answer_response: Option<SipResponse>,
     next_local_cseq: u32,
 }
 
@@ -99,6 +101,15 @@ impl SipDialog {
             .ok_or(DialogError::MissingHeader)?
             .to_owned();
         let remote_target = contact_uri(required(invite, "Contact")?)?;
+        let route_set = invite
+            .headers()
+            .get_all("Record-Route")
+            .map(split_routes)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(str::to_owned)
+            .collect();
 
         Ok(Self {
             id: SipDialogId {
@@ -115,7 +126,9 @@ impl SipDialog {
             remote_target,
             local_contact: local_contact.to_owned(),
             local_sent_by: local_sent_by.to_owned(),
+            route_set,
             offer_sdp: invite.body().to_vec(),
+            answer_response: None,
             next_local_cseq: 1,
         })
     }
@@ -149,8 +162,35 @@ impl SipDialog {
         }
         let mut response = self.invite_response(200, "OK")?;
         response.set_body("application/sdp", sdp_answer)?;
+        self.answer_response = Some(response.clone());
         self.state = DialogState::Answered;
         Ok(response)
+    }
+
+    pub fn retransmit_answer(&self) -> Result<&SipResponse, DialogError> {
+        if self.state != DialogState::Answered {
+            return Err(DialogError::InvalidState);
+        }
+        self.answer_response
+            .as_ref()
+            .ok_or(DialogError::InvalidState)
+    }
+
+    pub fn on_invite_retransmission(
+        &self,
+        invite: &SipRequest,
+    ) -> Result<SipResponse, DialogError> {
+        if invite.method() != &SipMethod::Invite
+            || !self.matches_initial_transaction(invite, "INVITE")
+        {
+            return Err(DialogError::SessionMismatch);
+        }
+        if self.state == DialogState::Ringing {
+            return self.ringing();
+        }
+        self.answer_response
+            .clone()
+            .ok_or(DialogError::InvalidState)
     }
 
     pub fn reject(&mut self) -> Result<SipResponse, DialogError> {
@@ -208,12 +248,34 @@ impl SipDialog {
         if self.state != DialogState::Established {
             return Err(DialogError::InvalidState);
         }
+        self.build_bye()
+    }
+
+    pub fn answer_ack_timeout(&mut self) -> Result<SipRequest, DialogError> {
+        if self.state != DialogState::Answered {
+            return Err(DialogError::InvalidState);
+        }
+        self.build_bye()
+    }
+
+    fn build_bye(&mut self) -> Result<SipRequest, DialogError> {
         let cseq = self.next_local_cseq;
         self.next_local_cseq = self
             .next_local_cseq
             .checked_add(1)
             .ok_or(DialogError::SequenceExhausted)?;
-        let mut request = SipRequest::new(SipMethod::Bye, self.remote_target.clone())?;
+        let (target, routes) = match self.route_set.first() {
+            Some(first) if !has_loose_route(first)? => {
+                let mut routes = self.route_set[1..].to_vec();
+                routes.push(format!("<{}>", self.remote_target));
+                (contact_uri(first)?, routes)
+            }
+            _ => (self.remote_target.clone(), self.route_set.clone()),
+        };
+        let mut request = SipRequest::new(SipMethod::Bye, target)?;
+        for route in routes {
+            request.headers_mut().push("Route", &route)?;
+        }
         request.headers_mut().push(
             "Via",
             &format!(
@@ -277,6 +339,11 @@ impl SipDialog {
         response
             .headers_mut()
             .push("CSeq", required(request, "CSeq")?)?;
+        if request.method() == &SipMethod::Invite && (101..300).contains(&status) {
+            for route in request.headers().get_all("Record-Route") {
+                response.headers_mut().push("Record-Route", route)?;
+            }
+        }
         response
             .headers_mut()
             .push("Contact", &self.local_contact)?;
@@ -370,14 +437,63 @@ fn with_tag(value: &str, tag: &str) -> Result<String, DialogError> {
 fn contact_uri(value: &str) -> Result<String, DialogError> {
     validate_header_value(value)?;
     let value = value.trim();
-    let uri = value
-        .strip_prefix('<')
-        .and_then(|inner| inner.strip_suffix('>'))
-        .ok_or(DialogError::InvalidContact)?;
-    if !uri.starts_with("sip:") || uri.bytes().any(|byte| byte.is_ascii_whitespace()) {
+    let uri = if let Some((_, inner)) = value.split_once('<') {
+        inner.split_once('>').map(|(uri, _)| uri)
+    } else {
+        Some(value)
+    }
+    .ok_or(DialogError::InvalidContact)?;
+    if !(uri.starts_with("sip:") || uri.starts_with("sips:"))
+        || uri.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
         return Err(DialogError::InvalidContact);
     }
     Ok(uri.to_owned())
+}
+
+fn has_loose_route(route: &str) -> Result<bool, DialogError> {
+    Ok(contact_uri(route)?.split(';').skip(1).any(|parameter| {
+        parameter
+            .split_once('=')
+            .map_or(parameter, |(name, _)| name)
+            .eq_ignore_ascii_case("lr")
+    }))
+}
+
+fn split_routes(value: &str) -> Result<Vec<&str>, DialogError> {
+    let mut routes = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut bracketed = false;
+    for (index, byte) in value.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted {
+            match byte {
+                b'<' => bracketed = true,
+                b'>' => bracketed = false,
+                b',' if !bracketed => {
+                    let route = value[start..index].trim();
+                    contact_uri(route)?;
+                    routes.push(route);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    if quoted || escaped || bracketed {
+        return Err(DialogError::InvalidContact);
+    }
+    let route = value[start..].trim();
+    contact_uri(route)?;
+    routes.push(route);
+    Ok(routes)
 }
 
 fn is_sdp_content_type(value: &str) -> bool {

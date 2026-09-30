@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
@@ -34,6 +34,9 @@ const MAX_RUNTIME_DURATION: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_MAX_BOOTSTRAP_AGE: Duration = Duration::from_secs(3 * 60);
 const DEFAULT_MAX_FUTURE_SKEW: Duration = Duration::from_secs(60);
 const MAX_RECENT_BOOTSTRAPS: usize = 32;
+const SIP_T1: Duration = Duration::from_millis(500);
+const SIP_T2: Duration = Duration::from_secs(4);
+const SIP_ACK_TIMEOUT: Duration = Duration::from_secs(32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -396,7 +399,10 @@ impl SipCallRuntime {
             .map_err(|_| RuntimeError::Service)?;
 
         let ringing_timeout = sleep(self.config.ringing_timeout);
-        tokio::pin!(ringing_timeout);
+        let answer_retry = sleep(SIP_T1);
+        let answer_ack_timeout = sleep(SIP_ACK_TIMEOUT);
+        tokio::pin!(ringing_timeout, answer_retry, answer_ack_timeout);
+        let mut answer_retry_interval = SIP_T1;
         let mut pending_hangup = None;
         loop {
             tokio::select! {
@@ -415,6 +421,7 @@ impl SipCallRuntime {
                     let Some(command) = command else {
                         return Err(RuntimeError::CommandChannelClosed);
                     };
+                    let previous_state = dialog.state();
                     let command_result = self.handle_command(
                         command,
                         bootstrap,
@@ -424,6 +431,13 @@ impl SipCallRuntime {
                         cancellation,
                         &mut pending_hangup,
                     ).await;
+                    if previous_state == DialogState::Ringing
+                        && dialog.state() == DialogState::Answered
+                    {
+                        let now = Instant::now();
+                        answer_retry.as_mut().reset(now + SIP_T1);
+                        answer_ack_timeout.as_mut().reset(now + SIP_ACK_TIMEOUT);
+                    }
                     match command_result {
                         Ok(ActorControl::Continue) => {}
                         Ok(ActorControl::Terminate) => return Ok(()),
@@ -462,6 +476,20 @@ impl SipCallRuntime {
                     transport.send(&SipMessage::Response(dialog.timeout()?)).await?;
                     let _ = service.remote_ended(&call_id, CallEndReason::Timeout).await;
                     return Ok(());
+                }
+                () = &mut answer_ack_timeout, if dialog.state() == DialogState::Answered => {
+                    let bye = dialog.answer_ack_timeout()?;
+                    transport.send(&SipMessage::Request(bye)).await?;
+                    if let Some(pending) = pending_hangup.take() {
+                        let _ = pending.response.send(Err(command_timeout()));
+                    }
+                    let _ = service.remote_ended(&call_id, CallEndReason::Timeout).await;
+                    return Ok(());
+                }
+                () = &mut answer_retry, if dialog.state() == DialogState::Answered => {
+                    transport.send(&SipMessage::Response(dialog.retransmit_answer()?.clone())).await?;
+                    answer_retry_interval = answer_retry_interval.saturating_mul(2).min(SIP_T2);
+                    answer_retry.as_mut().reset(Instant::now() + answer_retry_interval);
                 }
             }
         }
@@ -613,12 +641,8 @@ impl SipCallRuntime {
                     .await?;
             }
             SipMethod::Invite => {
-                if dialog.state() == DialogState::Ringing
-                    && request.headers().get("Call-ID") == Some(dialog.id().call_id())
-                {
-                    transport
-                        .send(&SipMessage::Response(dialog.ringing()?))
-                        .await?;
+                if let Ok(response) = dialog.on_invite_retransmission(&request) {
+                    transport.send(&SipMessage::Response(response)).await?;
                 } else if let Ok(mut extra) = SipDialog::from_invite(
                     &request,
                     local_contact,
@@ -676,6 +700,16 @@ impl SipCallRuntime {
                     }
                 };
                 transport.send(&SipMessage::Response(rejected)).await?;
+                let actions = self.actions.clone();
+                let call_session_id = bootstrap.call_session_id().clone();
+                tokio::spawn(async move {
+                    if let Err(error) = actions
+                        .action(&call_session_id, RemoteCallAction::Unwanted)
+                        .await
+                    {
+                        tracing::warn!(code = ?error.code, "declined call could not notify other devices");
+                    }
+                });
                 let _ = response.send(Ok(()));
                 Ok(ActorControl::Terminate)
             }

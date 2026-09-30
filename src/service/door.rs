@@ -7,7 +7,7 @@ use crate::{
     domain::{DoorOpenIntentId, DoorOpenIntentView, FlatId},
     error::{AppError, ErrorCode},
     provider::mts::door::DoorOpenProvider,
-    service::{devices::DeviceService, property::PropertyService},
+    service::{calls::CallService, devices::DeviceService, property::PropertyService},
 };
 
 const DEFAULT_INTENT_TTL: Duration = Duration::from_secs(30);
@@ -144,15 +144,39 @@ impl DoorOpenService {
     }
 
     pub async fn confirm(&self, intent_id: &DoorOpenIntentId) -> Result<(), AppError> {
+        self.confirm_with_calls(intent_id, None).await
+    }
+
+    pub async fn confirm_with_calls(
+        &self,
+        intent_id: &DoorOpenIntentId,
+        call_service: Option<&Arc<CallService>>,
+    ) -> Result<(), AppError> {
         let now = self.clock.now();
         let intent = {
             let mut pending = self.pending.lock().await;
             pending.retain(|_, intent| intent.expires_at > now);
             pending.remove(intent_id).ok_or_else(intent_not_found)?
         };
+        let ringing_call = if let Some(calls) = call_service {
+            calls
+                .ringing_call_for_intercom(&intent.access_point_id)
+                .await
+                .map(|(id, revision)| (Arc::clone(calls), id, revision))
+        } else {
+            None
+        };
         self.provider
             .open(&intent.access_point_id, &intent.lock_number)
-            .await
+            .await?;
+        if let Some((calls, id, revision)) = ringing_call {
+            tokio::spawn(async move {
+                if let Err(error) = calls.decline(&id, revision).await {
+                    tracing::warn!(code = ?error.code, "opened door could not dismiss its ringing call");
+                }
+            });
+        }
+        Ok(())
     }
 }
 

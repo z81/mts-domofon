@@ -44,7 +44,9 @@ impl PropertyService {
     pub async fn dashboard(&self) -> Result<PropertyDashboard, AppError> {
         let (mut flats, selected_flat_id, call_settings) = {
             let mut state = self.state.lock().await;
-            let flats = self.provider.flats().await?;
+            let (flats, call_settings) =
+                tokio::join!(self.provider.flats(), self.provider.call_settings());
+            let flats = flats?;
             if !state.selection_loaded {
                 state.selected_flat_id = self.store.load_selected_flat().await?;
                 state.selection_loaded = true;
@@ -57,7 +59,7 @@ impl PropertyService {
                 self.store.clear_selected_flat().await?;
                 state.selected_flat_id = None;
             }
-            let call_settings = match self.provider.call_settings().await {
+            let call_settings = match call_settings {
                 Ok(mode) => CallSettingsStatus::Available(CallSettings {
                     mode,
                     revision: state.call_revision,
@@ -70,8 +72,10 @@ impl PropertyService {
         let call_settings_available = matches!(call_settings, CallSettingsStatus::Available(_));
         let mut diagnostics = BTreeMap::new();
         for flat in &mut flats {
-            let availability = self.provider.availability(&flat.id).await;
-            let services = self.provider.services(&flat.id).await;
+            let (availability, services) = tokio::join!(
+                self.provider.availability(&flat.id),
+                self.provider.services(&flat.id)
+            );
             if let Ok(services) = &services {
                 if services.has_app_call() {
                     flat.capabilities.calls = Capability::Available;

@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use reqwest::Method;
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
@@ -200,11 +201,17 @@ impl DeviceProvider for MtsDeviceProvider {
             let mut remaining_items = MAX_ITEMS;
             let mut successful_categories = 0_usize;
             let mut category_error = None;
-            for category in &categories {
-                match self
-                    .fold_access_point_category(flat, category, remaining_items)
-                    .await
-                {
+            let sources = join_all(
+                categories
+                    .iter()
+                    .map(|category| self.fold_access_point_category(flat, category, MAX_ITEMS)),
+            )
+            .await;
+            for source in sources {
+                match source {
+                    Ok((_, raw_count)) if raw_count > remaining_items => {
+                        category_error.get_or_insert_with(schema_error);
+                    }
                     Ok((source, raw_count)) => {
                         let mut candidate = merged.clone();
                         match merge_access_point_map(&mut candidate, source) {

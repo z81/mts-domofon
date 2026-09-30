@@ -316,6 +316,20 @@ impl CallService {
             .transpose()
     }
 
+    pub(crate) async fn ringing_call_for_intercom(
+        &self,
+        intercom_id: &str,
+    ) -> Option<(CallId, CallRevision)> {
+        let state = self.state.lock().await;
+        let current = state.current.as_ref()?;
+        if current.intercom_id.expose_secret() != intercom_id
+            || !matches!(current.session.phase(), CallPhase::Ringing)
+        {
+            return None;
+        }
+        Some((current.session.id().clone(), current.session.revision()))
+    }
+
     pub async fn answer(
         &self,
         id: &CallId,

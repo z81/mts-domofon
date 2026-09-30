@@ -166,7 +166,7 @@ async fn confirm_intent(
     intent_id: &DoorOpenIntentId,
 ) -> Result<(), ApiError> {
     service(state, request_id)?
-        .confirm(intent_id)
+        .confirm_with_calls(intent_id, state.call_service())
         .await
         .map_err(|error| ApiError::new(request_id, error))
 }

@@ -425,6 +425,15 @@ async fn call_open_provider_sends_call_scoped_header_without_a_lock_number() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/domofon/api/intercom/v1/calls/session-private-99/action/unwanted",
+        ))
+        .and(wire_header("content-length", "0"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
     let provider = MtsCallOpenProvider::new(provider_client(&server));
 
     provider
@@ -434,6 +443,19 @@ async fn call_open_provider_sends_call_scoped_header_without_a_lock_number() {
         )
         .await
         .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server.received_requests().await.unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("one peer notification after the confirmed lock request");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 
     let request = &server.received_requests().await.unwrap()[0];
     assert_eq!(

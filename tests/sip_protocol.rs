@@ -299,6 +299,11 @@ fn dialog_request(method: SipMethod, cseq_method: &str, to: &str) -> SipRequest 
         ("Call-ID", "dialog-call-123"),
         ("CSeq", &format!("42 {cseq_method}")),
         ("Contact", "<sip:door@server.example;transport=wss>"),
+        (
+            "Record-Route",
+            "\"Edge, proxy\" <sip:edge.example;lr;transport=wss>, <sip:proxy.example;lr>",
+        ),
+        ("Record-Route", "<sip:other.example;lr>"),
     ] {
         request
             .headers_mut()
@@ -346,6 +351,16 @@ fn incoming_invite_retains_bounded_sdp_and_builds_correlated_ringing() {
     );
     assert_eq!(ringing.headers().get("Call-ID"), Some("dialog-call-123"));
     assert_eq!(ringing.headers().get("CSeq"), Some("42 INVITE"));
+    assert_eq!(
+        ringing
+            .headers()
+            .get_all("Record-Route")
+            .collect::<Vec<_>>(),
+        vec![
+            "\"Edge, proxy\" <sip:edge.example;lr;transport=wss>, <sip:proxy.example;lr>",
+            "<sip:other.example;lr>",
+        ]
+    );
     assert!(
         ringing
             .headers()
@@ -371,6 +386,23 @@ fn dialog_builds_answer_and_each_local_ringing_disposition() {
     );
     assert_eq!(answer.body(), SDP.as_bytes());
     assert_eq!(accepted.state(), DialogState::Answered);
+    assert_eq!(accepted.retransmit_answer().expect("retry"), &answer);
+    let mut repeated_invite =
+        dialog_request(SipMethod::Invite, "INVITE", "<sip:resident@sip.example>");
+    repeated_invite
+        .set_body("application/sdp", SDP.as_bytes())
+        .expect("SDP");
+    assert_eq!(
+        accepted
+            .on_invite_retransmission(&repeated_invite)
+            .expect("retry INVITE"),
+        answer
+    );
+    repeated_invite
+        .headers_mut()
+        .set("CSeq", "43 INVITE")
+        .expect("CSeq");
+    assert!(accepted.on_invite_retransmission(&repeated_invite).is_err());
 
     for (dialog, response, expected) in [
         {
@@ -462,6 +494,14 @@ fn outbound_bye_uses_remote_target_and_dialog_tags() {
     );
     assert!(bye.headers().get("To").expect("To").contains("remote-tag"));
     assert_eq!(bye.headers().get("CSeq"), Some("1 BYE"));
+    assert_eq!(
+        bye.headers().get_all("Route").collect::<Vec<_>>(),
+        vec![
+            "\"Edge, proxy\" <sip:edge.example;lr;transport=wss>",
+            "<sip:proxy.example;lr>",
+            "<sip:other.example;lr>",
+        ]
+    );
     assert_eq!(dialog.state(), DialogState::Ending);
 }
 

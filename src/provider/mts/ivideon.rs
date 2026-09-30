@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, header::ACCEPT, redirect::Policy};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use tokio::time::{Instant, sleep, timeout_at};
 #[cfg(feature = "test-support")]
 use url::Host;
 use url::Url;
@@ -16,6 +17,9 @@ const API_BASE: &str = "https://openapi-alpha-eu01.ivideon.com/";
 const API_HOST: &str = "openapi-alpha-eu01.ivideon.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+const MAX_RETRIES: usize = 3;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_CAMERA_ID_BYTES: usize = 512;
 const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1024;
@@ -84,20 +88,8 @@ impl IvideonLiveResolver {
         }
         Ok(target)
     }
-}
 
-#[async_trait]
-impl IvideonLiveUrlResolver for IvideonLiveResolver {
-    async fn resolve_live_url(
-        &self,
-        camera_id: &str,
-        access_token: &SecretString,
-    ) -> Result<SecretString, AppError> {
-        validate_credential(access_token.expose_secret(), MAX_ACCESS_TOKEN_BYTES)?;
-        let mut target = self.endpoint(camera_id)?;
-        target
-            .query_pairs_mut()
-            .append_pair("access_token", access_token.expose_secret());
+    async fn request_live_url(&self, target: Url) -> Result<SecretString, AppError> {
         let http = self.http.as_ref().ok_or_else(ivideon_unavailable)?;
         let response = http
             .get(target)
@@ -138,6 +130,37 @@ impl IvideonLiveUrlResolver for IvideonLiveResolver {
         let payload: VideoUrl =
             serde_json::from_slice(&body).map_err(|_| ivideon_schema_error())?;
         validate_live_url(payload.url.expose_secret())
+    }
+}
+
+#[async_trait]
+impl IvideonLiveUrlResolver for IvideonLiveResolver {
+    async fn resolve_live_url(
+        &self,
+        camera_id: &str,
+        access_token: &SecretString,
+    ) -> Result<SecretString, AppError> {
+        validate_credential(access_token.expose_secret(), MAX_ACCESS_TOKEN_BYTES)?;
+        let mut target = self.endpoint(camera_id)?;
+        target
+            .query_pairs_mut()
+            .append_pair("access_token", access_token.expose_secret());
+        let deadline = Instant::now() + RESOLUTION_TIMEOUT;
+        for attempt in 0..=MAX_RETRIES {
+            match timeout_at(deadline, self.request_live_url(target.clone()))
+                .await
+                .map_err(|_| ivideon_unavailable())?
+            {
+                Ok(source) => return Ok(source),
+                Err(error) if !error.retryable || attempt == MAX_RETRIES => return Err(error),
+                Err(_) => {
+                    timeout_at(deadline, sleep(RETRY_DELAY))
+                        .await
+                        .map_err(|_| ivideon_unavailable())?;
+                }
+            }
+        }
+        Err(ivideon_unavailable())
     }
 }
 
@@ -209,7 +232,13 @@ fn status_error(status: StatusCode) -> AppError {
             "Ivideon authentication failed.",
             false,
         )
-    } else if status.is_server_error() || status.is_redirection() {
+    } else if status.is_redirection() {
+        AppError::new(
+            ErrorCode::UpstreamUnavailable,
+            "Ivideon live stream is temporarily unavailable.",
+            false,
+        )
+    } else if status.is_server_error() {
         ivideon_unavailable()
     } else {
         ivideon_schema_error()

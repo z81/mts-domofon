@@ -596,7 +596,7 @@ async fn connects_registers_rings_and_publishes_the_invite() {
     assert!(harness.service.current().await.expect("service").is_none());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn answer_sends_sdp_and_ack_marks_the_call_connected() {
     let mut harness = harness(test_config());
     let cancellation = CancellationToken::new();
@@ -618,6 +618,19 @@ async fn answer_sends_sdp_and_ack_marks_the_call_connected() {
         Some("application/sdp")
     );
 
+    tokio::time::advance(Duration::from_millis(500)).await;
+    let retry = harness.outbound.recv().await.expect("answer retry");
+    assert_eq!(retry, SipMessage::Response(answer.clone()));
+    harness
+        .inbound
+        .send(SipMessage::Request(invite.clone()))
+        .await
+        .expect("repeated INVITE");
+    assert_eq!(
+        harness.outbound.recv().await.expect("cached INVITE answer"),
+        SipMessage::Response(answer.clone())
+    );
+
     harness
         .inbound
         .send(SipMessage::Request(ack_for(&answer, &invite)))
@@ -625,6 +638,11 @@ async fn answer_sends_sdp_and_ack_marks_the_call_connected() {
         .expect("ACK");
     let active = wait_for_phase(&harness, CallViewPhase::Active).await;
     assert!(active.can_open);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert!(matches!(
+        harness.outbound.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 
     cancellation.cancel();
     let SipMessage::Request(bye) = harness.outbound.recv().await.expect("cancellation BYE") else {
@@ -637,7 +655,15 @@ async fn answer_sends_sdp_and_ack_marks_the_call_connected() {
 
 #[tokio::test]
 async fn decline_sends_600_and_ends_the_runtime() {
-    let mut harness = harness(test_config());
+    let (started_tx, mut started_rx) = mpsc::channel(1);
+    let (release_tx, release_rx) = mpsc::channel(1);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let actions = Arc::new(BlockingActions {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        calls: calls.clone(),
+    });
+    let mut harness = harness_with_actions(test_config(), actions);
     let cancellation = CancellationToken::new();
     let (task, ringing, _) = start_ringing(&mut harness, &cancellation).await;
 
@@ -652,6 +678,12 @@ async fn decline_sends_600_and_ends_the_runtime() {
     assert_eq!(response.status(), 600);
     assert!(task.await.expect("runtime task").is_ok());
     assert!(harness.service.current().await.expect("service").is_none());
+    assert_eq!(started_rx.recv().await, Some(RemoteCallAction::Unwanted));
+    release_tx
+        .send(())
+        .await
+        .expect("release peer notification");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

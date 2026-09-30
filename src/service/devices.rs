@@ -33,11 +33,10 @@ impl DeviceService {
     }
 
     pub async fn camera(&self, flat: &FlatId, camera_id: &str) -> Result<Camera, AppError> {
-        let (access_points, cameras) = self.sources(flat).await;
-        let mut access_points = access_points.unwrap_or_default();
-        let mut cameras = cameras?;
-        stamp_and_sort_access_points(flat, &mut access_points);
-        stamp_associate_and_sort_cameras(flat, &access_points, &mut cameras);
+        // Camera ownership and capabilities come from the flat-scoped camera inventory.
+        // Door discovery is only needed to associate cameras when displaying the full inventory.
+        let mut cameras = self.provider.cameras(flat).await?;
+        stamp_associate_and_sort_cameras(flat, &[], &mut cameras);
         cameras
             .into_iter()
             .find(|camera| camera.id == camera_id)

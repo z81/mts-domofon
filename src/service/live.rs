@@ -509,6 +509,8 @@ impl LiveProcessRunner for FfmpegRunner {
                 "yuv420p",
                 "-g",
                 "25",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*1)",
                 "-sc_threshold",
                 "0",
                 "-c:a",

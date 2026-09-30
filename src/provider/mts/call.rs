@@ -53,7 +53,20 @@ impl CallOpenProvider for MtsCallOpenProvider {
         self.client
             .send_empty(request)
             .await
-            .map_err(map_physical_mutation_error)
+            .map_err(map_physical_mutation_error)?;
+        let actions = MtsCallActionProvider::new(self.client.clone());
+        let call_session_id = call_session_id.clone();
+        // The mobile client sends this action when opening during a call. Its
+        // result must not delay or replace the confirmed physical open result.
+        tokio::spawn(async move {
+            if let Err(error) = actions
+                .action(&call_session_id, RemoteCallAction::Unwanted)
+                .await
+            {
+                tracing::warn!(code = ?error.code, "opened call could not notify other devices");
+            }
+        });
+        Ok(())
     }
 }
 

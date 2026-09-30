@@ -84,7 +84,8 @@ function CameraSnapshot({ api, camera, flatId }: { api: IntercomApi; camera: Cam
 
 function CameraLive({ api, camera, flatId, onStop }: { api: IntercomApi; camera: Camera; flatId: string; onStop: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null)
-  const [status, setStatus] = useState<'starting' | 'ready' | 'error'>(
+  const [reload, setReload] = useState(0)
+  const [status, setStatus] = useState<'starting' | 'ready' | 'paused' | 'error'>(
     api.startLive && api.stopLive ? 'starting' : 'error',
   )
 
@@ -92,48 +93,111 @@ function CameraLive({ api, camera, flatId, onStop }: { api: IntercomApi; camera:
     const startLive = api.startLive
     const stopLive = api.stopLive
     if (!startLive || !stopLive) return
+    const video = videoRef.current
+    if (!video) return
     const controller = new AbortController()
     let active = true
     let sessionId: string | null = null
     let hls: Hls | null = null
+    let playPending = false
+
+    const stopSession = () => {
+      const previousSessionId = sessionId
+      sessionId = null
+      if (previousSessionId) void stopLive(previousSessionId).catch(() => undefined)
+    }
+    const failPlayback = () => {
+      if (!active) return
+      active = false
+      controller.abort()
+      hls?.destroy()
+      hls = null
+      stopSession()
+      setStatus('error')
+    }
+    const play = async () => {
+      if (!active || playPending || !sessionId) return
+      playPending = true
+      try {
+        await video.play()
+      } catch (error) {
+        if (!active) return
+        if (error instanceof DOMException && error.name === 'NotAllowedError') {
+          // Startup can outlive the user gesture that allows playback with sound.
+          video.muted = true
+          try {
+            await video.play()
+          } catch {
+            if (active) setStatus('paused')
+          }
+        } else if (!(error instanceof DOMException && error.name === 'AbortError')) {
+          failPlayback()
+        }
+      } finally {
+        playPending = false
+      }
+    }
+    const ready = () => {
+      if (active && sessionId) setStatus('ready')
+    }
+    const canPlay = () => { void play() }
+    const mediaError = () => { failPlayback() }
+    video.addEventListener('playing', ready)
+    video.addEventListener('canplay', canPlay)
+    video.addEventListener('error', mediaError)
 
     startLive(flatId, camera.id, controller.signal).then((session) => {
-      sessionId = session.sessionId
       if (!active) {
         void stopLive(session.sessionId).catch(() => undefined)
         return
       }
-      const video = videoRef.current
-      if (!video) return
+      sessionId = session.sessionId
       if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = session.playlistUrl
       } else if (Hls.isSupported()) {
         hls = new Hls({ enableWorker: true, lowLatencyMode: true })
-        hls.loadSource(session.playlistUrl)
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+          if (data.fatal) mediaError()
+        })
+        hls.on(Hls.Events.MANIFEST_PARSED, canPlay)
         hls.attachMedia(video)
+        hls.loadSource(session.playlistUrl)
       } else {
-        setStatus('error')
+        failPlayback()
         return
       }
-      setStatus('ready')
-      void video.play().catch(() => undefined)
+      void play()
     }).catch(() => {
-      if (active && !controller.signal.aborted) setStatus('error')
+      if (active && !controller.signal.aborted) failPlayback()
     })
 
     return () => {
       active = false
       controller.abort()
+      video.removeEventListener('playing', ready)
+      video.removeEventListener('canplay', canPlay)
+      video.removeEventListener('error', mediaError)
       hls?.destroy()
-      if (sessionId) void stopLive(sessionId).catch(() => undefined)
+      if (video.getAttribute('src')) {
+        video.pause()
+        video.removeAttribute('src')
+        video.load()
+      }
+      stopSession()
     }
-  }, [api, camera.id, flatId])
+  }, [api, camera.id, flatId, reload])
 
   return <div className="camera-live media-frame">
     <video aria-label={`Live-видео с камеры ${camera.name}`} controls playsInline ref={videoRef} />
     <span className="live-badge"><i />LIVE</span>
     {status === 'starting' && <div className="live-status" role="status"><span className="loading-ring" />Подключаем видео…</div>}
-    {status === 'error' && <div className="live-status" role="alert">Не удалось запустить видео</div>}
+    {status === 'paused' && <div className="live-status" role="status">
+      <button className="secondary-button" onClick={() => { void videoRef.current?.play().catch(() => undefined) }} type="button">Воспроизвести</button>
+    </div>}
+    {status === 'error' && <div className="live-status" role="alert">
+      <span>Не удалось запустить видео</span>
+      <button className="secondary-button" onClick={() => { setStatus('starting'); setReload((value) => value + 1) }} type="button">Повторить</button>
+    </div>}
     <button className="live-stop-button" onClick={onStop} type="button">Остановить</button>
   </div>
 }
@@ -160,7 +224,7 @@ export function CameraExperience(props: CameraExperienceProps) {
       {archiveAvailable && <button aria-pressed={mode === 'archive'} className={mode === 'archive' ? 'selected' : ''} onClick={() => setMode('archive')} type="button">Архив</button>}
     </div>
     {mode === 'live' && liveAvailable
-      ? <CameraLive api={props.api} camera={props.camera} flatId={props.flatId} onStop={() => setMode(snapshotAvailable ? 'snapshot' : 'idle')} />
+      ? <CameraLive api={props.api} camera={props.camera} flatId={props.flatId} key={`${props.flatId}\u0000${props.camera.id}`} onStop={() => setMode(snapshotAvailable ? 'snapshot' : 'idle')} />
       : mode === 'archive' && archiveAvailable
         ? <ArchivePlayer api={props.api} cameraId={props.camera.id} cameraName={props.camera.name} flatId={props.flatId} initialAt={props.initialArchiveAt} />
         : mode === 'snapshot' && snapshotAvailable
