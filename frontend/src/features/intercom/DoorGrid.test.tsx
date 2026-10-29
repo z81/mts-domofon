@@ -17,13 +17,29 @@ const pointWithTwoLocks: AccessPoint = {
   available: true,
 }
 
+const gate: AccessPoint = {
+  ...pointWithTwoLocks,
+  id: 'gate-1',
+  name: 'Калитка',
+  kind: 'gate',
+  locks: [{ number: '1', name: 'Замок калитки', permanentlyOpen: false }],
+}
+
 describe('DoorGrid', () => {
   it('prepares the selected lock from a direct door action without a selector', async () => {
     const user = userEvent.setup()
     const onPrepare = vi.fn()
-    render(<DoorGrid accessPoints={[pointWithTwoLocks]} interactionLocked={false} preparingLock={null} onPrepare={onPrepare} />)
+    render(<DoorGrid accessPoints={[pointWithTwoLocks, gate]} interactionLocked={false} preparingLock={null} onPrepare={onPrepare} />)
 
-    await user.click(screen.getByRole('button', { name: 'Открыть Подъезд 1: Вторая дверь' }))
+    const secondLock = screen.getByRole('button', { name: 'Открыть Подъезд 1: Вторая дверь' })
+    expect(secondLock).toHaveTextContent('Открыть')
+    expect(secondLock).toHaveTextContent('Вторая дверь')
+    expect(secondLock).not.toHaveTextContent('Подъезд 1')
+    expect(screen.getAllByText('Подъезд 1')).toHaveLength(1)
+    expect(screen.getByRole('button', { name: 'Открыть Калитка' })).toHaveTextContent(/^Открыть$/)
+    expect(screen.getAllByText('Калитка')).toHaveLength(1)
+
+    await user.click(secondLock)
 
     expect(onPrepare).toHaveBeenCalledWith(pointWithTwoLocks, pointWithTwoLocks.locks[1])
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()

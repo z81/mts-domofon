@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
-import Hls from 'hls.js'
+import { useCallback, useEffect, useState } from 'react'
 import { ArchivePlayer } from './ArchivePlayer'
+import { LivePlayer } from './LivePlayer'
+import { primeLiveAudio } from './livePriming'
+import { ExpandIcon, RefreshIcon } from './MediaIcons'
 import type { Camera, IntercomApi } from './intercomApi'
 
-export type CameraExperienceMode = 'idle' | 'snapshot' | 'live' | 'archive'
+export type CameraExperienceMode = 'live' | 'archive'
 
 export interface CameraExperienceProps {
   api: IntercomApi
@@ -11,164 +13,133 @@ export interface CameraExperienceProps {
   flatId: string
   presentation: 'preview' | 'detail'
   initialArchiveAt?: string
+  audioSuspended?: boolean
+  onAuthRequired?: () => void
   onOpenDetail?: () => void
 }
 
-type SnapshotRemote =
-  | { status: 'loading'; requestKey: string }
-  | { status: 'success'; requestKey: string; objectUrl: string }
-  | { status: 'error'; requestKey: string }
-
-function cameraCapabilityStatus(api: IntercomApi, camera: Camera): string {
-  const modes = [
-    camera.capabilities.snapshot.state === 'available' ? 'кадр' : null,
-    camera.capabilities.live.state === 'available' && api.startLive && api.stopLive ? 'эфир' : null,
-    camera.capabilities.archive.state === 'available' && api.getArchiveDistribution && api.startArchive && api.stopLive ? 'архив' : null,
-  ].filter((mode): mode is string => Boolean(mode))
-  return modes.length > 0 ? `Доступно: ${modes.join(' · ')}` : 'Медиа недоступно'
+interface SnapshotFrame {
+  url: string
+  takenAt: number
 }
 
-function CameraSnapshot({ api, camera, flatId }: { api: IntercomApi; camera: Camera; flatId: string }) {
-  const [reload, setReload] = useState(0)
-  const requestKey = `${flatId}\u0000${camera.id}\u0000${reload}`
-  const [snapshot, setSnapshot] = useState<SnapshotRemote>({ status: 'loading', requestKey })
+const snapshotRefreshMs = 15_000
+
+function snapshotTime(value: number): string {
+  return new Intl.DateTimeFormat('ru-RU', {
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).format(value)
+}
+
+// Stale-while-revalidate: the previous frame stays on screen while the next one loads.
+function CameraSnapshot({ api, camera, flatId, onOpen }: { api: IntercomApi; camera: Camera; flatId: string; onOpen?: () => void }) {
+  const [request, setRequest] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [failed, setFailed] = useState(false)
+  const [frame, setFrame] = useState<SnapshotFrame | null>(null)
 
   useEffect(() => {
-    if (camera.capabilities.snapshot.state !== 'available') return
-
     const controller = new AbortController()
-    let active = true
-    let objectUrl: string | null = null
-
     api.getSnapshot(flatId, camera.id, controller.signal).then((blob) => {
-      if (!active) return
-      objectUrl = URL.createObjectURL(blob)
-      setSnapshot({ status: 'success', requestKey, objectUrl })
+      if (controller.signal.aborted) return
+      setFrame({ url: URL.createObjectURL(blob), takenAt: Date.now() })
+      setFailed(false)
+      setLoading(false)
     }).catch(() => {
-      if (active && !controller.signal.aborted) setSnapshot({ status: 'error', requestKey })
+      if (controller.signal.aborted) return
+      setFailed(true)
+      setLoading(false)
     })
+    return () => controller.abort()
+  }, [api, camera.id, flatId, request])
 
-    return () => {
-      active = false
-      controller.abort()
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
+  useEffect(() => {
+    if (!frame) return
+    const { url } = frame
+    return () => URL.revokeObjectURL(url)
+  }, [frame])
+
+  const refresh = useCallback(() => {
+    setLoading(true)
+    setRequest((value) => value + 1)
+  }, [])
+
+  useEffect(() => {
+    if (loading) return
+    let due = false
+    const refreshWhenVisible = () => {
+      if (due && document.visibilityState === 'visible') refresh()
     }
-  }, [api, camera.capabilities.snapshot.state, camera.id, flatId, reload, requestKey])
+    const timer = window.setTimeout(() => {
+      due = true
+      refreshWhenVisible()
+    }, snapshotRefreshMs)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+    }
+  }, [loading, refresh])
 
-  const currentSnapshot: SnapshotRemote = snapshot.requestKey === requestKey
-    ? snapshot
-    : { status: 'loading', requestKey }
-
-  if (camera.capabilities.snapshot.state !== 'available') {
-    return <div className="camera-placeholder"><p>Снимки с этой камеры недоступны</p><small>{cameraCapabilityStatus(api, camera)}</small></div>
-  }
-  if (currentSnapshot.status === 'loading') {
-    return <div className="camera-placeholder" role="status"><span className="loading-ring" /><p>Загружаем кадр…</p></div>
-  }
-  if (currentSnapshot.status === 'error') {
-    return <div className="camera-placeholder" role="alert">
-      <p>Не удалось загрузить кадр</p>
-      <button className="secondary-button" onClick={() => setReload((value) => value + 1)} type="button">Повторить</button>
-    </div>
-  }
+  const caption = <span className="media-caption">
+    <b>{camera.name}</b>
+    {frame && <small>Кадр {snapshotTime(frame.takenAt)}</small>}
+  </span>
 
   return <div className="camera-snapshot media-frame">
-    <img alt={`Кадр с камеры ${camera.name}`} src={currentSnapshot.objectUrl} />
-    <span className="snapshot-badge">СНИМОК</span>
-    <div className="camera-caption">
-      <span><b>{camera.name}</b><small>{cameraCapabilityStatus(api, camera)}</small></span>
-      <button onClick={() => setReload((value) => value + 1)} type="button">Обновить</button>
-    </div>
-  </div>
-}
-
-function CameraLive({ api, camera, flatId, onStop }: { api: IntercomApi; camera: Camera; flatId: string; onStop: () => void }) {
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const [status, setStatus] = useState<'starting' | 'ready' | 'error'>(
-    api.startLive && api.stopLive ? 'starting' : 'error',
-  )
-
-  useEffect(() => {
-    const startLive = api.startLive
-    const stopLive = api.stopLive
-    if (!startLive || !stopLive) return
-    const controller = new AbortController()
-    let active = true
-    let sessionId: string | null = null
-    let hls: Hls | null = null
-
-    startLive(flatId, camera.id, controller.signal).then((session) => {
-      sessionId = session.sessionId
-      if (!active) {
-        void stopLive(session.sessionId).catch(() => undefined)
-        return
-      }
-      const video = videoRef.current
-      if (!video) return
-      // Chrome also reports native HLS, but its built-in player rejects live playlists shorter
-      // than three segments, so hls.js plays wherever Media Source Extensions exist.
-      if (Hls.isSupported()) {
-        const player = new Hls({ enableWorker: true, lowLatencyMode: true })
-        hls = player
-        // A playlist loaded before MediaSource opens waits for the next hls.js tick.
-        player.once(Hls.Events.MEDIA_ATTACHED, () => player.loadSource(session.playlistUrl))
-        player.attachMedia(video)
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = session.playlistUrl
-      } else {
-        setStatus('error')
-        return
-      }
-      setStatus('ready')
-      void video.play().catch(() => undefined)
-    }).catch(() => {
-      if (active && !controller.signal.aborted) setStatus('error')
-    })
-
-    return () => {
-      active = false
-      controller.abort()
-      hls?.destroy()
-      if (sessionId) void stopLive(sessionId).catch(() => undefined)
-    }
-  }, [api, camera.id, flatId])
-
-  return <div className="camera-live media-frame">
-    <video aria-label={`Live-видео с камеры ${camera.name}`} controls playsInline ref={videoRef} />
-    <span className="live-badge"><i />LIVE</span>
-    {status === 'starting' && <div className="live-status" role="status"><span className="loading-ring" />Подключаем видео…</div>}
-    {status === 'error' && <div className="live-status" role="alert">Не удалось запустить видео</div>}
-    <button className="live-stop-button" onClick={onStop} type="button">Остановить</button>
+    {frame && <img alt={`Кадр с камеры ${camera.name}`} src={frame.url} />}
+    {onOpen
+      ? <button aria-label={`Открыть камеру ${camera.name}`} className="media-open" onClick={onOpen} type="button">{caption}<ExpandIcon /></button>
+      : <div className="media-caption-row">{caption}</div>}
+    {!frame && loading && <div className="live-status" role="status"><span><span className="loading-ring" />Загружаем кадр…</span></div>}
+    {!frame && !loading && failed && <div className="live-status live-status-error" role="alert">
+      <p>Не удалось загрузить кадр</p>
+      <button className="media-action" onClick={refresh} type="button">Повторить</button>
+    </div>}
+    {frame && <button aria-busy={loading} aria-label="Обновить кадр" className="media-corner-button snapshot-refresh" onClick={() => {
+      if (!loading) refresh()
+    }} type="button"><RefreshIcon /></button>}
   </div>
 }
 
 export function CameraExperience(props: CameraExperienceProps) {
-  const snapshotAvailable = props.camera?.capabilities.snapshot.state === 'available'
-  const liveAvailable = props.camera?.capabilities.live.state === 'available' && Boolean(props.api.startLive && props.api.stopLive)
-  const archiveAvailable = props.camera?.capabilities.archive.state === 'available' && Boolean(props.api.getArchiveDistribution && props.api.startArchive && props.api.stopLive)
-  const initialMode: CameraExperienceMode = props.initialArchiveAt && archiveAvailable
-    ? 'archive'
-    : snapshotAvailable ? 'snapshot' : 'idle'
-  const [mode, setMode] = useState<CameraExperienceMode>(initialMode)
+  const archiveAvailable = props.camera?.capabilities.archive.state === 'available'
+    && Boolean(props.api.getArchiveDistribution && props.api.startArchive && props.api.stopLive)
+  const [mode, setMode] = useState<CameraExperienceMode>(props.initialArchiveAt && archiveAvailable ? 'archive' : 'live')
 
-  if (!props.camera) return <div className="camera-empty">Камер для этого объекта нет</div>
-  if (props.presentation === 'preview') return <article className="camera-card camera-preview">
-    <CameraSnapshot api={props.api} camera={props.camera} flatId={props.flatId} />
-    <button aria-label={`Смотреть ${props.camera.name}`} className="camera-action" onClick={props.onOpenDetail} type="button">Смотреть</button>
-  </article>
+  if (!props.camera) return <div className="camera-empty">Камер по этому адресу нет</div>
+  const camera = props.camera
+  const openDetail = props.presentation === 'preview' ? props.onOpenDetail : undefined
+
+  const liveView = camera.capabilities.live.state === 'available' && props.api.startLive
+    ? <LivePlayer
+        api={props.api}
+        audioSuspended={props.audioSuspended}
+        camera={camera}
+        flatId={props.flatId}
+        onAuthRequired={props.onAuthRequired}
+        onOpen={openDetail}
+        variant={props.presentation}
+      />
+    : camera.capabilities.snapshot.state === 'available'
+      ? <CameraSnapshot api={props.api} camera={camera} flatId={props.flatId} onOpen={openDetail} />
+      : openDetail
+        ? <button aria-label={`Открыть камеру ${camera.name}`} className="camera-placeholder" onClick={openDetail} type="button"><span>Камера сейчас недоступна</span></button>
+        : <div className="camera-placeholder"><p>Камера сейчас недоступна</p></div>
+
+  if (props.presentation === 'preview') return <article className="camera-card camera-preview">{liveView}</article>
 
   return <article className="camera-card camera-detail">
-    <div aria-label="Режим камеры" className="camera-mode-tabs" role="group">
-      {liveAvailable && <button aria-pressed={mode === 'live'} className={mode === 'live' ? 'selected' : ''} onClick={() => setMode('live')} type="button">Эфир</button>}
-      {snapshotAvailable && <button aria-pressed={mode === 'snapshot'} className={mode === 'snapshot' ? 'selected' : ''} onClick={() => setMode('snapshot')} type="button">Кадр</button>}
-      {archiveAvailable && <button aria-pressed={mode === 'archive'} className={mode === 'archive' ? 'selected' : ''} onClick={() => setMode('archive')} type="button">Архив</button>}
-    </div>
-    {mode === 'live' && liveAvailable
-      ? <CameraLive api={props.api} camera={props.camera} flatId={props.flatId} onStop={() => setMode(snapshotAvailable ? 'snapshot' : 'idle')} />
-      : mode === 'archive' && archiveAvailable
-        ? <ArchivePlayer api={props.api} cameraId={props.camera.id} cameraName={props.camera.name} flatId={props.flatId} initialAt={props.initialArchiveAt} />
-        : mode === 'snapshot' && snapshotAvailable
-          ? <CameraSnapshot api={props.api} camera={props.camera} flatId={props.flatId} />
-          : <div className="camera-placeholder"><p>Выберите режим камеры</p></div>}
+    {archiveAvailable && <div aria-label="Режим камеры" className="camera-mode-tabs" role="group">
+      <button aria-pressed={mode === 'live'} className={mode === 'live' ? 'selected' : ''} onClick={() => {
+        if (mode === 'live') return
+        primeLiveAudio()
+        setMode('live')
+      }} type="button">Эфир</button>
+      <button aria-pressed={mode === 'archive'} className={mode === 'archive' ? 'selected' : ''} onClick={() => setMode('archive')} type="button">Архив</button>
+    </div>}
+    {mode === 'archive' && archiveAvailable
+      ? <ArchivePlayer api={props.api} cameraId={camera.id} cameraName={camera.name} flatId={props.flatId} initialAt={props.initialArchiveAt} />
+      : liveView}
   </article>
 }

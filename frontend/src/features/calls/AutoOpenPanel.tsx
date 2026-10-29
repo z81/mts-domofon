@@ -219,7 +219,7 @@ export function AutoOpenPanel({
   const controlsBusy = busy || mutationBusy
 
   if (!available) {
-    return <section className="content-card auto-open-panel"><p className="eyebrow">Автооткрытие</p><h2>Автооткрытие недоступно</h2><p>Обновите локальный сервис, чтобы использовать ограниченные правила.</p></section>
+    return <section className="content-card auto-open-panel"><p className="eyebrow">Автооткрытие</p><h2>Автооткрытие недоступно</h2><p>Сервер домофона пока не поддерживает автооткрытие.</p></section>
   }
 
   return <section className={`content-card auto-open-panel ${policy?.mode !== 'disabled' ? 'armed' : ''}`}>

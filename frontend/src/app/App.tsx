@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 import { AuthPage } from '../features/auth/AuthPage'
 import { AuthApiError, authApi as defaultAuthApi, type AuthApi } from '../features/auth/authApi'
 import { IncomingCallOverlay } from '../features/calls/IncomingCallOverlay'
@@ -15,7 +15,8 @@ import { EventJournal } from '../features/events/EventJournal'
 import { eventApi as defaultEventApi, type EventApi } from '../features/events/eventApi'
 import { HomePage } from '../features/home/HomePage'
 import { CameraExperience } from '../features/intercom/CameraExperience'
-import { DoorGrid, type DoorFeedback, type PreparingLock } from '../features/intercom/DoorGrid'
+import { DoorGrid, DoorIcon, type DoorFeedback, type PreparingLock } from '../features/intercom/DoorGrid'
+import { clearLiveFrames, primeLiveAudio } from '../features/intercom/livePriming'
 import { MorePage } from '../features/settings/MorePage'
 import {
   IntercomApiError,
@@ -55,6 +56,7 @@ interface PreparedDoorIntent {
   flatAddress: string
   accessPointName: string
   lockName: string
+  doorName: string
   accessPointId: string
   lockNumber: string
 }
@@ -70,9 +72,39 @@ interface AppAutoOpenMutationLease extends AutoOpenMutationLease {
   sessionEpoch: number
 }
 
+const cameraHistoryState = { domruView: 'camera' }
 
-function Glyph({ children }: { children: ReactNode }) {
-  return <span className="glyph" aria-hidden="true">{children}</span>
+const iconProps = {
+  'aria-hidden': true,
+  fill: 'none',
+  height: 22,
+  stroke: 'currentColor',
+  strokeLinecap: 'round',
+  strokeLinejoin: 'round',
+  strokeWidth: 1.9,
+  viewBox: '0 0 24 24',
+  width: 22,
+} as const
+
+function BackIcon() {
+  return <svg {...iconProps}><path d="M19 12H5m6-6-6 6 6 6" /></svg>
+}
+
+function AccountIcon() {
+  return <svg {...iconProps}><circle cx="12" cy="8" r="3.6" /><path d="M5 20a7 7 0 0 1 14 0" /></svg>
+}
+
+function FlatIcon() {
+  return <svg {...iconProps} height={20} width={20}><path d="M4 10.5 12 4l8 6.5V20h-5v-6H9v6H4Z" /></svg>
+}
+
+function ChevronIcon({ direction }: { direction: 'down' | 'right' }) {
+  return <svg {...iconProps} className="chevron-icon" height={18} width={18}><path d={direction === 'down' ? 'm6 9 6 6 6-6' : 'm9 6 6 6-6 6'} /></svg>
+}
+
+// The camera screen owns one history entry, so the system back button leaves the screen instead of the app.
+function isCameraEntry(state: unknown): boolean {
+  return typeof state === 'object' && state !== null && (state as { domruView?: unknown }).domruView === 'camera'
 }
 
 function isUnauthorized(error: unknown): boolean {
@@ -157,11 +189,11 @@ function StateCard({ eyebrow, title, children, action }: {
 
 function DeviceError({ unauthorized, onAuth, onRetry }: { unauthorized: boolean; onAuth: () => void; onRetry: () => void }) {
   return <StateCard
-    eyebrow="Устройства"
-    title={unauthorized ? 'Сессия MTS ID истекла' : 'Не удалось загрузить устройства'}
+    eyebrow={unauthorized ? 'MTS ID' : 'Связь'}
+    title={unauthorized ? 'Сессия MTS ID истекла' : 'Не удалось загрузить камеры и двери'}
     action={<button className="primary-button" onClick={unauthorized ? onAuth : onRetry} type="button">{unauthorized ? 'Войти с MTS ID' : 'Повторить'}</button>}
   >
-    <p>{unauthorized ? 'Войдите снова, чтобы получить список домофонов и камер.' : 'Проверьте локальный сервис и повторите запрос.'}</p>
+    <p>{unauthorized ? 'Войдите снова, чтобы получить список домофонов и камер.' : 'Нет связи с сервером домофона. Повторите попытку.'}</p>
   </StateCard>
 }
 
@@ -188,12 +220,48 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
   const [autoOpenPolicy, setAutoOpenPolicy] = useState<AutoOpenPolicy | null>(null)
   const [autoOpenDisableFailed, setAutoOpenDisableFailed] = useState(false)
   const [autoOpenMutationBusy, setAutoOpenMutationBusy] = useState(false)
+  const [eventsRefresh, setEventsRefresh] = useState({ callActive: false, key: 0 })
   const doorPreparationLease = useRef<DoorPreparationLease | null>(null)
   const doorExecutionInFlight = useRef(false)
   const autoOpenMutationLease = useRef<AppAutoOpenMutationLease | null>(null)
   const autoOpenPolicyGeneration = useRef(0)
   const sessionEpoch = useRef(0)
   const autoResumeEpoch = useRef<number | null>(null)
+  const flatWrapRef = useRef<HTMLDivElement>(null)
+  const flatButtonRef = useRef<HTMLButtonElement>(null)
+  const ignoreBackEcho = useRef(false)
+  const focusScreenHeading = useRef(false)
+
+  useEffect(() => {
+    // Screen changes scroll to the top themselves; the browser would restore an older position after the change.
+    window.history.scrollRestoration = 'manual'
+    // A reload restores the camera entry's state, but the app starts on Home.
+    if (isCameraEntry(window.history.state)) window.history.replaceState(null, '')
+  }, [])
+
+  useEffect(() => {
+    function onPopState(event: PopStateEvent) {
+      if (ignoreBackEcho.current) {
+        ignoreBackEcho.current = false
+        return
+      }
+      if (view.kind !== 'camera' || isCameraEntry(event.state)) return
+      focusScreenHeading.current = true
+      setView({ kind: 'destination', destination: view.returnTo })
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [view])
+
+  useEffect(() => {
+    if (!focusScreenHeading.current) return
+    focusScreenHeading.current = false
+    // An open dialog (an incoming call, a door confirmation) keeps the focus.
+    if (!document.activeElement?.closest('[role="dialog"]')) {
+      document.querySelector<HTMLElement>('#main-content > div:not([hidden]) h1')?.focus({ preventScroll: true })
+    }
+    if (window.scrollY > 0) window.scrollTo(0, 0)
+  }, [view])
 
   useEffect(() => {
     const requestEpoch = sessionEpoch.current
@@ -279,6 +347,11 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
 
   const activeCurrentCall = callPollingEnabled ? currentCall : null
   const activeCallAutoOpenResult = autoOpenResultForCall(activeCurrentCall, autoOpenPolicy)
+  const callActive = activeCurrentCall !== null
+  // A finished call lands in the journal, so the journal reloads once the call is gone.
+  if (eventsRefresh.callActive !== callActive) {
+    setEventsRefresh({ callActive, key: callActive ? eventsRefresh.key : eventsRefresh.key + 1 })
+  }
 
   useEffect(() => {
     if (!doorIntent || doorExecuting) return
@@ -307,15 +380,87 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
   const doorInteractionLocked = preparingLock !== null || doorIntent !== null || doorExecuting
   const unauthenticated = (dashboard.status === 'error' && isUnauthorized(dashboard.error))
     || (dashboard.status === 'success' && devices.status === 'error' && isUnauthorized(devices.error))
+  const flatOptions = dashboard.status === 'success' ? dashboard.data.flats : []
+  const flatMenuOpen = flatOpen && flatOptions.length > 1
 
   const destination = view.kind === 'destination' ? view.destination : view.returnTo
 
+  useEffect(() => {
+    if (!flatMenuOpen) return
+    const wrap = flatWrapRef.current
+    const current = wrap?.querySelector<HTMLElement>('[role="menuitem"][aria-current="true"]')
+      ?? wrap?.querySelector<HTMLElement>('[role="menuitem"]')
+    current?.focus()
+    function onPointerDown(event: PointerEvent) {
+      if (!wrap?.contains(event.target as Node)) setFlatOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    return () => document.removeEventListener('pointerdown', onPointerDown)
+  }, [flatMenuOpen])
+
+  function onFlatMenuKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!flatMenuOpen) return
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      setFlatOpen(false)
+      flatButtonRef.current?.focus()
+      return
+    }
+    if (event.key === 'Tab') {
+      setFlatOpen(false)
+      return
+    }
+    const items = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]'))
+    const index = items.findIndex((item) => item === document.activeElement)
+    let next: number
+    if (event.key === 'ArrowDown') next = (index + 1) % items.length
+    else if (event.key === 'ArrowUp') next = index <= 0 ? items.length - 1 : index - 1
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = items.length - 1
+    else return
+    event.preventDefault()
+    items[next]?.focus()
+  }
+
   function selectDestination(next: Destination) {
+    if (view.kind === 'camera' && isCameraEntry(window.history.state)) window.history.replaceState(null, '')
     setView({ kind: 'destination', destination: next })
     setFlatOpen(false)
   }
 
+  function openCamera(returnTo: Destination, archiveTarget?: { cameraId: string; archiveAt: string }) {
+    if (!isCameraEntry(window.history.state)) window.history.pushState(cameraHistoryState, '')
+    focusScreenHeading.current = true
+    setView({ kind: 'camera', returnTo, archiveTarget })
+    setFlatOpen(false)
+  }
+
+  // Our own history.back() echoes as popstate; the view has already changed by then.
+  function closeCamera() {
+    if (view.kind !== 'camera') return
+    if (isCameraEntry(window.history.state)) {
+      ignoreBackEcho.current = true
+      window.history.back()
+    }
+    focusScreenHeading.current = true
+    setView({ kind: 'destination', destination: view.returnTo })
+  }
+
+  function switchCamera(cameraId: string) {
+    if (view.kind !== 'camera' || cameraId === selectedCamera?.id) return
+    primeLiveAudio()
+    setSelectedCameraId(cameraId)
+    setView({ kind: 'camera', returnTo: view.returnTo })
+  }
+
+  function canOpenArchive(cameraId: string): boolean {
+    const camera = inventory?.cameras.find((item) => item.id === cameraId)
+    return camera?.capabilities.archive.state === 'available'
+      && Boolean(api.getArchiveDistribution && api.startArchive && api.stopLive)
+  }
+
   function selectFlat(flatId: string) {
+    flatButtonRef.current?.focus()
     if (flatId === selectedFlatId) {
       setFlatOpen(false)
       return
@@ -362,6 +507,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
 
   function finishLogout() {
     sessionEpoch.current += 1
+    clearLiveFrames()
     doorPreparationLease.current?.controller.abort()
     doorPreparationLease.current = null
     doorExecutionInFlight.current = false
@@ -433,10 +579,9 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
   }
 
   function openEventArchive(cameraId: string, archiveAt: string) {
-    if (!inventory?.cameras.some((camera) => camera.id === cameraId)) return
+    if (!canOpenArchive(cameraId)) return
     setSelectedCameraId(cameraId)
-    setView({ kind: 'camera', returnTo: 'events', archiveTarget: { cameraId, archiveAt } })
-    setFlatOpen(false)
+    openCamera(destination, { cameraId, archiveAt })
   }
 
   const beginAutoOpenMutation = useCallback((controller = new AbortController()): AppAutoOpenMutationLease | null => {
@@ -499,13 +644,16 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
     try {
       const intent = await api.createDoorIntent(flat.id, point.id, lock.number, lease.controller.signal)
       if (doorPreparationLease.current !== lease || lease.controller.signal.aborted || lease.sessionEpoch !== sessionEpoch.current) return
+      const lockName = lock.name.trim() || `Замок ${lock.number}`
       setDoorIntent({
         intentId: intent.intentId,
         expiresAt: intent.expiresAt,
         flatLabel: flat.label,
         flatAddress: flat.address,
         accessPointName: point.name,
-        lockName: lock.name.trim() || `Замок ${lock.number}`,
+        lockName,
+        // Like the door grid: the lock, or the entrance when it has a single lock.
+        doorName: point.locks.length === 1 ? point.name : lockName,
         accessPointId: point.id,
         lockNumber: lock.number,
       })
@@ -544,7 +692,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
         accessPointId: intent.accessPointId,
         lockNumber: intent.lockNumber,
         kind: 'success',
-        message: `${intent.accessPointName} открыт`,
+        message: `Открыто: ${intent.doorName}`,
       })
     } catch {
       if (operationEpoch !== sessionEpoch.current) return
@@ -567,7 +715,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
   function renderDeviceContent() {
     if (!selectedFlat) return null
     if (devices.status === 'idle' || devices.status === 'loading' || devices.flatId !== selectedFlat.id) {
-      return <div className="loading-card" role="status"><span className="loading-ring" /><p>Загружаем устройства…</p></div>
+      return <div className="loading-card" role="status"><span className="loading-ring" /><p>Загружаем камеры и двери…</p></div>
     }
     if (devices.status === 'error') {
       return <DeviceError unauthorized={isUnauthorized(devices.error)} onAuth={() => setAuthOpen(true)} onRetry={retryDevices} />
@@ -578,28 +726,35 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
       ? view.archiveTarget?.archiveAt
       : undefined
     const cameraPanelKey = `${selectedFlat.id}\u0000${selectedCamera?.id ?? ''}\u0000${activeArchiveAt ?? ''}`
+    const doorProps = {
+      interactionLocked: doorInteractionLocked,
+      preparingLock,
+      blockedLock,
+      feedback: doorFeedback,
+      onPrepare: (point: AccessPoint, lock: Lock) => void prepareDoor(selectedFlat, point, lock),
+    }
 
     if (view.kind === 'camera') {
-      return <>
-        <section className="page-heading camera-detail-heading"><div><p className="eyebrow">{selectedFlat.address}</p><h1>Камеры</h1><p>Снимки и доступные режимы выбранной камеры.</p></div><button className="outline-button" onClick={() => selectDestination(view.returnTo)} type="button">Назад</button></section>
+      const cameraDoors = selectedCamera
+        ? deviceInventory.accessPoints.filter((point) => point.id === selectedCamera.accessPointId || point.cameraIds.includes(selectedCamera.id))
+        : []
+      return <div className="camera-screen">
+        <header className="camera-screen-header">
+          <button aria-label="Назад" className="icon-button" onClick={closeCamera} type="button"><BackIcon /></button>
+          <h1 tabIndex={-1}>{selectedCamera?.name ?? 'Камеры'}</h1>
+        </header>
         {deviceInventory.cameras.length > 1 && <div className="camera-tabs" aria-label="Выбор камеры" role="group">
-          {deviceInventory.cameras.map((camera) => <button aria-pressed={camera.id === selectedCamera?.id} className={camera.id === selectedCamera?.id ? 'selected' : ''} onClick={() => { setSelectedCameraId(camera.id); setView({ kind: 'camera', returnTo: view.returnTo }) }} type="button" key={camera.id}>{camera.name}</button>)}
+          {deviceInventory.cameras.map((camera) => <button aria-pressed={camera.id === selectedCamera?.id} className={camera.id === selectedCamera?.id ? 'selected' : ''} onClick={() => switchCamera(camera.id)} type="button" key={camera.id}>{camera.name}</button>)}
         </div>}
-        <section className="camera-layout">
-          <CameraExperience api={api} camera={selectedCamera} flatId={selectedFlat.id} initialArchiveAt={activeArchiveAt} key={cameraPanelKey} presentation="detail" />
-          <aside className="content-card camera-info"><p className="eyebrow">Возможности</p><h2>{selectedCamera?.name ?? 'Камеры не найдены'}</h2><p>{selectedCamera ? [
-            selectedCamera.capabilities.snapshot.state === 'available' ? 'снимок' : null,
-            selectedCamera.capabilities.live.state === 'available' ? 'прямой эфир со звуком' : null,
-            selectedCamera.capabilities.archive.state === 'available' ? 'архив со звуком' : null,
-          ].filter(Boolean).join(' · ') || 'Медиа недоступно' : 'Для выбранного объекта MTS не вернул камер.'}</p>
-          {selectedCamera && selectedCamera.capabilities.archive.state !== 'available' && <p className="capability-note">Архив этой камеры недоступен</p>}
-          </aside>
-        </section>
-      </>
+        <div className={cameraDoors.length > 0 ? 'camera-screen-body with-doors' : 'camera-screen-body'}>
+          <CameraExperience api={api} audioSuspended={activeCurrentCall !== null} camera={selectedCamera} flatId={selectedFlat.id} initialArchiveAt={activeArchiveAt} key={cameraPanelKey} onAuthRequired={() => setAuthOpen(true)} presentation="detail" />
+          {cameraDoors.length > 0 && <section className="camera-doors"><header><h2>Двери</h2></header><DoorGrid accessPoints={cameraDoors} {...doorProps} /></section>}
+        </div>
+      </div>
     }
 
     if (destination === 'events') {
-      return <EventJournal api={eventsApi} flatId={selectedFlat.id} onOpenArchive={openEventArchive} variant="full" />
+      return <EventJournal api={eventsApi} canOpenArchive={canOpenArchive} flatId={selectedFlat.id} onOpenArchive={openEventArchive} refreshKey={eventsRefresh.key} variant="full" />
     }
 
     if (destination === 'more') {
@@ -612,10 +767,10 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
           <button disabled={autoOpenMutationBusy} onClick={() => void disableAutoOpenFromHome()} type="button">Выключить</button>
           {autoOpenDisableFailed && <span role="alert">Не удалось выключить автооткрытие</span>}
         </section>
-      : <button className="auto-open-entry" onClick={() => selectDestination('more')} type="button">Автооткрытие</button>
+      : <button className="auto-open-entry" onClick={() => selectDestination('more')} type="button"><span>Автооткрытие · выкл</span><ChevronIcon direction="right" /></button>
 
     return <HomePage
-      activity={<EventJournal api={eventsApi} flatId={selectedFlat.id} onOpenArchive={openEventArchive} variant="compact" />}
+      activity={<EventJournal api={eventsApi} canOpenArchive={canOpenArchive} flatId={selectedFlat.id} onOpenArchive={openEventArchive} refreshKey={eventsRefresh.key} variant="compact" />}
       autoOpen={autoOpenStrip}
       camera={<>
         {deviceInventory.cameras.length > 1 && <div aria-label="Камеры на главной" className="home-camera-switch" role="group">
@@ -629,51 +784,47 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
         </div>}
         <CameraExperience
             api={api}
+            audioSuspended={activeCurrentCall !== null}
             camera={selectedCamera}
             flatId={selectedFlat.id}
             key={cameraPanelKey}
-            onOpenDetail={() => setView({ kind: 'camera', returnTo: destination })}
+            onAuthRequired={() => setAuthOpen(true)}
+            onOpenDetail={() => openCamera(destination)}
             presentation="preview"
           />
       </>}
-      doors={<DoorGrid
-            accessPoints={deviceInventory.accessPoints}
-            interactionLocked={doorInteractionLocked}
-            preparingLock={preparingLock}
-            blockedLock={blockedLock}
-            feedback={doorFeedback}
-            onPrepare={(point, lock) => void prepareDoor(selectedFlat, point, lock)}
-          />}
+      doors={<DoorGrid accessPoints={deviceInventory.accessPoints} {...doorProps} />}
       onOpenAllEvents={() => selectDestination('events')}
     />
   }
 
   let mainContent: ReactNode
   if (dashboard.status === 'loading') {
-    mainContent = <div className="loading-card" role="status"><span className="loading-ring" /><p>Загружаем объекты…</p></div>
+    mainContent = <div className="loading-card" role="status"><span className="loading-ring" /><p>Загружаем…</p></div>
   } else if (dashboard.status === 'error' && isUnauthorized(dashboard.error)) {
     mainContent = <StateCard eyebrow="MTS ID" title="Войдите в MTS ID" action={<button className="primary-button" onClick={() => setAuthOpen(true)} type="button">Войти с MTS ID</button>}><p>Авторизация нужна, чтобы загрузить ваши квартиры и домофоны.</p></StateCard>
   } else if (dashboard.status === 'error') {
-    mainContent = <StateCard eyebrow="Локальный API" title="Не удалось загрузить объекты" action={<button className="primary-button" onClick={retryDashboard} type="button">Повторить</button>}><p>Проверьте, что локальный сервис запущен, и повторите запрос.</p></StateCard>
+    mainContent = <StateCard eyebrow="Связь" title="Не удалось загрузить данные" action={<button className="primary-button" onClick={retryDashboard} type="button">Повторить</button>}><p>Нет связи с сервером домофона. Повторите попытку.</p></StateCard>
   } else if (dashboard.data.flats.length === 0) {
-    mainContent = <StateCard eyebrow="Объекты MTS" title="Нет доступных объектов"><p>MTS ID подключён, но сервис не вернул ни одной квартиры.</p></StateCard>
+    mainContent = <StateCard eyebrow="MTS ID" title="Квартир не найдено"><p>В аккаунте MTS ID нет квартир с домофоном.</p></StateCard>
   } else {
     mainContent = renderDeviceContent()
   }
 
-  const flatOptions = dashboard.status === 'success' ? dashboard.data.flats : []
   const moreVisible = view.kind === 'destination' && destination === 'more'
+  const flatSummary = <>
+    <span className="flat-icon"><FlatIcon /></span>
+    <span><small>Квартира</small><b>{selectedFlat?.label ?? (dashboard.status === 'loading' ? 'Загрузка…' : 'Не выбрана')}</b></span>
+  </>
   const shellHeader = <div className="shell-header-row">
-    <div className="flat-wrap">
-      <button className="flat-switcher" aria-expanded={flatOpen} aria-haspopup="menu" disabled={flatOptions.length === 0} onClick={() => setFlatOpen((open) => !open)} type="button">
-        <span className="flat-icon"><Glyph>⌂</Glyph></span>
-        <span><small>Текущий объект</small><b>{selectedFlat?.label ?? (dashboard.status === 'loading' ? 'Загрузка…' : 'Не выбран')}</b></span>
-        <Glyph>⌄</Glyph>
-      </button>
-      {flatOpen && <div className="flat-menu" role="menu">{flatOptions.map((flat) => <button aria-current={flat.id === selectedFlatId ? 'true' : undefined} onClick={() => selectFlat(flat.id)} role="menuitem" type="button" key={flat.id}><b>{flat.label}</b><small>{flat.address}</small></button>)}</div>}
+    <div className="flat-wrap" onKeyDown={onFlatMenuKeyDown} ref={flatWrapRef}>
+      {flatOptions.length > 1
+        ? <button aria-expanded={flatMenuOpen} aria-haspopup="menu" className="flat-switcher" onClick={() => setFlatOpen((open) => !open)} ref={flatButtonRef} type="button">{flatSummary}<ChevronIcon direction="down" /></button>
+        : <div className="flat-current">{flatSummary}</div>}
+      {flatMenuOpen && <div className="flat-menu" role="menu">{flatOptions.map((flat) => <button aria-current={flat.id === selectedFlatId ? 'true' : undefined} onClick={() => selectFlat(flat.id)} role="menuitem" type="button" key={flat.id}><b>{flat.label}</b><small>{flat.address}</small></button>)}</div>}
     </div>
     {selectedFlat && <span className="shell-property-address">{selectedFlat.address}</span>}
-    <button className="avatar" aria-label="Профиль подключения" onClick={() => setAuthOpen(true)} type="button">М</button>
+    <button aria-label="Аккаунт" className="icon-button account-button" onClick={() => setAuthOpen(true)} type="button"><AccountIcon /></button>
   </div>
   return <div className="app-frame">
     <AppShell destination={destination} header={shellHeader} onNavigate={selectDestination}>
@@ -702,13 +853,13 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
     {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} onLoggedOut={finishLogout} onSessionRestored={resumeRestoredSession} />}
     {doorIntent && <Modal className="door-dialog" labelledBy="door-confirm-title" onClose={closeDoorIntent} closeOnBackdrop>
       <button aria-label="Закрыть" className="dialog-close" disabled={doorExecuting} onClick={closeDoorIntent} type="button">×</button>
-      <span className="dialog-icon"><Glyph>⌑</Glyph></span>
+      <span className="dialog-icon"><DoorIcon /></span>
       <h2 id="door-confirm-title">Открыть дверь?</h2>
-      <p>Проверьте объект и замок. Следующее нажатие отправит физическую команду домофону.</p>
+      <p>Проверьте адрес и дверь. Дверь откроется после подтверждения.</p>
       <dl className="door-summary">
-        <div><dt>Объект</dt><dd><b>{doorIntent.flatLabel}</b><small>{doorIntent.flatAddress}</small></dd></div>
-        <div><dt>Точка входа</dt><dd>{doorIntent.accessPointName}</dd></div>
-        <div><dt>Замок</dt><dd>{doorIntent.lockName}</dd></div>
+        <div><dt>Адрес</dt><dd><b>{doorIntent.flatLabel}</b><small>{doorIntent.flatAddress}</small></dd></div>
+        <div><dt>Домофон</dt><dd>{doorIntent.accessPointName}</dd></div>
+        <div><dt>Дверь</dt><dd>{doorIntent.lockName}</dd></div>
       </dl>
       <p className="door-expiry">Действует до {formatDoorExpiry(doorIntent.expiresAt)}</p>
       <div className="dialog-actions">

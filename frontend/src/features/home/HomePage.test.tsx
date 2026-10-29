@@ -13,9 +13,11 @@ describe('HomePage', () => {
       onOpenAllEvents={() => undefined}
     />)
 
-    expect(screen.getByRole('heading', { name: 'Главная' })).toBeVisible()
-    expect(screen.getByRole('heading', { name: 'Камеры' })).toBeVisible()
+    expect(screen.getByRole('heading', { level: 1, name: 'Главная' })).toHaveClass('visually-hidden')
+    expect(screen.getByRole('heading', { name: 'Камеры' })).toHaveClass('visually-hidden')
+    expect(screen.getByRole('heading', { name: 'Двери' })).not.toHaveClass('visually-hidden')
     expect(screen.getByRole('heading', { name: 'Двери' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Последние события' })).not.toHaveClass('visually-hidden')
     expect(screen.getByText('Камера из API')).toBeVisible()
     expect(screen.getByText('Двери из API')).toBeVisible()
     expect(screen.getByRole('status')).toHaveTextContent('Автооткрытие из API')

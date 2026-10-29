@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Modal } from '../../app/Modal'
+import { DoorIcon } from '../intercom/DoorGrid'
 import { callApi, type CallApi, type CallOpenIntent, type CurrentCall } from './callApi'
 
 type Feedback = { kind: 'status' | 'error'; message: string }
@@ -234,7 +235,7 @@ function CallPageSession({
         message: action === 'hangup' ? 'Завершаем вызов…' : action === 'ignore' ? 'Вызов проигнорирован' : 'Вызов отклонён',
       })
     } catch {
-      setFeedback({ kind: 'error', message: 'Команда не подтверждена локальным сервисом. Состояние звонка обновится автоматически.' })
+      setFeedback({ kind: 'error', message: 'Команда не дошла до домофона. Состояние звонка обновится автоматически.' })
     } finally {
       commandInFlight.current = false
       setCommandBusy(null)
@@ -310,14 +311,14 @@ function CallPageSession({
   if (pollingError && !call) {
     return <>
       {presentation === 'page' && <section className="page-heading"><div><p className="eyebrow">Звонки</p><h1>Звонки</h1></div></section>}
-      <section className="content-card call-empty" role="alert"><span className="state-icon" aria-hidden="true">!</span><h2>Не удалось проверить звонки</h2><p>Локальный сервис продолжит попытки подключения автоматически.</p></section>
+      <section className="content-card call-empty" role="alert"><span className="state-icon" aria-hidden="true">!</span><h2>Не удалось проверить звонки</h2><p>Попробуем снова автоматически.</p></section>
     </>
   }
 
   if (!call) {
     return <>
       {presentation === 'page' && <section className="page-heading"><div><p className="eyebrow">Звонки</p><h1>Звонки</h1></div></section>}
-      <section className="content-card call-empty"><span className="state-icon" aria-hidden="true">☎</span><h2>Нет активного звонка</h2><p>Здесь появится только реальный вызов, полученный локальным сервисом.</p></section>
+      <section className="content-card call-empty"><span className="state-icon" aria-hidden="true">☎</span><h2>Нет активного звонка</h2><p>Здесь появится входящий вызов домофона.</p></section>
     </>
   }
 
@@ -327,7 +328,7 @@ function CallPageSession({
   const liveRole = feedback?.kind === 'error' ? 'alert' : 'status'
 
   return <>
-    {presentation === 'page' && <section className="page-heading"><div><p className="eyebrow">Домофон</p><h1>Звонок</h1><p>Сигнал и медиа получены через локальный API.</p></div></section>}
+    {presentation === 'page' && <section className="page-heading"><div><p className="eyebrow">Домофон</p><h1>Звонок</h1></div></section>}
     <section className={`call-stage call-${call.phase}`} aria-labelledby="current-call-title">
       <p className="call-live-message" role={liveRole}>{liveMessage}</p>
       <video
@@ -361,12 +362,12 @@ function CallPageSession({
     </section>
     {preparedOpen && <Modal className="door-dialog call-open-dialog" labelledBy="call-open-title" onClose={closeOpenConfirmation} closeOnBackdrop>
       <button aria-label="Закрыть" className="dialog-close" disabled={openExecuting} onClick={closeOpenConfirmation} type="button">×</button>
-      <span className="dialog-icon" aria-hidden="true">⌑</span>
+      <span className="dialog-icon"><DoorIcon /></span>
       <h2 id="call-open-title">Открыть дверь во время звонка?</h2>
-      <p>Следующее нажатие отправит физическую команду для текущего звонка.</p>
+      <p>Дверь откроется после подтверждения.</p>
       <dl className="door-summary">
         <div><dt>Домофон</dt><dd>{preparedOpen.callerName}</dd></div>
-        <div><dt>Звонок</dt><dd>Текущий вызов, ревизия {preparedOpen.revision}</dd></div>
+        <div><dt>Звонок</dt><dd>Текущий вызов</dd></div>
       </dl>
       <p className="door-expiry">Действует до {formatIntentExpiry(preparedOpen.expiresAt)}</p>
       <div className="dialog-actions">

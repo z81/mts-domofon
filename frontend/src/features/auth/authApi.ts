@@ -3,8 +3,8 @@ export interface AuthAccountOption {
   label: string
 }
 
-// Task 8 deliberately keeps SessionStatus provider-neutral; the UI displays it
-// but does not branch on undocumented values.
+// Task 8 deliberately keeps SessionStatus provider-neutral; the UI neither displays it
+// nor branches on undocumented values.
 export type SessionStatus = string
 
 export interface SessionView {

@@ -177,6 +177,7 @@ export function createProductionIntercomApi(fetcher: typeof fetch = fetch): Inte
     stopLive: async (sessionId) => {
       const response = await fetcher(`/api/v1/live/${encodeURIComponent(sessionId)}`, {
         credentials: 'same-origin',
+        keepalive: true,
         method: 'DELETE',
       })
       if (!response.ok) throw await errorFrom(response)

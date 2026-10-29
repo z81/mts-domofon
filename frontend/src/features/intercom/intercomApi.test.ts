@@ -87,6 +87,7 @@ describe('production intercom API boundary', () => {
     })
     expect(fetcher).toHaveBeenNthCalledWith(2, '/api/v1/live/5d7a5769-adf9-4a41-9bd8-12427e0ae921', {
       credentials: 'same-origin',
+      keepalive: true,
       method: 'DELETE',
     })
   })

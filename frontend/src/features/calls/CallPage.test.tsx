@@ -90,6 +90,7 @@ describe('call page states and controls', () => {
     render(<CallPage api={createApi()} call={null} />)
 
     expect(screen.getByRole('heading', { name: 'Нет активного звонка' })).toBeVisible()
+    expect(screen.getByText('Здесь появится входящий вызов домофона.')).toBeVisible()
     expect(screen.queryByRole('button', { name: 'Принять вызов' })).not.toBeInTheDocument()
     expect(screen.queryByText('Подъезд 1')).not.toBeInTheDocument()
   })
@@ -423,6 +424,8 @@ describe('confirmed call-scoped open', () => {
     expect(executeOpenIntent).not.toHaveBeenCalled()
     const dialog = await screen.findByRole('dialog', { name: 'Открыть дверь во время звонка?' })
     expect(within(dialog).getByText('Подъезд 1')).toBeVisible()
+    expect(within(dialog).getByText('Текущий вызов')).toBeVisible()
+    expect(dialog).not.toHaveTextContent(/ревизия/)
 
     const confirm = within(dialog).getByRole('button', { name: 'Подтвердить открытие' })
     await user.dblClick(confirm)

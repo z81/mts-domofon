@@ -31,6 +31,8 @@ describe('AuthPage', () => {
 
     await screen.findByRole('button', { name: 'Войти с MTS ID' })
 
+    expect(screen.getByRole('heading', { name: 'Вход через MTS ID' })).toBeVisible()
+    expect(document.body).not.toHaveTextContent(/VDome|локальн/i)
     expect(screen.queryByRole('button', { name: 'Войти по SMS' })).not.toBeInTheDocument()
   })
 
@@ -213,7 +215,8 @@ describe('AuthPage', () => {
     api.startAuth = async () => { throw new AuthApiError({ code: 'rate_limited', message: 'Слишком много попыток', retryable: true, requestId: 'e7411f58-d5e9-4a43-b25d-88ddf2014713', retryAfterSeconds: 2 }) }
     render(<AuthPage api={api} onClose={() => undefined} />)
 
-    expect(await screen.findByRole('heading', { name: 'Сессия восстановлена' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Вы вошли в MTS ID' })).toBeVisible()
+    expect(document.body).not.toHaveTextContent(/active|Статус/)
     await user.click(screen.getByRole('button', { name: 'Выйти' }))
     await user.click(await screen.findByRole('button', { name: 'Войти с MTS ID' }))
 
