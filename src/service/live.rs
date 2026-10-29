@@ -22,7 +22,11 @@ const SESSION_LIFETIME: Duration = Duration::from_secs(10 * 60);
 const MAX_PLAYLIST_BYTES: usize = 256 * 1024;
 const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CAMERA_KEY_BYTES: usize = 2_200;
-const STARTUP_SEGMENT_COUNT: usize = 3;
+// Players start on the oldest listed segment, so two 1 s segments leave a 1-2 s buffer. Chrome's
+// built-in HLS player rejects live playlists shorter than three segments, so the web app prefers
+// hls.js wherever Media Source Extensions exist.
+const STARTUP_SEGMENT_COUNT: usize = 2;
+const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,6 +176,22 @@ impl LiveSessionManager {
                 capacity: Arc::new(Semaphore::new(capacity)),
                 sessions: Mutex::new(Sessions::default()),
             }),
+        }
+    }
+
+    /// Returns the camera's running session, first waiting for an in-flight start to settle.
+    ///
+    /// Callers check this before resolving a provider source, so joining a running stream costs
+    /// no provider round trips.
+    pub async fn existing(&self, camera_key: &str) -> Option<LiveSessionView> {
+        loop {
+            let sessions = self.inner.sessions.lock().await;
+            if let Some(session_id) = sessions.by_camera.get(camera_key) {
+                return Some(session_view(*session_id));
+            }
+            let mut completion = sessions.starting.get(camera_key)?.completion.subscribe();
+            drop(sessions);
+            let _ = completion.changed().await;
         }
     }
 
@@ -493,6 +513,10 @@ impl LiveProcessRunner for FfmpegRunner {
                 "0",
                 "-protocol_whitelist",
                 "pipe,rtsp,rtsps,tcp,udp,tls,http,https,crypto",
+                // Frame-threaded decoding delays output by one frame per extra thread, and the
+                // default starts one thread per core.
+                "-threads",
+                "2",
                 "-i",
                 "pipe:0",
                 "-map",
@@ -507,16 +531,20 @@ impl LiveProcessRunner for FfmpegRunner {
                 "zerolatency",
                 "-pix_fmt",
                 "yuv420p",
-                "-g",
-                "25",
+                // Time-based keyframes keep segments at 1 s whatever the camera frame rate.
+                "-force_key_frames",
+                "expr:gte(t,n_forced*1)",
                 "-sc_threshold",
                 "0",
                 "-c:a",
                 "aac",
                 "-b:a",
-                "96k",
+                "64k",
                 "-ac",
                 "1",
+                // 48 kHz AAC frames last 21 ms instead of 128 ms at 8 kHz, so segments close sooner.
+                "-ar",
+                "48000",
                 "-f",
                 "hls",
                 "-hls_time",
@@ -539,8 +567,11 @@ impl LiveProcessRunner for FfmpegRunner {
         } else {
             ""
         };
+        // Rate probing waits for 20 frames by default, which delays the first segment by about
+        // 0.4 s. Ten frames still give an exact rate; probing less, or capping analyzeduration or
+        // probesize, breaks cameras whose H.264 headers carry no frame rate.
         let description = format!(
-            "ffconcat version 1.0\nfile '{}'\n{rtsp_transport}",
+            "ffconcat version 1.0\nfile '{}'\n{rtsp_transport}option fpsprobesize 10\n",
             source.expose_secret()
         );
         stdin
@@ -571,7 +602,7 @@ impl LiveProcessRunner for FfmpegRunner {
                 tracing::warn!(category, "live ffmpeg startup failed");
                 return Err(live_unavailable());
             }
-            sleep(Duration::from_millis(100)).await;
+            sleep(STARTUP_POLL_INTERVAL).await;
         }
     }
 }
@@ -664,12 +695,12 @@ mod tests {
     use super::playlist_has_startup_window;
 
     #[test]
-    fn playlist_is_not_ready_until_three_segments_are_published() {
+    fn playlist_is_not_ready_until_two_segments_are_published() {
+        let one_segment = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nsegment-000000.ts\n";
         let two_segments = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nsegment-000000.ts\n#EXTINF:1.0,\nsegment-000001.ts\n";
-        let three_segments = b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nsegment-000000.ts\n#EXTINF:1.0,\nsegment-000001.ts\n#EXTINF:1.0,\nsegment-000002.ts\n";
 
-        assert!(!playlist_has_startup_window(two_segments));
-        assert!(playlist_has_startup_window(three_segments));
+        assert!(!playlist_has_startup_window(one_segment));
+        assert!(playlist_has_startup_window(two_segments));
     }
 
     #[test]

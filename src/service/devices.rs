@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    domain::{AccessPoint, Camera, DeviceInventory, FlatId},
+    domain::{AccessPoint, Camera, Capability, DeviceInventory, FlatId},
     error::{AppError, ErrorCode},
     provider::mts::intercom::DeviceProvider,
 };
@@ -48,6 +48,17 @@ impl DeviceService {
                     false,
                 )
             })
+    }
+
+    /// Picks the flat's live-capable camera with the lowest ID, as the inventory orders cameras.
+    ///
+    /// Only the camera list is read: access points do not affect live capability.
+    pub async fn first_live_camera(&self, flat: &FlatId) -> Result<Option<Camera>, AppError> {
+        let mut cameras = self.provider.cameras(flat).await?;
+        cameras.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(cameras
+            .into_iter()
+            .find(|camera| matches!(camera.capabilities.live, Capability::Available)))
     }
 
     pub async fn ensure_lock(

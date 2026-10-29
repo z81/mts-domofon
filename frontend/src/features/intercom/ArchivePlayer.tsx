@@ -113,13 +113,14 @@ export function ArchivePlayer({ api, flatId, cameraId, cameraName, initialAt }: 
         cleanupPlayback(false)
         return
       }
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = session.playlistUrl
-      } else if (Hls.isSupported()) {
+      // Same player order as live video: Chrome's built-in HLS needs three segments to start.
+      if (Hls.isSupported()) {
         const hls = new Hls({ enableWorker: true, lowLatencyMode: false })
         hlsRef.current = hls
-        hls.loadSource(session.playlistUrl)
+        hls.once(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(session.playlistUrl))
         hls.attachMedia(video)
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = session.playlistUrl
       } else {
         cleanupPlayback(false)
         setPlayback('error')

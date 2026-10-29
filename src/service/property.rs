@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     domain::{
-        CallMode, CallSettings, CallSettingsPatch, CallSettingsStatus, Capability, FlatId,
+        CallMode, CallSettings, CallSettingsPatch, CallSettingsStatus, Capability, Flat, FlatId,
         PropertyDashboard,
     },
     error::{AppError, ErrorCode},
@@ -45,18 +45,7 @@ impl PropertyService {
         let (mut flats, selected_flat_id, call_settings) = {
             let mut state = self.state.lock().await;
             let flats = self.provider.flats().await?;
-            if !state.selection_loaded {
-                state.selected_flat_id = self.store.load_selected_flat().await?;
-                state.selection_loaded = true;
-            }
-            if state
-                .selected_flat_id
-                .as_ref()
-                .is_some_and(|selected| !flats.iter().any(|flat| &flat.id == selected))
-            {
-                self.store.clear_selected_flat().await?;
-                state.selected_flat_id = None;
-            }
+            self.reconcile_selection(&mut state, &flats).await?;
             let call_settings = match self.provider.call_settings().await {
                 Ok(mode) => CallSettingsStatus::Available(CallSettings {
                     mode,
@@ -99,6 +88,40 @@ impl PropertyService {
             selected_flat_id,
             call_settings,
         })
+    }
+
+    /// Returns the selected linked flat, or the first linked flat when none is selected.
+    ///
+    /// Unlike [`Self::dashboard`], this reads only the flat list, so stream selection does not
+    /// wait for call settings or per-flat diagnostics.
+    pub async fn default_flat(&self) -> Result<Option<FlatId>, AppError> {
+        let mut state = self.state.lock().await;
+        let flats = self.provider.flats().await?;
+        self.reconcile_selection(&mut state, &flats).await?;
+        Ok(state
+            .selected_flat_id
+            .clone()
+            .or_else(|| flats.first().map(|flat| flat.id.clone())))
+    }
+
+    async fn reconcile_selection(
+        &self,
+        state: &mut ServiceState,
+        flats: &[Flat],
+    ) -> Result<(), AppError> {
+        if !state.selection_loaded {
+            state.selected_flat_id = self.store.load_selected_flat().await?;
+            state.selection_loaded = true;
+        }
+        if state
+            .selected_flat_id
+            .as_ref()
+            .is_some_and(|selected| !flats.iter().any(|flat| &flat.id == selected))
+        {
+            self.store.clear_selected_flat().await?;
+            state.selected_flat_id = None;
+        }
+        Ok(())
     }
 
     pub async fn ensure_linked_flat(&self, flat_id: &FlatId) -> Result<(), AppError> {

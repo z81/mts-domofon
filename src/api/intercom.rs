@@ -6,12 +6,14 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, post},
 };
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    domain::{Capability, FlatId},
+    domain::FlatId,
     error::{ApiError, AppError, ErrorCode},
     request_id::RequestId,
+    service::live::{LiveSessionManager, LiveSessionView},
     state::AppState,
 };
 
@@ -157,45 +159,72 @@ async fn start_default_live(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
 ) -> Result<Response<Body>, ApiError> {
-    let dashboard = load_dashboard(&state, request_id).await?;
-    let selected_flat = dashboard.selected_flat_id.as_ref().and_then(|selected| {
-        dashboard
-            .flats
-            .iter()
-            .any(|flat| &flat.id == selected)
-            .then(|| selected.clone())
-    });
-    let flat_id = selected_flat
-        .or_else(|| dashboard.flats.first().map(|flat| flat.id.clone()))
+    let flat_id = state
+        .property_service()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .default_flat()
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?
         .ok_or_else(|| ApiError::new(request_id, linked_flat_not_found()))?;
-    let inventory = load_inventory(&state, request_id, flat_id.0.clone()).await?;
-    let camera = inventory
-        .cameras
-        .into_iter()
-        .find(|camera| matches!(camera.capabilities.live, Capability::Available))
+    let camera = state
+        .device_service()
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))?
+        .first_live_camera(&flat_id)
+        .await
+        .map_err(|error| ApiError::new(request_id, error))?
         .ok_or_else(|| ApiError::new(request_id, live_video_not_found()))?;
-    let view = start_live_session(&state, request_id, &flat_id, &camera.id).await?;
+    let sessions = live_session_manager(&state, request_id)?;
+    let camera_key = live_camera_key(&flat_id, &camera.id);
+    let view = match sessions.existing(&camera_key).await {
+        Some(view) => view,
+        None => {
+            let source = live_source(&state, request_id, &flat_id, &camera.id).await?;
+            start_live_session(sessions, request_id, camera_key, source).await?
+        }
+    };
     temporary_live_redirect(request_id, view)
 }
 
-async fn start_live_session(
+fn live_session_manager(
+    state: &AppState,
+    request_id: RequestId,
+) -> Result<&LiveSessionManager, ApiError> {
+    state
+        .live_session_manager()
+        .map(AsRef::as_ref)
+        .ok_or_else(runtime_unavailable)
+        .map_err(|error| ApiError::new(request_id, error))
+}
+
+/// Live sessions are shared per flat and camera; the length prefix keeps the key unambiguous.
+fn live_camera_key(flat_id: &FlatId, camera_id: &str) -> String {
+    format!("{:04x}{}{}", flat_id.0.len(), flat_id.0, camera_id)
+}
+
+async fn live_source(
     state: &AppState,
     request_id: RequestId,
     flat_id: &FlatId,
     camera_id: &str,
-) -> Result<crate::service::live::LiveSessionView, ApiError> {
-    let camera_key = format!("{:04x}{}{}", flat_id.0.len(), flat_id.0, camera_id);
-    let source = state
+) -> Result<SecretString, ApiError> {
+    state
         .live_source_provider()
         .ok_or_else(runtime_unavailable)
         .map_err(|error| ApiError::new(request_id, error))?
         .live_source(flat_id, camera_id)
         .await
-        .map_err(|error| ApiError::new(request_id, error))?;
-    state
-        .live_session_manager()
-        .ok_or_else(runtime_unavailable)
-        .map_err(|error| ApiError::new(request_id, error))?
+        .map_err(|error| ApiError::new(request_id, error))
+}
+
+async fn start_live_session(
+    sessions: &LiveSessionManager,
+    request_id: RequestId,
+    camera_key: String,
+    source: SecretString,
+) -> Result<LiveSessionView, ApiError> {
+    sessions
         .start(camera_key, source)
         .await
         .map_err(|error| ApiError::new(request_id, error))
@@ -203,7 +232,7 @@ async fn start_live_session(
 
 fn temporary_live_redirect(
     request_id: RequestId,
-    view: crate::service::live::LiveSessionView,
+    view: LiveSessionView,
 ) -> Result<Response<Body>, ApiError> {
     let location = format!("/api/v1/live/{}/index.m3u8", view.session_id);
     if view.playlist_url != location {
@@ -222,23 +251,24 @@ async fn start_live(
     Extension(request_id): Extension<RequestId>,
     Path(camera_id): Path<String>,
     Query(scope): Query<FlatScope>,
-) -> Result<Json<crate::service::live::LiveSessionView>, ApiError> {
+) -> Result<Json<LiveSessionView>, ApiError> {
     validate_opaque_id(&scope.flat_id).map_err(|error| ApiError::new(request_id, error))?;
     validate_opaque_id(&camera_id).map_err(|error| ApiError::new(request_id, error))?;
     let flat_id = FlatId(scope.flat_id);
-    ensure_linked_flat(&state, request_id, &flat_id).await?;
-    let devices = state
-        .device_service()
-        .ok_or_else(runtime_unavailable)
-        .map_err(|error| ApiError::new(request_id, error))?;
-    let camera = devices
-        .camera(&flat_id, &camera_id)
-        .await
-        .map_err(|error| ApiError::new(request_id, error))?;
-    if !matches!(camera.capabilities.live, Capability::Available) {
-        return Err(ApiError::new(request_id, live_video_not_found()));
+    let sessions = live_session_manager(&state, request_id)?;
+    let camera_key = live_camera_key(&flat_id, &camera_id);
+    // A running session was created only after this flat and camera passed every check below.
+    if let Some(view) = sessions.existing(&camera_key).await {
+        return Ok(Json(view));
     }
-    let view = start_live_session(&state, request_id, &flat_id, &camera_id).await?;
+    // The source lookup reads the flat's camera list and fails for cameras outside the flat or
+    // without live video, so it runs alongside the linked-flat check rather than after it.
+    let (linked, source) = tokio::join!(
+        ensure_linked_flat(&state, request_id, &flat_id),
+        live_source(&state, request_id, &flat_id, &camera_id),
+    );
+    linked?;
+    let view = start_live_session(sessions, request_id, camera_key, source?).await?;
     Ok(Json(view))
 }
 

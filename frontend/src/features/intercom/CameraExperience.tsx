@@ -105,12 +105,16 @@ function CameraLive({ api, camera, flatId, onStop }: { api: IntercomApi; camera:
       }
       const video = videoRef.current
       if (!video) return
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Chrome also reports native HLS, but its built-in player rejects live playlists shorter
+      // than three segments, so hls.js plays wherever Media Source Extensions exist.
+      if (Hls.isSupported()) {
+        const player = new Hls({ enableWorker: true, lowLatencyMode: true })
+        hls = player
+        // A playlist loaded before MediaSource opens waits for the next hls.js tick.
+        player.once(Hls.Events.MEDIA_ATTACHED, () => player.loadSource(session.playlistUrl))
+        player.attachMedia(video)
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = session.playlistUrl
-      } else if (Hls.isSupported()) {
-        hls = new Hls({ enableWorker: true, lowLatencyMode: true })
-        hls.loadSource(session.playlistUrl)
-        hls.attachMedia(video)
       } else {
         setStatus('error')
         return
