@@ -101,6 +101,7 @@ async fn request_tracing_redacts_sensitive_query_values() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .json()
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(BufferWriter(Arc::clone(&output)))
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);

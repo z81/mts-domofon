@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useEffectEvent, useRef, useState } from 'react'
 import { Modal } from '../../app/Modal'
 import {
   AuthApiError,
@@ -27,12 +27,13 @@ function directMtsLoginUrl(raw: string): string {
   return url.href
 }
 
-export function AuthPage({ api = authApi, navigate = navigateSameTab, onClose, onAuthenticated, onLoggedOut }: {
+export function AuthPage({ api = authApi, navigate = navigateSameTab, onClose, onAuthenticated, onLoggedOut, onSessionRestored }: {
   api?: AuthApi
   navigate?: (url: string) => void
   onClose: () => void
   onAuthenticated?: (session: SessionView) => void
   onLoggedOut?: () => void
+  onSessionRestored?: (session: SessionView) => void
 }) {
   const [view, setView] = useState<AuthView>('restoring')
   const [flowId, setFlowId] = useState<string | null>(null)
@@ -45,6 +46,7 @@ export function AuthPage({ api = authApi, navigate = navigateSameTab, onClose, o
   const startRequestInFlight = useRef(false)
   const importRequestInFlight = useRef(false)
   const logoutRequestInFlight = useRef(false)
+  const notifySessionRestored = useEffectEvent((restored: SessionView) => onSessionRestored?.(restored))
 
   useEffect(() => {
     const controller = new AbortController()
@@ -52,6 +54,7 @@ export function AuthPage({ api = authApi, navigate = navigateSameTab, onClose, o
       if (restored.authenticated) {
         setSession(restored)
         setView('session')
+        if (!controller.signal.aborted) notifySessionRestored(restored)
       } else {
         setView('choice')
       }

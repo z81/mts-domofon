@@ -1,10 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{
     Client, Method, RequestBuilder, Response, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -22,6 +25,7 @@ const KEYCLOAK_REFRESH_PATH: &str = "/user-service/api/v2/auth/refresh";
 const WEB_SSO_REFRESH_PATH: &str = "/user-service/api/auth/websso/refresh";
 const LOGOUT_PATH: &str = "/user-service/api/v2/auth/logout";
 const MAX_RESPONSE_BODY_LEN: usize = 64 * 1024;
+const MAX_RETRY_AFTER_SECONDS: u64 = 60 * 60;
 const DEVICE_TOKEN_HEADER: &str = "x-device-token";
 const DEVICE_TYPE_HEADER: &str = "x-device-type";
 const REQUEST_ID_HEADER: &str = "request-id";
@@ -134,8 +138,10 @@ impl ProviderAuthApi for MtsAuthApi {
         if let Some(device_token) = device_token {
             request = request.header(DEVICE_TOKEN_HEADER, secret_header(device_token)?);
         }
-        let response: KeycloakRefreshResponse = send_json(request).await?;
-        response.into_rotation()
+        send("keycloak_refresh", request, |body| {
+            decode::<KeycloakRefreshResponse>(body)?.into_rotation()
+        })
+        .await
     }
 
     async fn rotate_web_sso(
@@ -150,8 +156,10 @@ impl ProviderAuthApi for MtsAuthApi {
         if let Some(device_token) = device_token {
             request = request.header(DEVICE_TOKEN_HEADER, secret_header(device_token)?);
         }
-        let response: WebSsoRefreshResponse = send_json(request).await?;
-        response.into_token()
+        send("web_sso_refresh", request, |body| {
+            decode::<WebSsoRefreshResponse>(body)?.into_token()
+        })
+        .await
     }
 
     async fn logout(
@@ -163,7 +171,7 @@ impl ProviderAuthApi for MtsAuthApi {
         let body = RefreshRequest {
             refresh_token: refresh_token.expose_secret(),
         };
-        let response = match auth_flavor {
+        let request = match auth_flavor {
             AuthFlavor::WebSso => {
                 let mut request = self
                     .gateway_request(Method::POST, LOGOUT_PATH)?
@@ -172,20 +180,14 @@ impl ProviderAuthApi for MtsAuthApi {
                 if let Some(device_token) = device_token {
                     request = request.header(DEVICE_TOKEN_HEADER, secret_header(device_token)?);
                 }
-                request.send().await
+                request
             }
-            AuthFlavor::LegacySms => {
-                self.legacy_request(Method::POST, LOGOUT_PATH)?
-                    .header(CONTENT_TYPE, "application/json")
-                    .json(&body)
-                    .send()
-                    .await
-            }
-        }
-        .map_err(transport_error)?;
-        let response = classify(response).await?;
-        let _ = read_bounded(response).await?;
-        Ok(())
+            AuthFlavor::LegacySms => self
+                .legacy_request(Method::POST, LOGOUT_PATH)?
+                .header(CONTENT_TYPE, "application/json")
+                .json(&body),
+        };
+        send("logout", request, |_| Ok(())).await
     }
 }
 
@@ -261,14 +263,41 @@ impl WebSsoRefreshResponse {
     }
 }
 
-async fn send_json<T>(request: RequestBuilder) -> Result<T, AppError>
+async fn send<T>(
+    operation: &'static str,
+    request: RequestBuilder,
+    parse: impl FnOnce(&[u8]) -> Result<T, AppError>,
+) -> Result<T, AppError> {
+    let response = request.send().await.map_err(|error| {
+        tracing::warn!(
+            operation,
+            is_timeout = error.is_timeout(),
+            is_connect = error.is_connect(),
+            "MTS authentication request failed"
+        );
+        transport_error(error)
+    })?;
+    let status = response.status();
+    let result = match classify(response).await {
+        Ok(response) => read_bounded(response).await.and_then(|body| parse(&body)),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = &result {
+        tracing::warn!(
+            operation,
+            status = status.as_u16(),
+            code = ?error.code,
+            "MTS authentication request failed"
+        );
+    }
+    result
+}
+
+fn decode<T>(body: &[u8]) -> Result<T, AppError>
 where
     T: serde::de::DeserializeOwned,
 {
-    let response = request.send().await.map_err(transport_error)?;
-    let response = classify(response).await?;
-    let body = read_bounded(response).await?;
-    serde_json::from_slice(&body).map_err(|_| schema_error())
+    serde_json::from_slice(body).map_err(|_| schema_error())
 }
 
 async fn classify(response: Response) -> Result<Response, AppError> {
@@ -276,13 +305,23 @@ async fn classify(response: Response) -> Result<Response, AppError> {
     if status.is_success() {
         return Ok(response);
     }
-    let _ = read_bounded(response).await;
-    Err(match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => AppError::new(
-            ErrorCode::UpstreamAuthenticationFailed,
-            "MTS authentication operation failed.",
-            false,
-        ),
+    let error = match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            AppError::new(
+                ErrorCode::UpstreamAuthenticationFailed,
+                "MTS authentication operation failed.",
+                false,
+            )
+        }
+        StatusCode::TOO_MANY_REQUESTS => {
+            let mut error = AppError::new(
+                ErrorCode::RateLimited,
+                "MTS authentication rate limit was reached.",
+                true,
+            );
+            error.retry_after_seconds = retry_after(response.headers());
+            error
+        }
         status if status.is_server_error() => AppError::new(
             ErrorCode::UpstreamUnavailable,
             "MTS authentication service is unavailable.",
@@ -293,7 +332,23 @@ async fn classify(response: Response) -> Result<Response, AppError> {
             "MTS authentication service returned an unexpected response.",
             false,
         ),
-    })
+    };
+    let _ = read_bounded(response).await;
+    Err(error)
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    let seconds = value.parse().ok().or_else(|| {
+        let deadline = httpdate::parse_http_date(value).ok()?;
+        Some(
+            deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or(Duration::ZERO)
+                .as_secs(),
+        )
+    })?;
+    Some(seconds.min(MAX_RETRY_AFTER_SECONDS))
 }
 
 async fn read_bounded(response: Response) -> Result<Zeroizing<Vec<u8>>, AppError> {

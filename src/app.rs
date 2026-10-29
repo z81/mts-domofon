@@ -1,15 +1,15 @@
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use axum::{
     Router,
     extract::Request,
-    http::{Uri, header},
+    http::{Method, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use tower_http::{
     sensitive_headers::SetSensitiveHeadersLayer,
-    trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
+    trace::{DefaultOnRequest, DefaultOnResponse, OnRequest, OnResponse, TraceLayer},
 };
 use tracing::{Level, Span};
 
@@ -196,6 +196,55 @@ fn make_request_span(request: &Request) -> Span {
     )
 }
 
+#[derive(Clone, Copy)]
+struct QuietTrace;
+
+fn is_quiet_trace_request(request: &Request) -> bool {
+    request.method() == Method::GET && is_quiet_trace_path(request.uri().path())
+}
+
+fn is_quiet_trace_path(path: &str) -> bool {
+    if matches!(path, "/health/live" | "/api/v1/calls/current") {
+        return true;
+    }
+    path.strip_prefix("/api/v1/live/")
+        .and_then(|descendant| descendant.split_once('/'))
+        .is_some_and(|(session_id, asset)| {
+            !session_id.is_empty()
+                && (asset == "index.m3u8"
+                    || (asset.starts_with("segment-")
+                        && asset.ends_with(".ts")
+                        && !asset.contains('/')))
+        })
+}
+
+async fn mark_quiet_trace(request: Request, next: Next) -> Response {
+    let quiet = is_quiet_trace_request(&request);
+    let mut response = next.run(request).await;
+    if quiet {
+        response.extensions_mut().insert(QuietTrace);
+    }
+    response
+}
+
+fn trace_level(quiet: bool) -> Level {
+    if quiet { Level::DEBUG } else { Level::INFO }
+}
+
+fn log_request(request: &Request, span: &Span) {
+    DefaultOnRequest::new()
+        .level(trace_level(is_quiet_trace_request(request)))
+        .on_request(request, span);
+}
+
+fn log_response(response: &Response, latency: Duration, span: &Span) {
+    DefaultOnResponse::new()
+        .level(trace_level(
+            response.extensions().get::<QuietTrace>().is_some(),
+        ))
+        .on_response(response, latency, span);
+}
+
 pub fn sensitive_headers_layer() -> SetSensitiveHeadersLayer {
     SetSensitiveHeadersLayer::new([
         header::AUTHORIZATION,
@@ -210,11 +259,12 @@ pub fn sensitive_headers_layer() -> SetSensitiveHeadersLayer {
 
 pub fn with_http_middleware(router: Router) -> Router {
     router
+        .layer(middleware::from_fn(mark_quiet_trace))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_request_span)
-                .on_request(DefaultOnRequest::new().level(Level::INFO))
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                .on_request(log_request)
+                .on_response(log_response),
         )
         .layer(middleware::from_fn(attach_redacted_uri))
         .layer(sensitive_headers_layer())

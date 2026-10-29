@@ -59,6 +59,7 @@ export interface AuthApi {
   importWebSsoResponse(response: string, signal?: AbortSignal): Promise<AuthProgress>
   submitChallenge(flowId: string, input: ChallengeInput, signal?: AbortSignal): Promise<AuthProgress>
   getSession(signal?: AbortSignal): Promise<SessionView>
+  refreshSession(signal?: AbortSignal): Promise<SessionView>
   logout(): Promise<void>
 }
 
@@ -110,6 +111,11 @@ export function createProductionAuthApi(fetcher: typeof fetch = fetch): AuthApi 
       method: 'GET',
       signal,
     })),
+    refreshSession: async (signal) => readLocalResponse<SessionView>(await fetcher('/api/v1/session/refresh', {
+      credentials: 'same-origin',
+      method: 'POST',
+      signal,
+    })),
     logout: async () => readLocalResponse<void>(await fetcher('/api/v1/session', {
       credentials: 'same-origin',
       method: 'DELETE',
@@ -132,6 +138,7 @@ const syntheticAuthApi: AuthApi = {
   importWebSsoResponse: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'preview', authenticated_at: new Date().toISOString(), expires_at: null } }),
   submitChallenge: async (flowId, input) => nextSyntheticProgress(flowId, input),
   getSession: async () => ({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }),
+  refreshSession: async () => ({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }),
   logout: async () => undefined,
 }
 
@@ -166,6 +173,10 @@ export function getSession(signal?: AbortSignal): Promise<SessionView> {
   return defaultAuthApi.getSession(signal)
 }
 
+export function refreshSession(signal?: AbortSignal): Promise<SessionView> {
+  return defaultAuthApi.refreshSession(signal)
+}
+
 export function logout(): Promise<void> {
   return defaultAuthApi.logout()
 }
@@ -176,5 +187,6 @@ export const authApi: AuthApi = {
   importWebSsoResponse,
   submitChallenge,
   getSession,
+  refreshSession,
   logout,
 }

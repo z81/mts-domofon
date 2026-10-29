@@ -135,6 +135,7 @@ function anonymousAuthApi(): AuthApi {
     getSession: async () => ({ authenticated: false, status: 'anonymous', authenticated_at: null, expires_at: null }),
     importWebSsoResponse: async () => ({ status: 'authenticated', session: { authenticated: true, status: 'active', authenticated_at: '2026-08-06T09:00:00Z', expires_at: '2026-08-06T10:00:00Z' } }),
     logout: async () => undefined,
+    refreshSession: async () => { throw new Error('not used') },
     startAuth: async () => ({
       status: 'browser_redirect',
       flow_id: 'flow-1',

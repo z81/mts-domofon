@@ -13,6 +13,7 @@ function sequenceApi(challenges: readonly AuthChallenge[], session: SessionView 
   let index = 0
   return {
     getSession: async () => session,
+    refreshSession: async () => session,
     importWebSsoResponse: async () => authenticated,
     startAuth: async () => ({ status: 'challenge', flow_id: 'memory-only-flow', challenge: challenges[0] }),
     submitChallenge: async () => {

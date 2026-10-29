@@ -8,7 +8,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use domru_mts::auth::{AuthClock, AuthCoordinator, LogoutWarning, SsoTransport};
 use domru_mts::domain::auth::{
     AuthFlavor, AuthFlowId, AuthProgress, ChallengeInput, PersistedSession, SessionStatus,
@@ -66,6 +66,14 @@ struct FixedClock(DateTime<Utc>);
 impl AuthClock for FixedClock {
     fn now(&self) -> DateTime<Utc> {
         self.0
+    }
+}
+
+struct ManualClock(Mutex<DateTime<Utc>>);
+
+impl AuthClock for ManualClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().unwrap()
     }
 }
 
@@ -141,6 +149,7 @@ enum KeycloakAnswer {
         refresh_token: &'static str,
     },
     Failure,
+    Rejected,
 }
 
 enum WebSsoAnswer {
@@ -252,6 +261,7 @@ impl ProviderAuthApi for FakeProviderAuthApi {
                 refresh_token: SecretString::from(refresh_token),
             }),
             Some(KeycloakAnswer::Failure) => Err(upstream_error()),
+            Some(KeycloakAnswer::Rejected) => Err(rejected_error()),
             None => panic!("unexpected Keycloak rotation"),
         }
     }
@@ -314,6 +324,14 @@ fn upstream_error() -> AppError {
         ErrorCode::UpstreamUnavailable,
         "Synthetic upstream failure.",
         true,
+    )
+}
+
+fn rejected_error() -> AppError {
+    AppError::new(
+        ErrorCode::UpstreamAuthenticationFailed,
+        "Synthetic upstream rejection.",
+        false,
     )
 }
 
@@ -688,13 +706,14 @@ async fn concurrent_failed_refreshes_share_the_same_redacted_failure() {
 }
 
 #[tokio::test]
-async fn failed_keycloak_refresh_expires_access_and_retry_uses_retained_refresh_material() {
+async fn keycloak_refresh_keeps_the_session_on_transient_failure_and_expires_it_on_rejection() {
     let data_dir = TempDir::new().unwrap();
     let store = open_store(&data_dir).await;
     store.save_session(&persisted_session()).await.unwrap();
     let provider = Arc::new(FakeProviderAuthApi::new(
         [
             KeycloakAnswer::Failure,
+            KeycloakAnswer::Rejected,
             KeycloakAnswer::Success {
                 access_token: "access-after-keycloak-retry",
                 refresh_token: "refresh-after-keycloak-retry",
@@ -702,12 +721,15 @@ async fn failed_keycloak_refresh_expires_access_and_retry_uses_retained_refresh_
         ],
         [WebSsoAnswer::Success("websso-after-keycloak-retry")],
     ));
-    let coordinator = restore_with(
+    let clock = Arc::new(ManualClock(Mutex::new(instant(10))));
+    let coordinator = AuthCoordinator::restore_for_test(
         store.clone(),
         Arc::new(FakeSsoTransport::without_callback()),
-        Arc::clone(&provider),
+        provider.clone(),
+        clock.clone(),
     )
-    .await;
+    .await
+    .unwrap();
 
     let error = coordinator.refresh().await.unwrap_err();
 
@@ -715,10 +737,36 @@ async fn failed_keycloak_refresh_expires_access_and_retry_uses_retained_refresh_
     assert_eq!(
         coordinator.session().await,
         SessionView {
+            authenticated: true,
+            status: SessionStatus::Active,
+            authenticated_at: Some(instant(9)),
+            expires_at: None,
+        }
+    );
+    assert_eq!(
+        TokenSource::access_token(coordinator.as_ref())
+            .await
+            .unwrap()
+            .expose_secret(),
+        ACCESS_OLD
+    );
+    let backoff_error = TokenSource::refresh_after_unauthorized(coordinator.as_ref())
+        .await
+        .unwrap_err();
+    assert_eq!(backoff_error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(provider.keycloak_calls.load(Ordering::SeqCst), 1);
+
+    *clock.0.lock().unwrap() += TimeDelta::seconds(5);
+    let error = coordinator.refresh().await.unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::UpstreamAuthenticationFailed);
+    assert_eq!(
+        coordinator.session().await,
+        SessionView {
             authenticated: false,
             status: SessionStatus::Expired,
             authenticated_at: Some(instant(9)),
-            expires_at: Some(instant(10)),
+            expires_at: Some(instant(10) + TimeDelta::seconds(5)),
         }
     );
     assert!(
@@ -747,7 +795,7 @@ async fn failed_keycloak_refresh_expires_access_and_retry_uses_retained_refresh_
 
     assert_eq!(
         provider.seen_refresh_tokens.lock().unwrap().as_slice(),
-        [REFRESH_OLD, REFRESH_OLD]
+        [REFRESH_OLD, REFRESH_OLD, REFRESH_OLD]
     );
     assert_eq!(coordinator.session().await.status, SessionStatus::Active);
     assert_eq!(
@@ -760,7 +808,7 @@ async fn failed_keycloak_refresh_expires_access_and_retry_uses_retained_refresh_
 }
 
 #[tokio::test]
-async fn failed_websso_refresh_never_installs_partial_tokens_and_retry_uses_rotated_refresh() {
+async fn failed_websso_refresh_installs_rotated_keycloak_tokens_and_keeps_the_previous_websso() {
     let data_dir = TempDir::new().unwrap();
     let store = open_store(&data_dir).await;
     store.save_session(&persisted_session()).await.unwrap();
@@ -787,23 +835,34 @@ async fn failed_websso_refresh_never_installs_partial_tokens_and_retry_uses_rota
     )
     .await;
 
-    let error = coordinator.refresh().await.unwrap_err();
+    let view = coordinator.refresh().await.unwrap();
 
-    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
-    assert_eq!(coordinator.session().await.status, SessionStatus::Expired);
-    assert!(
+    assert_eq!(view.status, SessionStatus::Active);
+    assert_eq!(coordinator.session().await.status, SessionStatus::Active);
+    assert_eq!(
         TokenSource::access_token(coordinator.as_ref())
             .await
-            .is_none()
+            .unwrap()
+            .expose_secret(),
+        "partial-keycloak-access"
     );
-    let still_persisted = store.load_session().await.unwrap().unwrap();
+    let rotated = store.load_session().await.unwrap().unwrap();
     assert_eq!(
-        still_persisted.tokens.access_token.expose_secret(),
-        ACCESS_OLD
+        rotated.tokens.access_token.expose_secret(),
+        "partial-keycloak-access"
     );
     assert_eq!(
-        still_persisted.tokens.refresh_token.expose_secret(),
-        REFRESH_OLD
+        rotated.tokens.refresh_token.expose_secret(),
+        "partial-keycloak-refresh"
+    );
+    assert_eq!(
+        rotated
+            .tokens
+            .web_sso_access_token
+            .as_ref()
+            .unwrap()
+            .expose_secret(),
+        WEB_SSO_OLD
     );
 
     coordinator.refresh().await.unwrap();

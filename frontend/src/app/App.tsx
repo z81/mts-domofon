@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } from 'react'
 import { AuthPage } from '../features/auth/AuthPage'
-import { authApi as defaultAuthApi, type AuthApi } from '../features/auth/authApi'
+import { AuthApiError, authApi as defaultAuthApi, type AuthApi } from '../features/auth/authApi'
 import { IncomingCallOverlay } from '../features/calls/IncomingCallOverlay'
 import type { AutoOpenMutationLease } from '../features/calls/AutoOpenPanel'
 import {
@@ -77,6 +77,29 @@ function Glyph({ children }: { children: ReactNode }) {
 
 function isUnauthorized(error: unknown): boolean {
   return error instanceof IntercomApiError && error.status === 401
+}
+
+async function sessionRecovered(authApi: AuthApi, signal: AbortSignal): Promise<boolean> {
+  const session = await authApi.getSession(signal)
+  if (session.authenticated) return true
+  if (session.status !== 'expired') return false
+  try {
+    // Not tied to the load's signal: an aborted request must not cut a token rotation short.
+    return (await authApi.refreshSession()).authenticated
+  } catch (error) {
+    if (error instanceof AuthApiError && ['session_expired', 'upstream_authentication_failed'].includes(error.envelope.code)) return false
+    throw error
+  }
+}
+
+async function loadWithSessionRecovery<T>(authApi: AuthApi, signal: AbortSignal, load: () => Promise<T>, onRecovered: () => void): Promise<T> {
+  try {
+    return await load()
+  } catch (error) {
+    if (!isUnauthorized(error) || !await sessionRecovered(authApi, signal)) throw error
+    onRecovered()
+    return await load()
+  }
 }
 
 function preferredFlat(dashboard: PropertyDashboard): string | null {
@@ -170,6 +193,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
   const autoOpenMutationLease = useRef<AppAutoOpenMutationLease | null>(null)
   const autoOpenPolicyGeneration = useRef(0)
   const sessionEpoch = useRef(0)
+  const autoResumeEpoch = useRef<number | null>(null)
 
   useEffect(() => {
     const requestEpoch = sessionEpoch.current
@@ -190,8 +214,11 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
     if (!dataSessionEnabled) return
     const requestEpoch = sessionEpoch.current
     const controller = new AbortController()
-    api.getDashboard(controller.signal).then((result) => {
+    loadWithSessionRecovery(authApi, controller.signal, () => api.getDashboard(controller.signal), () => {
+      if (!controller.signal.aborted && requestEpoch === sessionEpoch.current) setCallSessionAuthenticated(true)
+    }).then((result) => {
       if (controller.signal.aborted || requestEpoch !== sessionEpoch.current) return
+      autoResumeEpoch.current = null
       const flatId = preferredFlat(result)
       setDashboard({ status: 'success', data: result })
       setSelectedFlatId(flatId)
@@ -204,7 +231,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
       if (isUnauthorized(error)) setCallSessionAuthenticated(false)
     })
     return () => controller.abort()
-  }, [api, dashboardReload, dataSessionEnabled])
+  }, [api, authApi, dashboardReload, dataSessionEnabled])
 
   useEffect(() => {
     if (!dataSessionEnabled || !selectedFlatId) return
@@ -212,15 +239,18 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
     const flatId = selectedFlatId
     const requestEpoch = sessionEpoch.current
     const controller = new AbortController()
-    api.getDevices(flatId, controller.signal).then((result) => {
+    loadWithSessionRecovery(authApi, controller.signal, () => api.getDevices(flatId, controller.signal), () => {
+      if (!controller.signal.aborted && requestEpoch === sessionEpoch.current) setCallSessionAuthenticated(true)
+    }).then((result) => {
       if (controller.signal.aborted || requestEpoch !== sessionEpoch.current) return
+      autoResumeEpoch.current = null
       setDevices({ status: 'success', flatId, data: result })
       setSelectedCameraId((current) => result.cameras.some((camera) => camera.id === current) ? current : (result.cameras[0]?.id ?? null))
     }).catch((error: unknown) => {
       if (!controller.signal.aborted && requestEpoch === sessionEpoch.current) setDevices({ status: 'error', flatId, error })
     })
     return () => controller.abort()
-  }, [api, dataSessionEnabled, deviceReload, selectedFlatId])
+  }, [api, authApi, dataSessionEnabled, deviceReload, selectedFlatId])
 
   const callPollingEnabled = dataSessionEnabled && callSessionAuthenticated === true
 
@@ -275,6 +305,8 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
   const inventory = devices.status === 'success' && devices.flatId === selectedFlatId ? devices.data : null
   const selectedCamera = inventory?.cameras.find((camera) => camera.id === selectedCameraId) ?? inventory?.cameras[0] ?? null
   const doorInteractionLocked = preparingLock !== null || doorIntent !== null || doorExecuting
+  const unauthenticated = (dashboard.status === 'error' && isUnauthorized(dashboard.error))
+    || (dashboard.status === 'success' && devices.status === 'error' && isUnauthorized(devices.error))
 
   const destination = view.kind === 'destination' ? view.destination : view.returnTo
 
@@ -357,6 +389,37 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
     setAutoOpenDisableFailed(false)
     setAutoOpenMutationBusy(false)
   }
+
+  function resumeSession() {
+    finishAuthentication()
+    autoResumeEpoch.current = sessionEpoch.current
+  }
+
+  function resumeRestoredSession() {
+    // Resume from the dialog once until a load succeeds: if that did not stick, the dialog must still offer logout.
+    if (unauthenticated && autoResumeEpoch.current !== sessionEpoch.current) resumeSession()
+  }
+
+  const resumeVisibleSession = useEffectEvent(() => {
+    if (unauthenticated) resumeSession()
+  })
+
+  useEffect(() => {
+    if (!unauthenticated) return
+    const controller = new AbortController()
+    function recheckSession() {
+      if (document.visibilityState !== 'visible') return
+      const requestEpoch = sessionEpoch.current
+      authApi.getSession(controller.signal).then((session) => {
+        if (session.authenticated && !controller.signal.aborted && requestEpoch === sessionEpoch.current) resumeVisibleSession()
+      }).catch(() => undefined)
+    }
+    document.addEventListener('visibilitychange', recheckSession)
+    return () => {
+      document.removeEventListener('visibilitychange', recheckSession)
+      controller.abort()
+    }
+  }, [authApi, unauthenticated])
 
   function retryDashboard() {
     setDashboard({ status: 'loading' })
@@ -636,7 +699,7 @@ function App({ api = intercomApi, authApi = defaultAuthApi, callsApi = callApi, 
       </div>}
     </AppShell>
     <IncomingCallOverlay api={callsApi} autoOpenResult={activeCallAutoOpenResult} call={activeCurrentCall} loading={callLoading} pollingError={callPollingError} />
-    {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} onLoggedOut={finishLogout} />}
+    {authOpen && <AuthPage api={authApi} onClose={() => setAuthOpen(false)} onAuthenticated={finishAuthentication} onLoggedOut={finishLogout} onSessionRestored={resumeRestoredSession} />}
     {doorIntent && <Modal className="door-dialog" labelledBy="door-confirm-title" onClose={closeDoorIntent} closeOnBackdrop>
       <button aria-label="Закрыть" className="dialog-close" disabled={doorExecuting} onClick={closeDoorIntent} type="button">×</button>
       <span className="dialog-icon"><Glyph>⌑</Glyph></span>

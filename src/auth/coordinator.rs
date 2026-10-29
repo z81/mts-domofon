@@ -1,7 +1,10 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, Weak},
+};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use secrecy::SecretString;
 use tokio::sync::{Mutex, RwLock};
 
@@ -14,6 +17,9 @@ use crate::{
     provider::mts::{ProviderAuthApi, TokenSource, sms::MtsLegacySmsAuth, sso::MtsSsoTransport},
     storage::SecretStore,
 };
+
+const REFRESH_RETRY_INITIAL_DELAY_SECONDS: i64 = 5;
+const REFRESH_RETRY_MAX_DELAY_SECONDS: i64 = 5 * 60;
 
 pub trait AuthClock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
@@ -103,6 +109,7 @@ pub struct LogoutResult {
 }
 
 pub struct AuthCoordinator {
+    this: Weak<Self>,
     state: RwLock<CoordinatorState>,
     operation: Mutex<()>,
     transport: Arc<dyn SsoTransport>,
@@ -120,6 +127,7 @@ struct CoordinatorState {
     generation: u64,
     session: SessionState,
     last_refresh: Option<RefreshOutcome>,
+    refresh_backoff: Option<RefreshBackoff>,
 }
 
 enum SessionState {
@@ -130,6 +138,7 @@ enum SessionState {
 
 struct ExpiredSession {
     refresh_token: SecretString,
+    web_sso_access_token: Option<SecretString>,
     device_token: Option<SecretString>,
     auth_flavor: AuthFlavor,
     authenticated_at: DateTime<Utc>,
@@ -139,6 +148,7 @@ struct ExpiredSession {
 struct RefreshMaterial {
     generation: u64,
     refresh_token: SecretString,
+    web_sso_access_token: Option<SecretString>,
     device_token: Option<SecretString>,
     auth_flavor: AuthFlavor,
     authenticated_at: DateTime<Utc>,
@@ -147,6 +157,13 @@ struct RefreshMaterial {
 struct RefreshOutcome {
     observed_generation: u64,
     result: Result<SessionView, AppError>,
+}
+
+struct RefreshBackoff {
+    consecutive_failures: u32,
+    failed_at: DateTime<Utc>,
+    retry_at: DateTime<Utc>,
+    error: AppError,
 }
 
 impl AuthCoordinator {
@@ -179,11 +196,13 @@ impl AuthCoordinator {
             Some(session) => (1, SessionState::Active(session)),
             None => (0, SessionState::Anonymous),
         };
-        Ok(Arc::new(Self {
+        Ok(Arc::new_cyclic(|this| Self {
+            this: this.clone(),
             state: RwLock::new(CoordinatorState {
                 generation,
                 session,
                 last_refresh: None,
+                refresh_backoff: None,
             }),
             operation: Mutex::new(()),
             transport,
@@ -262,6 +281,7 @@ impl AuthCoordinator {
         state.generation = next_generation(state.generation)?;
         state.session = SessionState::Active(session);
         state.last_refresh = None;
+        state.refresh_backoff = None;
         Ok(AuthProgress::Authenticated { session: view })
     }
 
@@ -280,11 +300,27 @@ impl AuthCoordinator {
 
     pub async fn refresh(&self) -> Result<SessionView, AppError> {
         let observed_generation = self.state.read().await.generation;
+        // Rotation runs detached so a dropped caller (client disconnect) cannot lose rotated tokens.
+        let Some(coordinator) = self.this.upgrade() else {
+            return self.refresh_observed(observed_generation).await;
+        };
+        tokio::spawn(async move { coordinator.refresh_observed(observed_generation).await })
+            .await
+            .unwrap_or_else(|_| Err(interrupted_refresh_error()))
+    }
+
+    async fn refresh_observed(&self, observed_generation: u64) -> Result<SessionView, AppError> {
         let _operation = self.operation.lock().await;
         let material = {
             let state = self.state.read().await;
             if state.generation != observed_generation {
                 return coalesced_refresh_result(&state, observed_generation);
+            }
+            // A clock that moved backwards ends the backoff instead of extending it.
+            if let Some(backoff) = &state.refresh_backoff
+                && (backoff.failed_at..backoff.retry_at).contains(&self.clock.now())
+            {
+                return Err(backoff.error.clone());
             }
             refresh_material(&state)?
         };
@@ -296,9 +332,17 @@ impl AuthCoordinator {
             .await
         {
             Ok(tokens) => tokens,
-            Err(error) => {
+            Err(error) if error.code == ErrorCode::UpstreamAuthenticationFailed => {
+                tracing::warn!(
+                    code = ?error.code,
+                    "MTS rejected the session refresh; session expired"
+                );
                 self.install_expired(material, replacement_generation, error.clone())
                     .await;
+                return Err(error);
+            }
+            Err(error) => {
+                self.start_refresh_backoff(&error).await;
                 return Err(error);
             }
         };
@@ -310,16 +354,12 @@ impl AuthCoordinator {
             {
                 Ok(token) => Some(token),
                 Err(error) => {
-                    self.install_expired(
-                        RefreshMaterial {
-                            refresh_token: keycloak.refresh_token,
-                            ..material
-                        },
-                        replacement_generation,
-                        error.clone(),
-                    )
-                    .await;
-                    return Err(error);
+                    tracing::warn!(
+                        code = ?error.code,
+                        retryable = error.retryable,
+                        "MTS web SSO refresh failed; keeping the previous web SSO token"
+                    );
+                    material.web_sso_access_token
                 }
             }
         } else {
@@ -330,22 +370,16 @@ impl AuthCoordinator {
                 access_token: keycloak.access_token,
                 refresh_token: keycloak.refresh_token,
                 web_sso_access_token,
-                device_token: material.device_token.clone(),
+                device_token: material.device_token,
             },
             auth_flavor: material.auth_flavor,
             authenticated_at: material.authenticated_at,
         };
         if let Err(error) = self.store.save_session(&replacement).await {
-            self.install_expired(
-                RefreshMaterial {
-                    refresh_token: replacement.tokens.refresh_token.clone(),
-                    ..material
-                },
-                replacement_generation,
-                error.clone(),
-            )
-            .await;
-            return Err(error);
+            tracing::error!(
+                code = ?error.code,
+                "refreshed MTS session could not be persisted; keeping it in memory"
+            );
         }
 
         let view = active_view(&replacement);
@@ -356,6 +390,12 @@ impl AuthCoordinator {
             observed_generation,
             result: Ok(view.clone()),
         });
+        let previous_failures = state
+            .refresh_backoff
+            .take()
+            .map_or(0, |backoff| backoff.consecutive_failures);
+        drop(state);
+        tracing::info!(previous_failures, "MTS session refreshed");
         Ok(view)
     }
 
@@ -379,6 +419,7 @@ impl AuthCoordinator {
             state.generation = next_generation(state.generation)?;
             state.session = SessionState::Anonymous;
             state.last_refresh = None;
+            state.refresh_backoff = None;
             logout_material
         };
         self.transport.clear();
@@ -402,6 +443,7 @@ impl AuthCoordinator {
         state.generation = generation;
         state.session = SessionState::Expired(ExpiredSession {
             refresh_token: material.refresh_token,
+            web_sso_access_token: material.web_sso_access_token,
             device_token: material.device_token,
             auth_flavor: material.auth_flavor,
             authenticated_at: material.authenticated_at,
@@ -411,6 +453,37 @@ impl AuthCoordinator {
             observed_generation: material.generation,
             result: Err(error),
         });
+        state.refresh_backoff = None;
+    }
+
+    async fn start_refresh_backoff(&self, error: &AppError) {
+        let failed_at = self.clock.now();
+        let mut state = self.state.write().await;
+        let consecutive_failures = state
+            .refresh_backoff
+            .as_ref()
+            .map_or(1, |backoff| backoff.consecutive_failures.saturating_add(1));
+        let retry_after_seconds = error.retry_after_seconds.map_or(0, |seconds| {
+            i64::try_from(seconds)
+                .unwrap_or(i64::MAX)
+                .min(REFRESH_RETRY_MAX_DELAY_SECONDS)
+        });
+        let retry_delay_seconds =
+            refresh_retry_delay_seconds(consecutive_failures).max(retry_after_seconds);
+        state.refresh_backoff = Some(RefreshBackoff {
+            consecutive_failures,
+            failed_at,
+            retry_at: failed_at + TimeDelta::seconds(retry_delay_seconds),
+            error: error.clone(),
+        });
+        drop(state);
+        tracing::warn!(
+            code = ?error.code,
+            retryable = error.retryable,
+            consecutive_failures,
+            retry_delay_seconds,
+            "MTS session refresh failed; keeping the current session"
+        );
     }
 
     async fn install_web_sso_session(&self, tokens: TokenBundle) -> Result<SessionView, AppError> {
@@ -425,6 +498,7 @@ impl AuthCoordinator {
         state.generation = next_generation(state.generation)?;
         state.session = SessionState::Active(session);
         state.last_refresh = None;
+        state.refresh_backoff = None;
         Ok(view)
     }
 }
@@ -479,6 +553,7 @@ fn refresh_material(state: &CoordinatorState) -> Result<RefreshMaterial, AppErro
         SessionState::Active(session) => Ok(RefreshMaterial {
             generation: state.generation,
             refresh_token: session.tokens.refresh_token.clone(),
+            web_sso_access_token: session.tokens.web_sso_access_token.clone(),
             device_token: session.tokens.device_token.clone(),
             auth_flavor: session.auth_flavor,
             authenticated_at: session.authenticated_at,
@@ -486,6 +561,7 @@ fn refresh_material(state: &CoordinatorState) -> Result<RefreshMaterial, AppErro
         SessionState::Expired(session) => Ok(RefreshMaterial {
             generation: state.generation,
             refresh_token: session.refresh_token.clone(),
+            web_sso_access_token: session.web_sso_access_token.clone(),
             device_token: session.device_token.clone(),
             auth_flavor: session.auth_flavor,
             authenticated_at: session.authenticated_at,
@@ -518,6 +594,12 @@ fn active_view(session: &PersistedSession) -> SessionView {
     }
 }
 
+fn refresh_retry_delay_seconds(consecutive_failures: u32) -> i64 {
+    REFRESH_RETRY_INITIAL_DELAY_SECONDS
+        .saturating_mul(2_i64.saturating_pow(consecutive_failures.saturating_sub(1)))
+        .min(REFRESH_RETRY_MAX_DELAY_SECONDS)
+}
+
 fn next_generation(generation: u64) -> Result<u64, AppError> {
     generation.checked_add(1).ok_or_else(|| {
         AppError::new(
@@ -533,6 +615,14 @@ fn session_expired_error() -> AppError {
         ErrorCode::SessionExpired,
         "Provider session expired.",
         false,
+    )
+}
+
+fn interrupted_refresh_error() -> AppError {
+    AppError::new(
+        ErrorCode::Internal,
+        "Provider session refresh was interrupted.",
+        true,
     )
 }
 
