@@ -23,6 +23,9 @@ const MAX_SECRET_STATE_BYTES: usize = 256 * 1024;
 const MAX_PERSISTENT_IDS: usize = 128;
 const MAX_PERSISTENT_ID_BYTES: usize = 512;
 const MAX_CONSECUTIVE_STARTUP_FAILURES: u8 = 3;
+const FCM_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const FCM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const FCM_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 const CURRENT_USER_PATH: &str = "/domofon/api/security/v1/users/self";
 const USERS_PATH: &str = "/domofon/api/security/v1/users";
@@ -703,6 +706,9 @@ impl FcmBootstrapService {
                 }
             };
             connection_cancel.cancel();
+            if let Err(error) = &connection_result {
+                tracing::warn!(%error, "FCM push connection ended; reconnecting");
+            }
             if matches!(connection_result, Err(FcmServiceError::Transport)) && !observed_event {
                 consecutive_startup_failures = consecutive_startup_failures.saturating_add(1);
                 if consecutive_startup_failures >= MAX_CONSECUTIVE_STARTUP_FAILURES {
@@ -753,9 +759,15 @@ impl FcmBootstrapService {
                     }
                     self.store.save(state).await?;
                 }
-                let Ok(Some(bootstrap)) = parse_incoming_call_bootstrap(&body) else {
-                    return Ok(());
+                let bootstrap = match parse_incoming_call_bootstrap(&body) {
+                    Ok(Some(bootstrap)) => bootstrap,
+                    Ok(None) => return Ok(()),
+                    Err(_) => {
+                        tracing::warn!("FCM incoming call payload could not be parsed");
+                        return Ok(());
+                    }
                 };
+                tracing::info!("FCM incoming call received");
                 tokio::select! {
                     () = cancellation.cancelled() => return Ok(()),
                     result = output.send(bootstrap) => {
@@ -776,9 +788,16 @@ pub async fn acknowledge_heartbeat<W>(writer: &mut W) -> Result<(), FcmServiceEr
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    writer
-        .write_all(&fcm_push_listener::new_heartbeat_ack())
+    write_fcm_frame(writer, &fcm_push_listener::new_heartbeat_ack()).await
+}
+
+async fn write_fcm_frame<W>(writer: &mut W, frame: &[u8]) -> Result<(), FcmServiceError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(FCM_IO_TIMEOUT, writer.write_all(frame))
         .await
+        .map_err(|_| FcmServiceError::Transport)?
         .map_err(|_| FcmServiceError::Transport)
 }
 
@@ -826,18 +845,51 @@ impl FcmTransport for VendoredFcmTransport {
                 .await
                 .map_err(|_| FcmServiceError::ChannelClosed)?;
         }
-        let connection = checked
-            .new_connection(state.persistent_ids.clone())
-            .await
-            .map_err(|_| FcmServiceError::Transport)?;
+        let connection = tokio::select! {
+            () = cancellation.cancelled() => return Ok(()),
+            result = tokio::time::timeout(
+                FCM_IO_TIMEOUT,
+                checked.new_connection(state.persistent_ids.clone()),
+            ) => result
+                .map_err(|_| FcmServiceError::Transport)?
+                .map_err(|_| FcmServiceError::Transport)?,
+        };
         let mut stream =
             fcm_push_listener::MessageStream::wrap(connection, &state.registration.keys);
+        tracing::info!("FCM MCS connection opened");
+
+        // Probe immediately, then periodically. TCP can remain ESTABLISHED after a
+        // NAT or network silently drops it, so reads alone cannot detect a dead link.
+        let mut heartbeat_deadline = tokio::time::Instant::now();
+        let mut waiting_for_heartbeat = false;
 
         loop {
             let message = tokio::select! {
+                biased;
                 () = cancellation.cancelled() => return Ok(()),
+                () = tokio::time::sleep_until(heartbeat_deadline) => {
+                    if waiting_for_heartbeat {
+                        tracing::warn!("FCM heartbeat timed out; reconnecting");
+                        return Err(FcmServiceError::Transport);
+                    }
+                    // MCS tag followed by a zero-length protobuf HeartbeatPing.
+                    let ping = [fcm_push_listener::MessageTag::HeartbeatPing as u8, 0];
+                    tokio::select! {
+                        () = cancellation.cancelled() => return Ok(()),
+                        result = write_fcm_frame(&mut *stream, &ping) => result?,
+                    }
+                    waiting_for_heartbeat = true;
+                    heartbeat_deadline = tokio::time::Instant::now() + FCM_HEARTBEAT_TIMEOUT;
+                    tracing::debug!("FCM heartbeat sent");
+                    continue;
+                }
                 message = stream.next() => message,
             };
+            // Like the Chromium MCS client, any incoming frame proves liveness.
+            if matches!(&message, Some(Ok(_))) {
+                waiting_for_heartbeat = false;
+                heartbeat_deadline = tokio::time::Instant::now() + FCM_HEARTBEAT_INTERVAL;
+            }
             match message {
                 Some(Ok(fcm_push_listener::Message::HeartbeatPing)) => {
                     tokio::select! {
@@ -853,8 +905,29 @@ impl FcmTransport for VendoredFcmTransport {
                         .await
                         .map_err(|_| FcmServiceError::ChannelClosed)?;
                 }
-                Some(Ok(fcm_push_listener::Message::Other(_, _))) => {}
-                Some(Err(_)) | None => return Err(FcmServiceError::Transport),
+                Some(Ok(fcm_push_listener::Message::Other(tag, _))) => {
+                    if tag == fcm_push_listener::MessageTag::HeartbeatAck as u8 {
+                        tracing::info!("FCM heartbeat acknowledged");
+                    } else if tag == fcm_push_listener::MessageTag::StreamErrorStanza as u8 {
+                        tracing::warn!("FCM server reported a stream error");
+                        return Err(FcmServiceError::Transport);
+                    } else {
+                        tracing::debug!(tag, "FCM control message received");
+                    }
+                }
+                Some(Err(fcm_push_listener::Error::Socket(error))) => {
+                    tracing::warn!(%error, "FCM socket failed");
+                    return Err(FcmServiceError::Transport);
+                }
+                Some(Err(error)) => {
+                    // Google redelivers an unacknowledged stanza on every login, so
+                    // dropping the link here would loop forever on the same message.
+                    tracing::warn!(%error, "FCM stanza could not be decoded; skipping");
+                }
+                None => {
+                    tracing::warn!("FCM server closed the connection");
+                    return Err(FcmServiceError::Transport);
+                }
             }
         }
     }

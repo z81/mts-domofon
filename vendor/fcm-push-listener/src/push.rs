@@ -50,9 +50,18 @@ pub struct DataMessage {
     pub persistent_id: Option<String>,
 }
 
+/// Reads a base64 parameter from a `name=value;name=value` header, without its padding.
+fn web_push_param<'a>(header: &'a str, name: &str) -> &'a str {
+    header
+        .split(';')
+        .find_map(|param| param.trim().strip_prefix(name)?.strip_prefix('='))
+        .unwrap_or_default()
+        .trim_end_matches('=')
+}
+
 impl DataMessage {
     fn decode(eckey: &EcKeyComponents, auth_secret: &[u8], bytes: &[u8]) -> Result<Self, Error> {
-        use base64::engine::general_purpose::URL_SAFE;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use ece::legacy::AesGcmEncryptedBlock;
         use prost::Message;
@@ -72,9 +81,9 @@ impl DataMessage {
         for field in message.app_data {
             match field.key.as_str() {
                 "crypto-key" => {
-                    // crypto_key format: dh=abc...
-                    kex = URL_SAFE
-                        .decode(&field.value[3..])
+                    // crypto_key format: dh=abc...[;p256ecdsa=def...]
+                    kex = URL_SAFE_NO_PAD
+                        .decode(web_push_param(&field.value, "dh"))
                         .map_err(|e| Error::Base64Decode("FCM message crypto-key", e))?;
 
                     if !salt.is_empty() {
@@ -82,9 +91,9 @@ impl DataMessage {
                     }
                 }
                 "encryption" => {
-                    // encryption format: salt=abc...
-                    salt = URL_SAFE
-                        .decode(&field.value[5..])
+                    // encryption format: salt=abc...[;rs=4096]
+                    salt = URL_SAFE_NO_PAD
+                        .decode(web_push_param(&field.value, "salt"))
                         .map_err(|e| Error::Base64Decode("FCM message encryption params", e))?;
 
                     if !kex.is_empty() {
