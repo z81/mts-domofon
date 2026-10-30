@@ -536,6 +536,8 @@ impl LiveProcessRunner for FfmpegRunner {
                 "expr:gte(t,n_forced*1)",
                 "-sc_threshold",
                 "0",
+                "-af",
+                "aformat=sample_fmts=s16,speechnorm=e=25:r=0.0001:l=1",
                 "-c:a",
                 "aac",
                 "-b:a",
