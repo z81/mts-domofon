@@ -171,6 +171,11 @@ Request logging redacts authorization headers, cookies, sensitive query values, 
 
 ## Development
 
+Optional [local face-probe tools](scripts/face-probe/README.md) support recorded-video
+experiments and an explicitly started live diagnostic collector with screenshots,
+a lightweight dashboard and a separate opt-in Docker Compose service.
+They are separate from the application and cannot open doors.
+
 Run the backend test suite:
 
 ```shell

@@ -1,0 +1,18 @@
+# Allowlist: reference images, reports and model weights must never enter a build context.
+*
+!Dockerfile
+!requirements.txt
+!assets.py
+!engine.py
+!reference_inputs.py
+!probe.py
+!watch.py
+!watch_store.py
+!watch_stream.py
+!dashboard.py
+!dashboard_worker.py
+!dashboard_reports.py
+!web/
+!web/index.html
+!web/app.js
+!web/style.css

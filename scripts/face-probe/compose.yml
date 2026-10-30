@@ -1,0 +1,45 @@
+name: face-probe
+
+services:
+  face-probe:
+    build:
+      context: .
+    environment:
+      FACE_PROBE_BASE_URL: ${FACE_PROBE_BASE_URL:-http://host.docker.internal:3000}
+    ports:
+      - target: 8765
+        published: "${FACE_PROBE_PORT:-8765}"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${FACE_PROBE_MODELS_DIR:-./models}
+        target: /models
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FACE_PROBE_REFERENCES_DIR:-./references}
+        target: /references
+        read_only: true
+      - type: bind
+        source: ${FACE_PROBE_DATA_DIR:-./reports/dashboard}
+        target: /data
+        bind:
+          create_host_path: false
+    user: "${FACE_PROBE_UID:-10001}:${FACE_PROBE_GID:-10001}"
+    read_only: true
+    tmpfs: /tmp:rw,size=268435456,mode=1777,nodev,nosuid,noexec
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    cpus: 4.0
+    mem_limit: 2g
+    pids_limit: 128
+    restart: unless-stopped
+    stop_grace_period: 25s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

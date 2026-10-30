@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Face probe · Диагностика домофона</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">К диагностике</a>
+  <header class="header">
+    <div class="brand"><span class="brand-icon" aria-hidden="true">F</span><div><strong>Face probe</strong><small>Диагностика домофона</small></div></div>
+    <div class="header-actions"><span class="badge">Без открытия двери</span><label class="theme-label">Тема<select id="theme"><option value="auto">Системная</option><option value="light">Светлая</option><option value="dark">Тёмная</option></select></label></div>
+  </header>
+  <main id="main">
+    <div class="page-title"><div><h1>Наблюдение за потоком</h1><p id="source">Подключение к сервису…</p></div><span id="connection" role="status">Загрузка…</span></div>
+    <div id="error" class="notice error" role="alert" hidden></div>
+    <section class="panel controls" aria-labelledby="controls-title">
+      <div class="section-heading"><h2 id="controls-title">Сбор данных</h2><span id="worker-state" class="badge">Остановлен</span></div>
+      <form id="capture-form">
+        <fieldset id="settings">
+          <label>Режим<select id="mode"><option value="compare">FaceLiVTv2-L · сходство</option><option value="detect_only">Только детекция лиц</option></select></label>
+          <label>Проверок / с<input id="fps" type="number" min="0.1" max="10" step="0.1" value="3" required></label>
+          <label>Между скринами, с<input id="interval" type="number" min="0" max="3600" step="0.1" value="5" required></label>
+          <label>Длительность, с<input id="duration" type="number" min="0" max="604800" step="1" value="0" required></label>
+        </fieldset>
+        <div class="control-footer"><p id="config-note">0 секунд длительности — до остановки или лимита диска.</p><div class="buttons"><button id="start" class="primary" type="submit" disabled>Запустить сбор</button><button id="stop" type="button" disabled>Остановить</button></div></div>
+      </form>
+      <p id="reference-note" class="muted"></p>
+    </section>
+    <div class="history-row"><label for="history">Запуск</label><select id="history"><option value="">Текущий / последний</option></select><span id="run-time" class="muted">Запусков пока нет</span></div>
+    <section class="metrics" aria-label="Метрики выбранного запуска">
+      <article class="panel metric"><span>Кадров проверено</span><strong id="frames">—</strong></article>
+      <article class="panel metric"><span>Скринов сохранено</span><strong id="snapshots">—</strong></article>
+      <article class="panel metric"><span>Последний cosine</span><strong id="cosine">—</strong><small>Сходство, не вероятность</small></article>
+      <article class="panel metric"><span>Поток</span><strong id="stream-state" class="text-metric">Нет данных</strong></article>
+    </section>
+    <div class="content-grid">
+      <section class="panel preview-panel" aria-labelledby="preview-title">
+        <div class="section-heading"><h2 id="preview-title">Последний сохранённый кадр</h2><a id="image-link" target="_blank" rel="noopener" hidden>Оригинал</a></div>
+        <div id="preview-empty" class="empty"><span aria-hidden="true">◎</span><strong>Кадров пока нет</strong><p>Скрин появится, когда сборщик найдёт лицо.<br>Камера сама не запускается.</p></div>
+        <img id="preview" alt="Последний диагностический кадр с найденными лицами" decoding="async" hidden>
+        <p id="image-caption" class="muted">Исходные пиксели · lossless WebP · без наложений</p>
+        <details id="frame-details" hidden><summary>Метаданные кадра</summary><pre id="metadata"></pre></details>
+      </section>
+      <section class="panel log-panel" aria-labelledby="logs-title">
+        <div class="section-heading"><h2 id="logs-title">Лог процесса</h2><label class="checkbox"><input id="autoscroll" type="checkbox" checked>Прокрутка</label></div>
+        <pre id="logs" tabindex="0" aria-label="Последние строки лога">Сбор ещё не запускался.</pre>
+        <p id="result" class="muted">Здесь появятся подключения, scores и ошибки.</p>
+        <div class="downloads"><a id="download-events" hidden>Журнал JSONL</a><a id="download-manifest" hidden>Настройки JSON</a></div>
+      </section>
+    </div>
+    <section class="panel" aria-labelledby="events-title">
+      <div class="section-heading"><h2 id="events-title">Последние события</h2><span class="muted">Обновление каждые 2 с</span></div>
+      <div class="table-wrap"><table><thead><tr><th scope="col">Время</th><th scope="col">Событие</th><th scope="col">Лиц</th><th scope="col">Max cosine</th><th scope="col">Анализ, мс</th><th scope="col">Кадр</th></tr></thead><tbody id="events"><tr><td colspan="6" class="muted">Событий пока нет</td></tr></tbody></table></div>
+    </section>
+    <footer>Только диагностика. Cosine не является вероятностью личности. Нет проверки живого присутствия и управления дверью. Время показано в часовом поясе браузера; оригинальный журнал — UTC.</footer>
+  </main>
+</body>
+</html>
